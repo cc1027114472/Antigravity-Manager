@@ -1,6 +1,7 @@
 
 
 import {
+  Database,
   Download,
   LayoutGrid,
   List,
@@ -41,6 +42,7 @@ function Accounts() {
     accounts,
     currentAccount,
     fetchAccounts,
+    fetchCurrentAccount,
     addAccount,
     deleteAccount,
     deleteAccounts,
@@ -80,6 +82,7 @@ function Accounts() {
   const [isWarmupConfirmOpen, setIsWarmupConfirmOpen] = useState(false);
   const [isWarmuping, setIsWarmuping] = useState(false);
   const [refreshingIds, setRefreshingIds] = useState<Set<string>>(new Set());
+  const [isSyncingLocal, setIsSyncingLocal] = useState(false);
   const [errorAccountId, setErrorAccountId] = useState<string | null>(null);
   const [proxyBindings, setProxyBindings] = useState<Record<string, string>>({});
   const [proxyNames, setProxyNames] = useState<Record<string, string>>({});
@@ -111,6 +114,25 @@ function Accounts() {
       showToast(t('accounts.label_updated', 'Label updated'), 'success');
     } catch (error) {
       showToast(`${t('common.error')}: ${error}`, 'error');
+    }
+  };
+
+  const syncLocalLedger = async () => {
+    if (isSyncingLocal) return;
+    setIsSyncingLocal(true);
+    try {
+      await Promise.all([
+        fetchAccounts({ silent: true }),
+        fetchCurrentAccount({ silent: true }),
+      ]);
+      showToast(
+        t("accounts.sync_local_ledger_done", "Local ledger synced"),
+        "success"
+      );
+    } catch (error) {
+      showToast(`${t("common.error")}: ${error}`, "error");
+    } finally {
+      setIsSyncingLocal(false);
     }
   };
 
@@ -991,6 +1013,22 @@ function Accounts() {
               </button>
             </>
           )}
+
+          <button
+            className={`px-2.5 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 text-xs font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors flex items-center gap-1.5 shadow-sm ${isSyncingLocal ? "opacity-70 cursor-not-allowed" : ""}`}
+            onClick={syncLocalLedger}
+            disabled={isSyncingLocal}
+            title={t("accounts.sync_local_ledger", "Sync Local Ledger")}
+          >
+            <Database
+              className={`w-3.5 h-3.5 ${isSyncingLocal ? "animate-pulse" : ""}`}
+            />
+            <span className="hidden xl:inline">
+              {isSyncingLocal
+                ? t("common.loading")
+                : t("accounts.sync_local_ledger", "Sync Local Ledger")}
+            </span>
+          </button>
 
           <button
             className={`px-2.5 py-2 bg-blue-500 text-white text-xs font-medium rounded-lg hover:bg-blue-600 transition-colors flex items-center gap-1.5 shadow-sm ${isRefreshing ? "opacity-70 cursor-not-allowed" : ""}`}

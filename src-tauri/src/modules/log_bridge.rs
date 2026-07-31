@@ -87,7 +87,25 @@ pub fn clear_log_buffer() {
 
 /// Emit accounts://refreshed event to notify the frontend of account state changes
 /// This is used by background tasks (e.g. warmup 403 handling) that cannot access AppHandle directly.
+///
+/// Debounced (≈1s) so high-QPS ledger burns do not flood the UI with full list fetches.
 pub fn emit_accounts_refreshed() {
+    static LAST_EMIT_MS: AtomicU64 = AtomicU64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let prev = LAST_EMIT_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) < 1000 {
+        return;
+    }
+    if LAST_EMIT_MS
+        .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
     if let Some(handle) = APP_HANDLE.get() {
         let _ = handle.emit("accounts://refreshed", ());
         tracing::debug!("[LogBridge] Emitted accounts://refreshed event to frontend");

@@ -132,6 +132,8 @@
     "custom_label_placeholder": "Enter custom label",
     "label_updated": "Label updated",
     "add_account": "Add Account",
+    "sync_local_ledger": "Sync Local Ledger",
+    "sync_local_ledger_done": "Local ledger synced",
     "refresh_all": "Refresh All",
     "refresh_selected": "Refresh ({{count}})",
     "export_selected": "Export ({{count}})",

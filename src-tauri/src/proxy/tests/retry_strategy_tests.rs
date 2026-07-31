@@ -20,11 +20,30 @@ fn test_retry_strategy_404() {
 #[test]
 fn test_retry_strategy_429_no_delay() {
     let strategy = determine_retry_strategy(429, "rate limited", false);
-    assert!(
-        matches!(strategy, RetryStrategy::LinearBackoff { base_ms: 5000 }),
-        "Expected LinearBackoff {{ base_ms: 5000 }}, got {:?}",
-        strategy
-    );
+    match strategy {
+        RetryStrategy::FixedDelay(d) => assert_eq!(d, Duration::from_millis(50)),
+        other => panic!("Expected FixedDelay(50ms) for immediate rotate, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_retry_strategy_429_long_delay_rotates_immediately() {
+    let error_json = r#"{
+        "error": {
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                "retryDelay": "30s"
+            }]
+        }
+    }"#;
+    let strategy = determine_retry_strategy(429, error_json, false);
+    match strategy {
+        RetryStrategy::FixedDelay(d) => assert_eq!(d, Duration::from_millis(50)),
+        other => panic!(
+            "Expected FixedDelay(50ms) for long 429 delay (rotate immediately), got {:?}",
+            other
+        ),
+    }
 }
 
 #[test]

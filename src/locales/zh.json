@@ -129,6 +129,8 @@
     "custom_label_placeholder": "输入自定义标签",
     "label_updated": "标签已更新",
     "add_account": "添加账号",
+    "sync_local_ledger": "同步本地",
+    "sync_local_ledger_done": "已同步本地账本",
     "refresh_all": "刷新所有",
     "refresh_selected": "刷新 ({{count}})",
     "export_selected": "导出 ({{count}})",

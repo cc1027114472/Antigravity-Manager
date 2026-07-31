@@ -47,7 +47,7 @@ pub fn determine_retry_strategy(
         429 => {
             // 优先使用服务端返回的 Retry-After / quotaResetDelay
             if let Some(delay_ms) = crate::proxy::upstream::retry::parse_retry_delay(error_text) {
-                // [NEW] 如果延迟在 2s 内，执行 Grace Retry (原地重试)
+                // 短窗口：原地重试比切号更划算
                 if crate::proxy::upstream::retry::should_grace_retry(delay_ms) {
                     let actual_delay = delay_ms.saturating_add(100); // 增加 100ms 安全缓冲
                     tracing::info!(
@@ -56,12 +56,16 @@ pub fn determine_retry_strategy(
                     );
                     RetryStrategy::GraceRetry(Duration::from_millis(actual_delay))
                 } else {
-                    let actual_delay = delay_ms.saturating_add(200).min(30_000);
-                    RetryStrategy::FixedDelay(Duration::from_millis(actual_delay))
+                    // 长 retry-after：账号已由 mark_rate_limited 锁定，立刻切号，不要干等 Google 重置
+                    tracing::info!(
+                        "429 delay {}ms exceeds grace window; rotate immediately (lockout already applied)",
+                        delay_ms
+                    );
+                    RetryStrategy::FixedDelay(Duration::from_millis(50))
                 }
             } else {
-                // 否则使用线性退避：起始 5s，逐步增加
-                RetryStrategy::LinearBackoff { base_ms: 5000 }
+                // 无明确 delay：立刻切号（锁定时长由熔断/退避阶梯负责）
+                RetryStrategy::FixedDelay(Duration::from_millis(50))
             }
         }
 

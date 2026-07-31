@@ -48,7 +48,7 @@ Selection and `quota_protection` prefer **local estimated remaining %** per stan
 |------|--------|
 | Real-time intercept / sort | Local ledger (`estimated_quotas` → in-memory `ProxyToken.model_quotas`) |
 | Calibration | Online `fetch_quota` via `update_account_quota` (overwrites estimates) |
-| Hard backstop | Google 429 / realtime fetch also calibrates the ledger before lockout |
+| Hard backstop | Google 429 (non-grace): immediate rotate; set `proxy_disabled`, remove from pool, advance serial cursor; rate-limit lock without blocking on realtime quota fetch |
 
 Burn on successful proxy responses (`ProxyMonitor::log_request` → `TokenManager::burn_estimated_quota`):
 
@@ -62,7 +62,7 @@ Headless calibration: Rust ticker `modules/quota_calibration.rs` follows `auto_r
 
 When `quota_ledger.enabled=false`, protection/selection fall back to the online `quota` snapshot only.
 
-**UI display:** bars and ranks use local ledger via `getDisplayQuotaModels` ([`src/utils/quotaDisplay.ts`](../../src/utils/quotaDisplay.ts)); official % is tooltip/校验 only. After refresh, calibration overwrites local estimates so UI aligns with Google until the next burns.
+**UI display:** bars and ranks use local ledger via `getDisplayQuotaModels` ([`src/utils/quotaDisplay.ts`](../../src/utils/quotaDisplay.ts)); official % is tooltip/校验 only. After online refresh, calibration overwrites local estimates so UI aligns with Google until the next burns. Toolbar: **同步本地** re-reads disk `estimated_quotas` via silent `fetchAccounts` (no Google/OAuth); **刷新所有** runs online calibration. UI does not auto-poll or auto-refresh after burns — click 同步本地 to update %.
 
 ### 4) UI surfaces disabled state and blocks actions
 The accounts UI reads `disabled` fields and shows a “Disabled” badge and tooltip, and disables “switch / refresh” controls:

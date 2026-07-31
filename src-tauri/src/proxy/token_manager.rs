@@ -2772,11 +2772,10 @@ impl TokenManager {
 
     /// 标记账号限流(异步版本,支持实时配额刷新)
     ///
-    /// 三级降级策略:
-    /// 1. 优先: API 返回 quotaResetDelay → 直接使用
-    /// 2. 次优: 实时刷新配额 → 获取最新 reset_time
-    /// 3. 保底: 使用本地缓存配额 → 读取账号文件
-    /// 4. 兜底: 指数退避策略 → 默认锁定时间
+    /// 策略（保证立刻可切号）:
+    /// 1. 先立刻写入限流锁（退避阶梯 / Retry-After），让后续选号跳过该号
+    /// 2. 可选地用实时配额校准精确 lockout
+    /// 3. 429 → 设 `proxy_disabled` 并从内存池移除（与 403 forbidden 同级），便于立刻切号
     ///
     /// # 参数
     /// - `email`: 账号邮箱,用于查找账号信息
@@ -2808,42 +2807,34 @@ impl TokenManager {
             .email_to_account_id(email)
             .unwrap_or_else(|| email.to_string());
 
-        // 检查 API 是否返回了精确的重试时间
-        let has_explicit_retry_time =
-            retry_after_header.is_some() || error_body.contains("quotaResetDelay");
+        let reason = self.classify_rate_limit_reason(error_body);
 
-        if has_explicit_retry_time {
-            // API 返回了精确时间(quotaResetDelay),直接使用,无需实时刷新
-            if let Some(m) = model {
-                tracing::debug!(
-                    "账号 {} 的模型 {} 的 429 响应包含 quotaResetDelay,直接使用 API 返回的时间",
-                    account_id,
-                    m
-                );
-            } else {
-                tracing::debug!(
-                    "账号 {} 的 429 响应包含 quotaResetDelay,直接使用 API 返回的时间",
-                    account_id
-                );
-            }
-            self.rate_limit_tracker.parse_from_error(
-                &account_id,
-                status,
-                retry_after_header,
-                error_body,
-                model_to_track.map(|s| s.to_string()),
-                &config.backoff_steps, // [NEW] 传入配置
-            );
-            let reason = if error_body.to_lowercase().contains("quota") {
-                crate::proxy::rate_limit::RateLimitReason::QuotaExhausted
-            } else {
-                crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded
-            };
-            self.persist_live_limit(&account_id, model_to_track, status, reason, error_body);
-            return;
+        // 1) 立刻落锁，确保 handler 下一轮 force_rotate / 串行 advance 能跳过本号
+        self.rate_limit_tracker.parse_from_error(
+            &account_id,
+            status,
+            retry_after_header,
+            error_body,
+            model_to_track.map(|s| s.to_string()),
+            &config.backoff_steps,
+        );
+        self.persist_live_limit(&account_id, model_to_track, status, reason, error_body);
+
+        // 2) 429 且非 Grace 短窗：反代禁用 + 移出内存池 + 串行游标推进
+        //    短 retry（≤2s）保留账号以便原地重试；长锁/无 delay 则立刻踢出并切号。
+        let is_grace_window = crate::proxy::upstream::retry::parse_retry_delay(error_body)
+            .map(crate::proxy::upstream::retry::should_grace_retry)
+            .unwrap_or(false);
+        if status == 429 && !is_grace_window {
+            self.disable_proxy_on_429(&account_id, model_to_track, reason, error_body)
+                .await;
         }
+    }
 
-        // 确定限流原因
+    fn classify_rate_limit_reason(
+        &self,
+        error_body: &str,
+    ) -> crate::proxy::rate_limit::RateLimitReason {
         let error_body_lower = error_body.to_lowercase();
         let generic_resource_exhausted = error_body_lower.contains("resource has been exhausted")
             || error_body_lower.contains("resource_exhausted");
@@ -2854,7 +2845,7 @@ impl TokenManager {
             || error_body_lower.contains("per day")
             || error_body_lower.contains("daily quota");
 
-        let reason = if error_body_lower.contains("model_capacity") {
+        if error_body_lower.contains("model_capacity") {
             crate::proxy::rate_limit::RateLimitReason::ModelCapacityExhausted
         } else if error_body_lower.contains("per minute")
             || error_body_lower.contains("rate limit")
@@ -2869,76 +2860,61 @@ impl TokenManager {
             crate::proxy::rate_limit::RateLimitReason::QuotaExhausted
         } else {
             crate::proxy::rate_limit::RateLimitReason::Unknown
-        };
+        }
+    }
 
-        if !matches!(
+    /// 429：写入反代禁用，移出选号池，必要时推进串行游标
+    async fn disable_proxy_on_429(
+        &self,
+        account_id: &str,
+        model: Option<&str>,
+        reason: crate::proxy::rate_limit::RateLimitReason,
+        error_body: &str,
+    ) {
+        let reason_text = format!(
+            "429 {:?}{}: {}",
             reason,
-            crate::proxy::rate_limit::RateLimitReason::QuotaExhausted
-        ) {
-            tracing::info!(
-                "账号 {} 的 {} 响应被识别为 {:?},使用短退避而不是配额重置锁定",
-                account_id,
-                status,
-                reason
-            );
-            self.rate_limit_tracker.parse_from_error(
-                &account_id,
-                status,
-                retry_after_header,
-                error_body,
-                model_to_track.map(|s| s.to_string()),
-                &config.backoff_steps,
-            );
-            self.persist_live_limit(&account_id, model_to_track, status, reason, error_body);
-            return;
-        }
-
-        // API 未返回 quotaResetDelay,需要实时刷新配额获取精确锁定时间
-        if let Some(m) = model_to_track {
-            tracing::info!(
-                "账号 {} 的模型 {} 的 429 响应未包含 quotaResetDelay,尝试实时刷新配额...",
-                account_id,
-                m
-            );
-        } else {
-            tracing::info!(
-                "账号 {} 的 429 响应未包含 quotaResetDelay,尝试实时刷新配额...",
-                account_id
-            );
-        }
-
-        // [FIX] 传入 email 而不是 account_id，因为 fetch_and_lock_with_realtime_quota 期望 email
-        if self
-            .fetch_and_lock_with_realtime_quota(
-                email,
-                reason,
-                model_to_track.map(|s| s.to_string()),
-            )
-            .await
-        {
-            tracing::info!("账号 {} 已使用实时配额精确锁定", email);
-            self.persist_live_limit(&account_id, model_to_track, status, reason, error_body);
-            return;
-        }
-
-        // 实时刷新失败,尝试使用本地缓存的配额刷新时间
-        if self.set_precise_lockout(&account_id, reason, model_to_track.map(|s| s.to_string())) {
-            tracing::info!("账号 {} 已使用本地缓存配额锁定", account_id);
-            self.persist_live_limit(&account_id, model_to_track, status, reason, error_body);
-            return;
-        }
-
-        // 都失败了,回退到指数退避策略
-        tracing::warn!("账号 {} 无法获取配额刷新时间,使用指数退避策略", account_id);
-        self.rate_limit_tracker.parse_from_error(
-            &account_id,
-            status,
-            retry_after_header,
-            error_body,
-            model_to_track.map(|s| s.to_string()),
-            &config.backoff_steps, // [NEW] 传入配置
+            model.map(|m| format!(" [{}]", m)).unwrap_or_default(),
+            truncate_reason(error_body, 200)
         );
-        self.persist_live_limit(&account_id, model_to_track, status, reason, error_body);
+
+        if let Err(e) =
+            crate::modules::account::toggle_proxy_status(account_id, false, Some(&reason_text))
+        {
+            tracing::warn!(
+                "Failed to proxy-disable account {} after 429: {}",
+                account_id,
+                e
+            );
+            return;
+        }
+
+        self.tokens.remove(account_id);
+        tracing::warn!(
+            "🚫 Account {} proxy-disabled after 429 {:?} and removed from pool",
+            account_id,
+            reason
+        );
+
+        let serial_cfg = self.serial_pool.read().await.clone();
+        if serial_cfg.enabled && serial_cfg.should_advance_on("rate_limit") {
+            let preferred = self.preferred_account_id.read().await.clone();
+            if preferred.as_deref() == Some(account_id) {
+                match self.advance_serial_account("rate_limit", model).await {
+                    Ok(next) => tracing::info!(
+                        "[SerialPool] cursor advanced after 429 disable {} -> {}",
+                        account_id,
+                        next
+                    ),
+                    Err(e) => tracing::warn!(
+                        "[SerialPool] advance after 429 disable failed: {}",
+                        e
+                    ),
+                }
+            }
+        }
+
+        crate::modules::log_bridge::emit_accounts_refreshed();
     }
 
     fn persist_live_limit(

@@ -9,8 +9,8 @@ interface AccountState {
     error: string | null;
 
     // Actions
-    fetchAccounts: () => Promise<void>;
-    fetchCurrentAccount: () => Promise<void>;
+    fetchAccounts: (opts?: { silent?: boolean }) => Promise<void>;
+    fetchCurrentAccount: (opts?: { silent?: boolean }) => Promise<void>;
     addAccount: (email: string, refreshToken: string) => Promise<void>;
     deleteAccount: (accountId: string) => Promise<void>;
     deleteAccounts: (accountIds: string[]) => Promise<void>;
@@ -39,25 +39,27 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     loading: false,
     error: null,
 
-    fetchAccounts: async () => {
-        set({ loading: true, error: null });
+    fetchAccounts: async (opts) => {
+        const silent = opts?.silent === true;
+        if (!silent) set({ loading: true, error: null });
         try {
-            console.log('[Store] Fetching accounts...');
+            if (!silent) console.log('[Store] Fetching accounts...');
             const accounts = await accountService.listAccounts();
-            set({ accounts, loading: false });
+            set(silent ? { accounts } : { accounts, loading: false });
         } catch (error) {
             console.error('[Store] Fetch accounts failed:', error);
-            set({ error: String(error), loading: false });
+            set(silent ? { error: String(error) } : { error: String(error), loading: false });
         }
     },
 
-    fetchCurrentAccount: async () => {
-        set({ loading: true, error: null });
+    fetchCurrentAccount: async (opts) => {
+        const silent = opts?.silent === true;
+        if (!silent) set({ loading: true, error: null });
         try {
             const account = await accountService.getCurrentAccount();
-            set({ currentAccount: account, loading: false });
+            set(silent ? { currentAccount: account } : { currentAccount: account, loading: false });
         } catch (error) {
-            set({ error: String(error), loading: false });
+            set(silent ? { error: String(error) } : { error: String(error), loading: false });
         }
     },
 
