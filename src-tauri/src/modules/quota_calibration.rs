@@ -8,8 +8,12 @@ use tracing::info;
 
 /// Spawn a background loop that calls `refresh_all_quotas_logic` on an interval.
 /// Safe to call once at process start (GUI or headless).
+///
+/// GUI `setup` has no current Tokio Handle for bare `tokio::spawn`
+/// (panic: "there is no reactor running"). Headless already runs inside a
+/// Tokio runtime. Prefer the current handle when present, else Tauri's runtime.
 pub fn start_quota_calibration_ticker() {
-    tokio::spawn(async move {
+    let fut = async move {
         info!("[QuotaCalibration] ticker started (follows auto_refresh / refresh_interval)");
         loop {
             let (enabled, interval_min) = match crate::modules::config::load_app_config() {
@@ -48,5 +52,11 @@ pub fn start_quota_calibration_ticker() {
                 }
             }
         }
-    });
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(fut);
+    } else {
+        tauri::async_runtime::spawn(fut);
+    }
 }
