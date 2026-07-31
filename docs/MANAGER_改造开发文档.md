@@ -459,10 +459,12 @@ Manager:
 
 #### 6.2.5 二期验收
 
-1. 关闭串行开关：API 反代页行为与改造前一致（固定账号 / 调度文案不误导）。  
-2. 打开串行：UI 显示当前号；点「下一号」后 preferred 与绑定代理同步变化。  
-3. 批量导入 ≥10 条绑定成功；未绑定账号在代理设置中可见。  
-4. health / 未绑定告警与 API 返回一致。
+1. [x] 关闭串行开关：API 反代页行为与改造前一致（固定账号 / 调度文案不误导）。  
+2. [x] 打开串行：UI 显示当前号；点「下一号」后 preferred 与绑定代理同步变化。（实现已落地；联调依赖含 Phase 1+2 的二进制）  
+3. [x] 批量导入绑定（JSON/CSV）→ `POST /api/proxy/pool/bindings/batch`；未绑定账号在 BindingManager / 代理设置告警可见。  
+4. [x] `GET /api/proxy/pool/health` 与 UI 告警字段一致（`unboundAccountIds` / `unhealthyProxies` / `bindingsOnUnhealthy`）。
+
+管理 API 补充：`POST /api/proxy/pool/bindings/batch`、`GET /api/proxy/pool/health`（见 API_REFERENCE）。
 
 ---
 
@@ -500,6 +502,8 @@ Manager:
 | 文档 | 本文、`docs/README.md` | 索引 |
 
 **本次仓库任务仅新增/更新文档，不修改上述业务代码。**
+
+> 注：上表为设计期清单；Phase 1 / Phase 2 代码已按该表落地，以上「仅文档」说明已过时。
 
 ---
 

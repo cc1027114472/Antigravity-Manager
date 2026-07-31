@@ -67,8 +67,10 @@ Antigravity Gateway 是一个双重角色的服务器：
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
 | **GET** | `/proxy/pool/bindings` | 全部 `account_id → proxy_id` |
-| **POST** | `/proxy/pool/bind` | 绑定账号到代理 |
+| **POST** | `/proxy/pool/bind` | 绑定账号到代理（单条） |
 | **POST** | `/proxy/pool/unbind` | 解绑 |
+| **POST** | `/proxy/pool/bindings/batch` | 批量 upsert 绑定。Body: `{"bindings":[{"accountId":"...","proxyId":"..."}]}`。单行失败不回滚；响应 `ok` / `applied` / `errors[]` |
+| **GET** | `/proxy/pool/health` | 聚合快照（不触发探测）：`unboundAccountIds`、`unhealthyProxies`、`bindingsOnUnhealthy`、计数。刷新探测仍用 `POST /proxy/health-check/trigger` |
 | **GET** | `/proxy/pool/config` | 代理池配置 |
 
 ### 2.2.3 串行号池（`serial_pool`，默认关闭）

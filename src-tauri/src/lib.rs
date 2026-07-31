@@ -591,6 +591,9 @@ pub fn run() {
             commands::proxy::clear_proxy_session_bindings,
             commands::proxy::set_preferred_account,
             commands::proxy::get_preferred_account,
+            commands::proxy::get_serial_pool,
+            commands::proxy::update_serial_pool,
+            commands::proxy::advance_serial_pool,
             commands::proxy::clear_proxy_rate_limit,
             commands::proxy::clear_all_proxy_rate_limits,
             commands::proxy::check_proxy_health,
@@ -599,6 +602,8 @@ pub fn run() {
             commands::proxy_pool::unbind_account_proxy,
             commands::proxy_pool::get_account_proxy_binding,
             commands::proxy_pool::get_all_account_bindings,
+            commands::proxy_pool::batch_bind_account_proxies,
+            commands::proxy_pool::get_proxy_pool_health,
             // Autostart commands
             commands::autostart::toggle_auto_launch,
             commands::autostart::is_auto_launch_enabled,

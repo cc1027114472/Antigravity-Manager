@@ -2202,6 +2202,11 @@ impl TokenManager {
         self.tokens.len()
     }
 
+    /// 已加载账号 id 列表（号池 health 未绑定扫描用）
+    pub fn list_account_ids(&self) -> Vec<String> {
+        self.tokens.iter().map(|e| e.key().clone()).collect()
+    }
+
     /// 通过 email 获取指定账号的 Token（用于预热等需要指定账号的场景）
     /// 此方法会自动刷新过期的 token
     pub async fn get_token_by_email(
@@ -3047,7 +3052,7 @@ impl TokenManager {
             if let Some(ref rec) = *last {
                 if rec.from_id == from_id
                     && rec.reason == reason
-                    && rec.at.elapsed().as_millis() as u64 < cfg.advance_debounce_ms
+                    && (rec.at.elapsed().as_millis() as u64) < cfg.advance_debounce_ms
                 {
                     tracing::info!(
                         "[SerialPool] debounce: reuse advanced account {} (reason={})",

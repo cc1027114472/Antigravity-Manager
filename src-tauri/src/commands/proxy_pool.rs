@@ -74,3 +74,50 @@ pub async fn get_all_account_bindings(
         Err("Service not running".to_string())
     }
 }
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchBindItem {
+    pub account_id: String,
+    pub proxy_id: String,
+}
+
+/// Batch upsert account↔proxy bindings
+#[tauri::command]
+pub async fn batch_bind_account_proxies(
+    state: State<'_, ProxyServiceState>,
+    bindings: Vec<BatchBindItem>,
+) -> Result<crate::proxy::proxy_pool::BatchBindResult, String> {
+    let instance_lock = state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        let entries = bindings
+            .into_iter()
+            .map(|b| (b.account_id, b.proxy_id))
+            .collect();
+        Ok(instance
+            .axum_server
+            .proxy_pool_manager
+            .bind_accounts_batch(entries)
+            .await)
+    } else {
+        Err("Service not running".to_string())
+    }
+}
+
+/// Aggregate pool health snapshot (does not probe)
+#[tauri::command]
+pub async fn get_proxy_pool_health(
+    state: State<'_, ProxyServiceState>,
+) -> Result<crate::proxy::proxy_pool::PoolHealthSnapshot, String> {
+    let instance_lock = state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        let account_ids = instance.token_manager.list_account_ids();
+        Ok(instance
+            .axum_server
+            .proxy_pool_manager
+            .pool_health_snapshot(&account_ids)
+            .await)
+    } else {
+        Err("Service not running".to_string())
+    }
+}

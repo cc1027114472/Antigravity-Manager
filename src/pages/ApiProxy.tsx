@@ -197,6 +197,17 @@ export default function ApiProxy() {
     const [preferredAccountId, setPreferredAccountId] = useState<string | null>(null);
     const [availableAccounts, setAvailableAccounts] = useState<Array<{ id: string; email: string }>>([]);
 
+    // Phase 2: Serial account pool
+    const [serialPool, setSerialPool] = useState<{
+        enabled: boolean;
+        current_account_id: string | null;
+        last_advance_reason: string | null;
+        require_proxy_binding: boolean;
+        advance_on: string[];
+        advance_debounce_ms: number;
+    } | null>(null);
+    const [serialPoolBusy, setSerialPoolBusy] = useState(false);
+
     // Cloudflared (CF隧道) states
     const [cfStatus, setCfStatus] = useState<{ installed: boolean; version?: string; running: boolean; url?: string; error?: string }>({
         installed: false,
@@ -232,6 +243,7 @@ export default function ApiProxy() {
         loadStatus();
         loadAccounts();
         loadPreferredAccount();
+        loadSerialPool();
         loadCfStatus();
         loadCustomPresets();
         const interval = setInterval(loadStatus, 3000);
@@ -402,6 +414,68 @@ export default function ApiProxy() {
             showToast(String(error), 'error');
         }
     };
+
+    const loadSerialPool = async () => {
+        try {
+            const data = await invoke<{
+                enabled: boolean;
+                current_account_id: string | null;
+                last_advance_reason: string | null;
+                require_proxy_binding: boolean;
+                advance_on: string[];
+                advance_debounce_ms: number;
+            }>('get_serial_pool');
+            setSerialPool({
+                enabled: !!data.enabled,
+                current_account_id: data.current_account_id ?? null,
+                last_advance_reason: data.last_advance_reason ?? null,
+                require_proxy_binding: !!data.require_proxy_binding,
+                advance_on: data.advance_on || ['quota_protection', 'rate_limit', 'invalid_grant'],
+                advance_debounce_ms: data.advance_debounce_ms ?? 3000,
+            });
+            if (data.enabled && data.current_account_id) {
+                setPreferredAccountId(data.current_account_id);
+            }
+        } catch {
+            // Service not running
+        }
+    };
+
+    const handleUpdateSerialPool = async (patch: Partial<{
+        enabled: boolean;
+        requireProxyBinding: boolean;
+        advanceOn: string[];
+        advanceDebounceMs: number;
+    }>) => {
+        setSerialPoolBusy(true);
+        try {
+            await invoke('update_serial_pool', patch);
+            await loadSerialPool();
+            await loadPreferredAccount();
+            showToast(t('proxy.config.serial_pool.saved', { defaultValue: 'Serial pool updated' }), 'success');
+        } catch (error) {
+            showToast(String(error), 'error');
+        } finally {
+            setSerialPoolBusy(false);
+        }
+    };
+
+    const handleAdvanceSerialPool = async () => {
+        setSerialPoolBusy(true);
+        try {
+            const res = await invoke<{ account_id: string }>('advance_serial_pool', { reason: 'manual' });
+            await loadSerialPool();
+            await loadPreferredAccount();
+            const email = availableAccounts.find(a => a.id === res.account_id)?.email || res.account_id;
+            showToast(t('proxy.config.serial_pool.advanced', { defaultValue: `Advanced to ${email}`, email }), 'success');
+        } catch (error) {
+            showToast(String(error), 'error');
+        } finally {
+            setSerialPoolBusy(false);
+        }
+    };
+
+    const serialEnabled = !!serialPool?.enabled;
 
     const loadConfig = async () => {
         setConfigLoading(true);
@@ -1852,7 +1926,7 @@ print(response.choices[0].message.content)`;
                                             </div>
 
                                             {/* [FIX #820] Fixed Account Mode */}
-                                            <div className="bg-indigo-50 dark:bg-indigo-900/20 rounded-xl p-4 border border-indigo-200 dark:border-indigo-800">
+                                            <div className={`bg-indigo-50 dark:bg-indigo-900/20 rounded-xl p-4 border border-indigo-200 dark:border-indigo-800 ${serialEnabled ? 'opacity-60' : ''}`}>
                                                 <div className="flex items-center justify-between mb-3">
                                                     <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
                                                         🔒 {t('proxy.config.scheduling.fixed_account', { defaultValue: 'Fixed Account Mode' })}
@@ -1873,15 +1947,20 @@ print(response.choices[0].message.content)`;
                                                                 handleSetPreferredAccount(null);
                                                             }
                                                         }}
-                                                        disabled={!status.running}
+                                                        disabled={!status.running || serialEnabled}
                                                     />
                                                 </div>
+                                                {serialEnabled && (
+                                                    <p className="text-[10px] text-amber-700 dark:text-amber-400 mb-2">
+                                                        {t('proxy.config.serial_pool.takes_over_preferred', { defaultValue: 'Serial pool is enabled — fixed account is controlled by the serial cursor.' })}
+                                                    </p>
+                                                )}
                                                 {preferredAccountId !== null && (
                                                     <select
                                                         className="select select-bordered select-sm w-full text-xs"
                                                         value={preferredAccountId || ''}
                                                         onChange={(e) => handleSetPreferredAccount(e.target.value || null)}
-                                                        disabled={!status.running}
+                                                        disabled={!status.running || serialEnabled}
                                                     >
                                                         {availableAccounts.map(account => (
                                                             <option key={account.id} value={account.id}>
@@ -1894,6 +1973,95 @@ print(response.choices[0].message.content)`;
                                                     <p className="text-[10px] text-gray-500 mt-2">
                                                         {t('proxy.config.scheduling.start_proxy_first', { defaultValue: 'Start the proxy service to configure fixed account mode.' })}
                                                     </p>
+                                                )}
+                                            </div>
+
+                                            {/* Phase 2: Serial Account Pool */}
+                                            <div className="bg-emerald-50 dark:bg-emerald-900/20 rounded-xl p-4 border border-emerald-200 dark:border-emerald-800">
+                                                <div className="flex items-center justify-between mb-3">
+                                                    <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
+                                                        {t('proxy.config.serial_pool.title', { defaultValue: 'Serial Account Pool' })}
+                                                        <HelpTooltip text={t('proxy.config.serial_pool.tooltip', { defaultValue: 'When enabled, a global single cursor (preferred) is used for all clients. Advances on quota protection, rate limit, or invalid_grant.' })} />
+                                                    </label>
+                                                    <input
+                                                        type="checkbox"
+                                                        className="toggle toggle-sm toggle-success"
+                                                        checked={serialEnabled}
+                                                        disabled={!status.running || serialPoolBusy}
+                                                        onChange={(e) => handleUpdateSerialPool({ enabled: e.target.checked })}
+                                                    />
+                                                </div>
+                                                {serialPool && (
+                                                    <div className="space-y-3 text-xs">
+                                                        <div className="grid grid-cols-1 gap-1 text-[11px] text-gray-600 dark:text-gray-300">
+                                                            <div>
+                                                                <span className="font-medium">{t('proxy.config.serial_pool.cursor', { defaultValue: 'Cursor' })}: </span>
+                                                                {serialPool.current_account_id
+                                                                    ? (availableAccounts.find(a => a.id === serialPool.current_account_id)?.email || serialPool.current_account_id)
+                                                                    : t('proxy.config.serial_pool.none', { defaultValue: '—' })}
+                                                            </div>
+                                                            <div>
+                                                                <span className="font-medium">{t('proxy.config.serial_pool.last_reason', { defaultValue: 'Last advance' })}: </span>
+                                                                {serialPool.last_advance_reason || '—'}
+                                                            </div>
+                                                        </div>
+                                                        <label className="flex items-center justify-between gap-2">
+                                                            <span>{t('proxy.config.serial_pool.require_binding', { defaultValue: 'Require proxy binding' })}</span>
+                                                            <input
+                                                                type="checkbox"
+                                                                className="toggle toggle-xs toggle-success"
+                                                                checked={serialPool.require_proxy_binding}
+                                                                disabled={!status.running || serialPoolBusy}
+                                                                onChange={(e) => handleUpdateSerialPool({ requireProxyBinding: e.target.checked })}
+                                                            />
+                                                        </label>
+                                                        <div>
+                                                            <div className="mb-1 font-medium">{t('proxy.config.serial_pool.advance_on', { defaultValue: 'Advance on' })}</div>
+                                                            <div className="flex flex-wrap gap-2">
+                                                                {(['quota_protection', 'rate_limit', 'invalid_grant'] as const).map(reason => {
+                                                                    const checked = serialPool.advance_on.includes(reason);
+                                                                    return (
+                                                                        <label key={reason} className="flex items-center gap-1 text-[10px]">
+                                                                            <input
+                                                                                type="checkbox"
+                                                                                className="checkbox checkbox-xs"
+                                                                                checked={checked}
+                                                                                disabled={!status.running || serialPoolBusy}
+                                                                                onChange={() => {
+                                                                                    const next = checked
+                                                                                        ? serialPool.advance_on.filter(r => r !== reason)
+                                                                                        : [...serialPool.advance_on, reason];
+                                                                                    handleUpdateSerialPool({ advanceOn: next });
+                                                                                }}
+                                                                            />
+                                                                            {reason}
+                                                                        </label>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        </div>
+                                                        <label className="flex items-center justify-between gap-2">
+                                                            <span>{t('proxy.config.serial_pool.debounce_ms', { defaultValue: 'Debounce (ms)' })}</span>
+                                                            <input
+                                                                type="number"
+                                                                className="input input-bordered input-xs w-24"
+                                                                min={0}
+                                                                step={500}
+                                                                value={serialPool.advance_debounce_ms}
+                                                                disabled={!status.running || serialPoolBusy}
+                                                                onChange={(e) => setSerialPool({ ...serialPool, advance_debounce_ms: parseInt(e.target.value) || 0 })}
+                                                                onBlur={() => handleUpdateSerialPool({ advanceDebounceMs: serialPool.advance_debounce_ms })}
+                                                            />
+                                                        </label>
+                                                        <button
+                                                            type="button"
+                                                            className="btn btn-xs btn-outline btn-success w-full"
+                                                            disabled={!status.running || !serialEnabled || serialPoolBusy}
+                                                            onClick={handleAdvanceSerialPool}
+                                                        >
+                                                            {t('proxy.config.serial_pool.advance', { defaultValue: 'Advance to next account' })}
+                                                        </button>
+                                                    </div>
                                                 )}
                                             </div>
                                         </div>

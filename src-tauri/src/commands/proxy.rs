@@ -726,6 +726,102 @@ pub async fn get_preferred_account(
     }
 }
 
+/// 获取串行号池状态（含游标）
+#[tauri::command]
+pub async fn get_serial_pool(
+    state: State<'_, ProxyServiceState>,
+) -> Result<serde_json::Value, String> {
+    let instance_lock = state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        let cfg = instance.token_manager.get_serial_pool_config().await;
+        let current = instance.token_manager.get_preferred_account().await;
+        let last_reason = instance.token_manager.get_last_advance_reason().await;
+        let queue: Vec<String> = crate::modules::account::list_accounts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        Ok(serde_json::json!({
+            "enabled": cfg.enabled,
+            "current_account_id": current,
+            "last_advance_reason": last_reason,
+            "require_proxy_binding": cfg.require_proxy_binding,
+            "advance_on": cfg.advance_on,
+            "advance_debounce_ms": cfg.advance_debounce_ms,
+            "order": cfg.order,
+            "queue": queue,
+            "queue_len": queue.len(),
+        }))
+    } else {
+        Err("服务未运行".to_string())
+    }
+}
+
+/// 更新串行号池配置（写盘 + 热应用）
+#[tauri::command]
+pub async fn update_serial_pool(
+    state: State<'_, ProxyServiceState>,
+    enabled: Option<bool>,
+    advance_on: Option<Vec<String>>,
+    consecutive_failure_threshold: Option<u32>,
+    advance_debounce_ms: Option<u64>,
+    require_proxy_binding: Option<bool>,
+    order: Option<String>,
+) -> Result<(), String> {
+    let instance_lock = state.instance.read().await;
+    let Some(instance) = instance_lock.as_ref() else {
+        return Err("服务未运行".to_string());
+    };
+    let mut app_config = crate::modules::config::load_app_config()?;
+    let sp = &mut app_config.proxy.serial_pool;
+    if let Some(v) = enabled {
+        sp.enabled = v;
+    }
+    if let Some(v) = advance_on {
+        sp.advance_on = v;
+    }
+    if let Some(v) = consecutive_failure_threshold {
+        sp.consecutive_failure_threshold = v;
+    }
+    if let Some(v) = advance_debounce_ms {
+        sp.advance_debounce_ms = v;
+    }
+    if let Some(v) = require_proxy_binding {
+        sp.require_proxy_binding = v;
+    }
+    if let Some(v) = order {
+        sp.order = v;
+    }
+    let cfg_clone = sp.clone();
+    crate::modules::config::save_app_config(&app_config)?;
+    instance
+        .token_manager
+        .update_serial_pool_config(cfg_clone)
+        .await;
+    Ok(())
+}
+
+/// 强制推进串行游标
+#[tauri::command]
+pub async fn advance_serial_pool(
+    state: State<'_, ProxyServiceState>,
+    reason: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let instance_lock = state.instance.read().await;
+    let Some(instance) = instance_lock.as_ref() else {
+        return Err("服务未运行".to_string());
+    };
+    let reason = reason.unwrap_or_else(|| "manual".to_string());
+    let next = instance
+        .token_manager
+        .advance_serial_account(&reason, None)
+        .await?;
+    Ok(serde_json::json!({
+        "account_id": next,
+        "reason": reason,
+    }))
+}
+
 /// 清除指定账号的限流记录
 #[tauri::command]
 pub async fn clear_proxy_rate_limit(

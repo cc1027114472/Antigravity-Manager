@@ -2,7 +2,7 @@
 const isTauri = typeof window !== 'undefined' && (!!(window as any).__TAURI_INTERNALS__ || !!(window as any).__TAURI__);
 
 // 命令到 API 的映射
-const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'DELETE' | 'PATCH' }> = {
+const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'DELETE' | 'PATCH' | 'PUT' }> = {
   // Accounts
   'list_accounts': { url: '/api/accounts', method: 'GET' },
   'get_current_account': { url: '/api/accounts/current', method: 'GET' },
@@ -42,6 +42,9 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'check_proxy_health': { url: '/api/proxy/health-check/trigger', method: 'POST' },
   'get_preferred_account': { url: '/api/proxy/preferred-account', method: 'GET' },
   'set_preferred_account': { url: '/api/proxy/preferred-account', method: 'POST' },
+  'get_serial_pool': { url: '/api/proxy/serial-pool', method: 'GET' },
+  'update_serial_pool': { url: '/api/proxy/serial-pool', method: 'PUT' },
+  'advance_serial_pool': { url: '/api/proxy/serial-pool/advance', method: 'POST' },
   'fetch_zai_models': { url: '/api/zai/models/fetch', method: 'POST' },
   'load_config': { url: '/api/config', method: 'GET' },
   'save_config': { url: '/api/config', method: 'POST' },
@@ -163,6 +166,8 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'bind_account_proxy': { url: '/api/proxy/pool/bind', method: 'POST' },
   'unbind_account_proxy': { url: '/api/proxy/pool/unbind', method: 'POST' },
   'get_account_proxy_binding': { url: '/api/proxy/pool/binding/:accountId', method: 'GET' },
+  'batch_bind_account_proxies': { url: '/api/proxy/pool/bindings/batch', method: 'POST' },
+  'get_proxy_pool_health': { url: '/api/proxy/pool/health', method: 'GET' },
 };
 
 export async function request<T>(cmd: string, args?: any): Promise<T> {
@@ -226,7 +231,7 @@ export async function request<T>(cmd: string, args?: any): Promise<T> {
     });
     const qs = params.toString();
     if (qs) url += `?${qs}`;
-  } else if ((mapping.method === 'POST' || mapping.method === 'PATCH') && bodyArgs) {
+  } else if ((mapping.method === 'POST' || mapping.method === 'PATCH' || mapping.method === 'PUT') && bodyArgs) {
     // [FIX] 如果有 request 包装，提取其内容作为 body
     const body = bodyArgs.request !== undefined ? bodyArgs.request : bodyArgs;
     options.body = JSON.stringify(body);

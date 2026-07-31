@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { X, RefreshCw, Link2, Unlink } from 'lucide-react';
+import { X, RefreshCw, Link2, Unlink, Upload, AlertTriangle } from 'lucide-react';
 import { request } from '../../../utils/request';
 import { showToast } from '../../common/ToastContainer';
 import { useAccountStore } from '../../../stores/useAccountStore';
 import { ProxyEntry } from '../../../types/config';
+import BindingBatchImportModal from './BindingBatchImportModal';
 
 interface ProxyBindingManagerProps {
     isOpen: boolean;
@@ -13,14 +14,24 @@ interface ProxyBindingManagerProps {
     proxies: ProxyEntry[];
 }
 
+interface PoolHealth {
+    unboundAccountIds?: string[];
+    unbound_account_ids?: string[];
+    unhealthyProxies?: Array<{ id: string }>;
+    unhealthy_proxies?: Array<{ id: string }>;
+    bindingsOnUnhealthy?: Array<{ accountId?: string; account_id?: string; proxyId?: string; proxy_id?: string }>;
+    bindings_on_unhealthy?: Array<{ accountId?: string; account_id?: string }>;
+}
+
 export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyBindingManagerProps) {
     const { t } = useTranslation();
     const { accounts, fetchAccounts } = useAccountStore();
     const [bindings, setBindings] = useState<Record<string, string>>({});
+    const [health, setHealth] = useState<PoolHealth | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [isSaving, setIsSaving] = useState<string | null>(null);
+    const [batchOpen, setBatchOpen] = useState(false);
 
-    // Filter enabled proxies for selection
     const availableProxies = proxies.filter(p => p.enabled);
 
     useEffect(() => {
@@ -33,8 +44,12 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
         setIsLoading(true);
         try {
             await fetchAccounts();
-            const currentBindings = await request<Record<string, string>>('get_all_account_bindings');
+            const [currentBindings, healthSnap] = await Promise.all([
+                request<Record<string, string>>('get_all_account_bindings'),
+                request<PoolHealth>('get_proxy_pool_health').catch(() => null),
+            ]);
             setBindings(currentBindings || {});
+            setHealth(healthSnap);
         } catch (error) {
             console.error('Failed to load bindings:', error);
             showToast(t('settings.proxy_pool.binding.load_failed', 'Failed to load bindings'), 'error');
@@ -43,22 +58,30 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
         }
     };
 
+    const unboundIds = new Set(
+        health?.unboundAccountIds || health?.unbound_account_ids || []
+    );
+    const unhealthyBindingCount =
+        (health?.bindingsOnUnhealthy || health?.bindings_on_unhealthy || []).length;
+    const unhealthyProxyCount =
+        (health?.unhealthyProxies || health?.unhealthy_proxies || []).length;
+
     const handleBind = async (accountId: string, proxyId: string) => {
         setIsSaving(accountId);
         try {
             if (proxyId === '') {
-                // Unbind
                 await request('unbind_account_proxy', { accountId });
                 const newBindings = { ...bindings };
                 delete newBindings[accountId];
                 setBindings(newBindings);
                 showToast(t('settings.proxy_pool.binding.unbind_success', 'Unbound successfully'), 'success');
             } else {
-                // Bind
                 await request('bind_account_proxy', { accountId, proxyId });
                 setBindings({ ...bindings, [accountId]: proxyId });
                 showToast(t('settings.proxy_pool.binding.bind_success', 'Bound successfully'), 'success');
             }
+            const healthSnap = await request<PoolHealth>('get_proxy_pool_health').catch(() => null);
+            setHealth(healthSnap);
         } catch (error) {
             console.error('Failed to update binding:', error);
             showToast(t('settings.proxy_pool.binding.update_failed', 'Failed to update binding'), 'error');
@@ -73,13 +96,20 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm animate-in fade-in duration-200">
             <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
 
-                {/* Header */}
                 <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
                     <h3 className="text-lg font-semibold text-gray-900 dark:text-white flex items-center gap-2">
                         <Link2 className="w-5 h-5" />
                         {t('settings.proxy_pool.binding.title', 'Account Proxy Bindings')}
                     </h3>
                     <div className="flex items-center gap-2">
+                        <button
+                            onClick={() => setBatchOpen(true)}
+                            className="px-2 py-1.5 text-xs font-medium text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 rounded-lg flex items-center gap-1"
+                            title={t('settings.proxy_pool.binding.batch_import', 'Import Bindings')}
+                        >
+                            <Upload size={14} />
+                            {t('settings.proxy_pool.binding.batch_import_short', 'Batch')}
+                        </button>
                         <button
                             onClick={refreshData}
                             disabled={isLoading}
@@ -97,7 +127,31 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
                     </div>
                 </div>
 
-                {/* Content */}
+                {(unboundIds.size > 0 || unhealthyProxyCount > 0) && (
+                    <div className="mx-4 mt-3 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-xs text-amber-800 dark:text-amber-300 flex items-start gap-2">
+                        <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                        <div>
+                            {unboundIds.size > 0 && (
+                                <div>
+                                    {t('settings.proxy_pool.binding.unbound_alert', {
+                                        defaultValue: '{{count}} accounts unbound',
+                                        count: unboundIds.size,
+                                    })}
+                                </div>
+                            )}
+                            {unhealthyProxyCount > 0 && (
+                                <div>
+                                    {t('settings.proxy_pool.binding.unhealthy_alert', {
+                                        defaultValue: '{{proxies}} unhealthy proxies, {{bindings}} bindings on them',
+                                        proxies: unhealthyProxyCount,
+                                        bindings: unhealthyBindingCount,
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                )}
+
                 <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
                     {isLoading && accounts.length === 0 ? (
                         <div className="flex justify-center py-8">
@@ -112,10 +166,23 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
 
                             {accounts.map(account => {
                                 const currentProxyId = bindings[account.id] || '';
+                                const isUnbound = !bindings[account.id];
                                 return (
-                                    <div key={account.id} className="grid grid-cols-12 gap-4 items-center p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg border border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 transition-colors">
+                                    <div
+                                        key={account.id}
+                                        className={`grid grid-cols-12 gap-4 items-center p-3 rounded-lg border transition-colors ${
+                                            isUnbound
+                                                ? 'bg-amber-50/80 dark:bg-amber-900/10 border-amber-300 dark:border-amber-700'
+                                                : 'bg-gray-50 dark:bg-gray-700/50 border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'
+                                        }`}
+                                    >
                                         <div className="col-span-5 truncate font-medium text-gray-900 dark:text-gray-200" title={account.email}>
                                             {account.email}
+                                            {isUnbound && (
+                                                <span className="ml-2 text-[10px] text-amber-600 font-normal">
+                                                    {t('settings.proxy_pool.binding.unbound', 'Unbound')}
+                                                </span>
+                                            )}
                                         </div>
                                         <div className="col-span-7 relative">
                                             <select
@@ -125,7 +192,7 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
                                                 className={`w-full appearance-none pl-3 pr-8 py-2 border rounded-md text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-white transition-colors
                                                     ${bindings[account.id]
                                                         ? 'border-blue-300 dark:border-blue-700 ring-1 ring-blue-100 dark:ring-blue-900/20'
-                                                        : 'border-gray-300 dark:border-gray-600'
+                                                        : 'border-amber-300 dark:border-amber-700'
                                                     }`}
                                             >
                                                 <option value="">{t('settings.proxy_pool.binding.default_strategy', 'Default (Follow Strategy)')}</option>
@@ -158,7 +225,6 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
                     )}
                 </div>
 
-                {/* Footer */}
                 <div className="p-4 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 rounded-b-xl flex justify-end">
                     <button
                         onClick={onClose}
@@ -168,6 +234,15 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
                     </button>
                 </div>
             </div>
+
+            <BindingBatchImportModal
+                isOpen={batchOpen}
+                onClose={() => setBatchOpen(false)}
+                onImported={() => {
+                    setBatchOpen(false);
+                    refreshData();
+                }}
+            />
         </div>,
         document.body
     );

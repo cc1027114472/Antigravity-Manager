@@ -81,6 +81,12 @@ interface AccountTableProps {
     /** 拖拽排序回调，当用户完成拖拽时触发 */
     onReorder?: (accountIds: string[]) => void;
     onViewError: (accountId: string) => void;
+    /** account_id → proxy_id / name label */
+    proxyBindings?: Record<string, string>;
+    /** proxy_id → display name */
+    proxyNames?: Record<string, string>;
+    /** serial pool cursor account id */
+    serialCursorId?: string | null;
 }
 
 interface SortableRowProps {
@@ -101,6 +107,8 @@ interface SortableRowProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
+    proxyBindingLabel?: string | null;
+    isSerialCursor?: boolean;
 }
 
 interface AccountRowContentProps {
@@ -119,6 +127,8 @@ interface AccountRowContentProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
+    proxyBindingLabel?: string | null;
+    isSerialCursor?: boolean;
 }
 
 // ============================================================================
@@ -177,6 +187,8 @@ function SortableAccountRow({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    proxyBindingLabel,
+    isSerialCursor,
 }: SortableRowProps) {
     const { t } = useTranslation();
     const {
@@ -243,6 +255,8 @@ function SortableAccountRow({
                 onWarmup={onWarmup}
                 onUpdateLabel={onUpdateLabel}
                 onViewError={onViewError}
+                proxyBindingLabel={proxyBindingLabel}
+                isSerialCursor={isSerialCursor}
             />
         </tr>
     );
@@ -268,6 +282,8 @@ function AccountRowContent({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    proxyBindingLabel,
+    isSerialCursor,
 }: AccountRowContentProps) {
     const { t } = useTranslation();
     const { config, showAllQuotas } = useConfigStore();
@@ -376,6 +392,19 @@ function AccountRowContent({
                         {isCurrent && (
                             <span className="px-2 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 text-[10px] font-bold shadow-sm border border-blue-200/50 dark:border-blue-800/50">
                                 {t('accounts.current').toUpperCase()}
+                            </span>
+                        )}
+                        {isSerialCursor && (
+                            <span className="px-2 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold shadow-sm border border-emerald-200/50 dark:border-emerald-800/50">
+                                {t('accounts.serial_cursor', { defaultValue: 'SERIAL' })}
+                            </span>
+                        )}
+                        {proxyBindingLabel && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 text-[10px] font-bold shadow-sm border border-indigo-200/50 dark:border-indigo-800/50 max-w-[120px] truncate"
+                                title={proxyBindingLabel}
+                            >
+                                {proxyBindingLabel}
                             </span>
                         )}
                         {isDisabled && (
@@ -686,6 +715,9 @@ function AccountTable({
     onWarmup,
     onUpdateLabel,
     onViewError,
+    proxyBindings,
+    proxyNames,
+    serialCursorId,
 }: AccountTableProps) {
     const { t } = useTranslation();
 
@@ -784,6 +816,12 @@ function AccountTable({
                                     onWarmup={onWarmup ? () => onWarmup(account.id) : undefined}
                                     onUpdateLabel={onUpdateLabel ? (label: string) => onUpdateLabel(account.id, label) : undefined}
                                     onViewError={() => onViewError(account.id)}
+                                    proxyBindingLabel={
+                                        proxyBindings?.[account.id]
+                                            ? (proxyNames?.[proxyBindings[account.id]] || proxyBindings[account.id].slice(0, 8))
+                                            : null
+                                    }
+                                    isSerialCursor={!!serialCursorId && serialCursorId === account.id}
                                 />
                             ))}
                         </tbody>

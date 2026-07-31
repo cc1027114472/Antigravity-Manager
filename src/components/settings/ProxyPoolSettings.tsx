@@ -24,6 +24,11 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
     const [isTesting, setIsTesting] = useState(false);
     const [accountBindings, setAccountBindings] = useState<Record<string, string>>({});
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [poolHealth, setPoolHealth] = useState<{
+        unbound: number;
+        unhealthyProxies: number;
+        bindingsOnUnhealthy: number;
+    } | null>(null);
 
     // Fetch bindings and accounts on mount
     useEffect(() => {
@@ -83,6 +88,16 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
             if (bindings) setAccountBindings(bindings);
         } catch (e) {
             console.error('Fetch bindings failed:', e);
+        }
+        try {
+            const health = await request<any>('get_proxy_pool_health');
+            setPoolHealth({
+                unbound: (health.unboundAccountIds || health.unbound_account_ids || []).length,
+                unhealthyProxies: (health.unhealthyProxies || health.unhealthy_proxies || []).length,
+                bindingsOnUnhealthy: (health.bindingsOnUnhealthy || health.bindings_on_unhealthy || []).length,
+            });
+        } catch {
+            setPoolHealth(null);
         }
     };
 
@@ -310,6 +325,27 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
             </div>
 
             {/* Proxy List - Always visible, with status context */}
+            {poolHealth && (poolHealth.unbound > 0 || poolHealth.unhealthyProxies > 0) && (
+                <div className="mb-2 px-3 py-2 rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50/80 dark:bg-amber-900/10 text-[11px] text-amber-800 dark:text-amber-300">
+                    {poolHealth.unbound > 0 && (
+                        <span className="mr-3">
+                            {t('settings.proxy_pool.binding.unbound_alert', {
+                                defaultValue: '{{count}} accounts unbound',
+                                count: poolHealth.unbound,
+                            })}
+                        </span>
+                    )}
+                    {poolHealth.unhealthyProxies > 0 && (
+                        <span>
+                            {t('settings.proxy_pool.binding.unhealthy_alert', {
+                                defaultValue: '{{proxies}} unhealthy proxies, {{bindings}} bindings on them',
+                                proxies: poolHealth.unhealthyProxies,
+                                bindings: poolHealth.bindingsOnUnhealthy,
+                            })}
+                        </span>
+                    )}
+                </div>
+            )}
             <div className="relative border border-gray-200 dark:border-gray-800 rounded-xl overflow-hidden bg-white dark:bg-gray-900 shadow-sm transition-all duration-300">
                 {!safeConfig.enabled && (
                     <div className="absolute inset-x-0 top-0 z-10 bg-amber-50/80 dark:bg-amber-900/10 backdrop-blur-[2px] px-3 py-1 flex items-center justify-center border-b border-amber-100/50 dark:border-amber-900/20">

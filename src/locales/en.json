@@ -444,7 +444,16 @@
         "bind_success": "Bound successfully",
         "update_failed": "Failed to update binding",
         "assigned_proxy": "Assigned Proxy",
-        "default_strategy": "Default (Follow Strategy)"
+        "default_strategy": "Default (Follow Strategy)",
+        "batch_import": "Import Bindings",
+        "batch_import_short": "Batch",
+        "batch_hint": "JSON array [{account_id, proxy_id}] or CSV with header account_id,proxy_id",
+        "batch_run": "Import",
+        "batch_empty": "No bindings to import",
+        "batch_done": "Applied {{applied}}, errors {{errors}}",
+        "unbound": "Unbound",
+        "unbound_alert": "{{count}} accounts unbound",
+        "unhealthy_alert": "{{proxies}} unhealthy proxies, {{bindings}} bindings on them"
       },
       "status": {
         "inactive": "Inactive",
@@ -801,6 +810,20 @@
         "clear_bindings_tooltip": "Hard reset all session-account bindings, forcing accounts to be re-assigned on next request.",
         "clear_rate_limits": "Clear Rate Limit Records",
         "clear_rate_limits_tooltip": "Immediately clear local rate limit records for all accounts, forcing next requests to try upstream directly."
+      },
+      "serial_pool": {
+        "title": "Serial Account Pool",
+        "tooltip": "Global single cursor for all clients. Takes over fixed-account / preferred. Advances on quota protection, rate limit, or invalid_grant.",
+        "takes_over_preferred": "Serial pool is enabled — fixed account is controlled by the serial cursor.",
+        "cursor": "Cursor",
+        "none": "—",
+        "last_reason": "Last advance",
+        "require_binding": "Require proxy binding",
+        "advance_on": "Advance on",
+        "debounce_ms": "Debounce (ms)",
+        "advance": "Advance to next account",
+        "saved": "Serial pool updated",
+        "advanced": "Advanced to {{email}}"
       },
       "circuit_breaker": {
         "title": "Adaptive Circuit Breaker",

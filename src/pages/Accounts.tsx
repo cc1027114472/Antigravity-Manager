@@ -81,6 +81,9 @@ function Accounts() {
   const [isWarmuping, setIsWarmuping] = useState(false);
   const [refreshingIds, setRefreshingIds] = useState<Set<string>>(new Set());
   const [errorAccountId, setErrorAccountId] = useState<string | null>(null);
+  const [proxyBindings, setProxyBindings] = useState<Record<string, string>>({});
+  const [proxyNames, setProxyNames] = useState<Record<string, string>>({});
+  const [serialCursorId, setSerialCursorId] = useState<string | null>(null);
 
   const handleWarmup = async (accountId: string) => {
     setRefreshingIds((prev) => {
@@ -226,6 +229,34 @@ function Accounts() {
 
   useEffect(() => {
     fetchAccounts();
+  }, []);
+
+  useEffect(() => {
+    const loadPoolMeta = async () => {
+      try {
+        const [bindings, poolCfg, serial] = await Promise.all([
+          invoke<Record<string, string>>("get_all_account_bindings").catch(() => ({})),
+          invoke<{ proxies?: Array<{ id: string; name?: string }> }>("get_proxy_pool_config").catch(() => null),
+          invoke<{ enabled?: boolean; current_account_id?: string | null }>("get_serial_pool").catch(() => null),
+        ]);
+        setProxyBindings(bindings || {});
+        const names: Record<string, string> = {};
+        for (const p of poolCfg?.proxies || []) {
+          names[p.id] = p.name || p.id.slice(0, 8);
+        }
+        setProxyNames(names);
+        if (serial?.enabled && serial.current_account_id) {
+          setSerialCursorId(serial.current_account_id);
+        } else {
+          setSerialCursorId(null);
+        }
+      } catch {
+        // proxy service may be down
+      }
+    };
+    loadPoolMeta();
+    const timer = setInterval(loadPoolMeta, 15000);
+    return () => clearInterval(timer);
   }, []);
 
   // Reset pagination when view mode changes to avoid empty pages or confusion
@@ -1077,6 +1108,9 @@ function Accounts() {
                 onWarmup={handleWarmup}
                 onUpdateLabel={handleUpdateLabel}
                 onViewError={(id: string) => setErrorAccountId(id)}
+                proxyBindings={proxyBindings}
+                proxyNames={proxyNames}
+                serialCursorId={serialCursorId}
               />
             </div>
           </div>

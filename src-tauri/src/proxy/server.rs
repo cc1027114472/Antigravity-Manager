@@ -595,6 +595,11 @@ impl AxumServer {
             .route("/proxy/status", get(admin_get_proxy_status))
             .route("/proxy/pool/config", get(admin_get_proxy_pool_config))
             .route("/proxy/pool/bindings", get(admin_get_all_account_bindings))
+            .route(
+                "/proxy/pool/bindings/batch",
+                post(admin_batch_bind_account_proxies),
+            )
+            .route("/proxy/pool/health", get(admin_get_proxy_pool_health))
             .route("/proxy/pool/bind", post(admin_bind_account_proxy))
             .route("/proxy/pool/unbind", post(admin_unbind_account_proxy))
             .route(
@@ -1533,6 +1538,43 @@ async fn admin_bind_account_proxy(
             )
         })?;
     Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchBindAccountProxyItem {
+    account_id: String,
+    proxy_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchBindAccountProxyRequest {
+    bindings: Vec<BatchBindAccountProxyItem>,
+}
+
+async fn admin_batch_bind_account_proxies(
+    State(state): State<AppState>,
+    Json(payload): Json<BatchBindAccountProxyRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let entries = payload
+        .bindings
+        .into_iter()
+        .map(|b| (b.account_id, b.proxy_id))
+        .collect();
+    let result = state.proxy_pool_manager.bind_accounts_batch(entries).await;
+    Ok(Json(result))
+}
+
+async fn admin_get_proxy_pool_health(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let account_ids = state.token_manager.list_account_ids();
+    let snap = state
+        .proxy_pool_manager
+        .pool_health_snapshot(&account_ids)
+        .await;
+    Ok(Json(snap))
 }
 
 // [FIX Web Mode] Unbind account from proxy

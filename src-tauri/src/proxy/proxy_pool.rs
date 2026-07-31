@@ -362,11 +362,12 @@ impl ProxyPoolManager {
         })
     }
 
-    /// 绑定账号到代理
-    pub async fn bind_account_to_proxy(
+    /// 绑定账号到代理（内存校验 + 可选写盘）
+    async fn bind_account_to_proxy_inner(
         &self,
         account_id: String,
         proxy_id: String,
+        persist: bool,
     ) -> Result<(), String> {
         // 检查代理是否存在
         {
@@ -379,16 +380,24 @@ impl ProxyPoolManager {
             if let Some(entry) = config.proxies.iter().find(|p| p.id == proxy_id) {
                 if let Some(max) = entry.max_accounts {
                     if max > 0 {
-                        let current_count = self
+                        // upsert：同账号换绑到同一代理不占用额外名额
+                        let already_on_proxy = self
                             .account_bindings
-                            .iter()
-                            .filter(|kv| *kv.value() == proxy_id)
-                            .count();
-                        if current_count >= max {
-                            return Err(format!(
-                                "Proxy {} has reached max accounts limit",
-                                proxy_id
-                            ));
+                            .get(&account_id)
+                            .map(|v| *v.value() == proxy_id)
+                            .unwrap_or(false);
+                        if !already_on_proxy {
+                            let current_count = self
+                                .account_bindings
+                                .iter()
+                                .filter(|kv| *kv.value() == proxy_id)
+                                .count();
+                            if current_count >= max {
+                                return Err(format!(
+                                    "Proxy {} has reached max accounts limit",
+                                    proxy_id
+                                ));
+                            }
                         }
                     }
                 }
@@ -399,8 +408,9 @@ impl ProxyPoolManager {
         self.account_bindings
             .insert(account_id.clone(), proxy_id.clone());
 
-        // 持久化到配置文件
-        self.persist_bindings().await;
+        if persist {
+            self.persist_bindings().await;
+        }
 
         tracing::info!(
             "[ProxyPool] Bound account {} to proxy {}",
@@ -408,6 +418,101 @@ impl ProxyPoolManager {
             proxy_id
         );
         Ok(())
+    }
+
+    /// 绑定账号到代理
+    pub async fn bind_account_to_proxy(
+        &self,
+        account_id: String,
+        proxy_id: String,
+    ) -> Result<(), String> {
+        self.bind_account_to_proxy_inner(account_id, proxy_id, true)
+            .await
+    }
+
+    /// 批量绑定（upsert）；单行失败不回滚，成功项统一写盘一次
+    pub async fn bind_accounts_batch(
+        &self,
+        entries: Vec<(String, String)>,
+    ) -> BatchBindResult {
+        let mut applied = Vec::new();
+        let mut errors = Vec::new();
+
+        for (account_id, proxy_id) in entries {
+            match self
+                .bind_account_to_proxy_inner(account_id.clone(), proxy_id.clone(), false)
+                .await
+            {
+                Ok(()) => applied.push(BatchBindApplied {
+                    account_id,
+                    proxy_id,
+                }),
+                Err(message) => errors.push(BatchBindError {
+                    account_id,
+                    proxy_id,
+                    message,
+                }),
+            }
+        }
+
+        if !applied.is_empty() {
+            self.persist_bindings().await;
+        }
+
+        BatchBindResult {
+            ok: errors.is_empty(),
+            applied_count: applied.len(),
+            error_count: errors.len(),
+            applied,
+            errors,
+        }
+    }
+
+    /// 号池健康聚合快照（不触发探测）
+    pub async fn pool_health_snapshot(
+        &self,
+        account_ids: &[String],
+    ) -> PoolHealthSnapshot {
+        let config = self.config.read().await;
+        let bindings = self.get_all_bindings_snapshot();
+
+        let unhealthy_proxies: Vec<UnhealthyProxyInfo> = config
+            .proxies
+            .iter()
+            .filter(|p| !p.is_healthy)
+            .map(|p| UnhealthyProxyInfo {
+                id: p.id.clone(),
+                name: Some(p.name.clone()),
+                latency_ms: p.latency,
+            })
+            .collect();
+
+        let unhealthy_ids: std::collections::HashSet<String> =
+            unhealthy_proxies.iter().map(|p| p.id.clone()).collect();
+
+        let bindings_on_unhealthy: Vec<BindingOnUnhealthy> = bindings
+            .iter()
+            .filter(|(_, proxy_id)| unhealthy_ids.contains(*proxy_id))
+            .map(|(account_id, proxy_id)| BindingOnUnhealthy {
+                account_id: account_id.clone(),
+                proxy_id: proxy_id.clone(),
+            })
+            .collect();
+
+        let unbound_account_ids: Vec<String> = account_ids
+            .iter()
+            .filter(|id| !bindings.contains_key(*id))
+            .cloned()
+            .collect();
+
+        PoolHealthSnapshot {
+            unbound_account_ids,
+            unhealthy_proxies,
+            bindings_on_unhealthy,
+            bound_count: bindings.len(),
+            proxy_count: config.proxies.len(),
+            account_count: account_ids.len(),
+        }
     }
 
     /// 解绑账号代理
@@ -612,5 +717,124 @@ impl ProxyPoolManager {
                 tokio::time::sleep(Duration::from_secs(interval_secs)).await;
             }
         });
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchBindApplied {
+    pub account_id: String,
+    pub proxy_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchBindError {
+    pub account_id: String,
+    pub proxy_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchBindResult {
+    pub ok: bool,
+    pub applied_count: usize,
+    pub error_count: usize,
+    pub applied: Vec<BatchBindApplied>,
+    pub errors: Vec<BatchBindError>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnhealthyProxyInfo {
+    pub id: String,
+    pub name: Option<String>,
+    pub latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingOnUnhealthy {
+    pub account_id: String,
+    pub proxy_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolHealthSnapshot {
+    pub unbound_account_ids: Vec<String>,
+    pub unhealthy_proxies: Vec<UnhealthyProxyInfo>,
+    pub bindings_on_unhealthy: Vec<BindingOnUnhealthy>,
+    pub bound_count: usize,
+    pub proxy_count: usize,
+    pub account_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::config::{ProxyEntry, ProxyPoolConfig};
+    use tokio::sync::RwLock;
+
+    fn test_pool(proxies: Vec<ProxyEntry>) -> ProxyPoolManager {
+        let mut cfg = ProxyPoolConfig::default();
+        cfg.enabled = true;
+        cfg.proxies = proxies;
+        ProxyPoolManager::new(Arc::new(RwLock::new(cfg)))
+    }
+
+    fn proxy(id: &str, max: Option<usize>) -> ProxyEntry {
+        ProxyEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            url: format!("http://127.0.0.1:{}", 9000),
+            auth: None,
+            enabled: true,
+            priority: 0,
+            tags: Vec::new(),
+            max_accounts: max,
+            health_check_url: None,
+            last_check_time: None,
+            is_healthy: true,
+            latency: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_bind_partial_failure() {
+        let pool = test_pool(vec![proxy("p1", Some(1))]);
+        let result = pool
+            .bind_accounts_batch(vec![
+                ("a1".into(), "p1".into()),
+                ("a2".into(), "missing".into()),
+                ("a3".into(), "p1".into()), // may hit max
+            ])
+            .await;
+
+        assert_eq!(result.applied_count, 1);
+        assert_eq!(result.error_count, 2);
+        assert!(!result.ok);
+        assert_eq!(pool.get_account_binding("a1").as_deref(), Some("p1"));
+        assert!(pool.get_account_binding("a2").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pool_health_unbound_list() {
+        let mut unhealthy = proxy("bad", None);
+        unhealthy.is_healthy = false;
+        let pool = test_pool(vec![proxy("good", None), unhealthy]);
+        let _ = pool
+            .bind_account_to_proxy_inner("bound".into(), "bad".into(), false)
+            .await;
+
+        let snap = pool
+            .pool_health_snapshot(&["bound".into(), "free".into()])
+            .await;
+        assert_eq!(snap.unbound_account_ids, vec!["free".to_string()]);
+        assert_eq!(snap.bound_count, 1);
+        assert_eq!(snap.unhealthy_proxies.len(), 1);
+        assert_eq!(snap.bindings_on_unhealthy.len(), 1);
+        assert_eq!(snap.bindings_on_unhealthy[0].account_id, "bound");
     }
 }

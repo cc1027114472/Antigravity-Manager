@@ -444,7 +444,16 @@
         "bind_success": "绑定成功",
         "update_failed": "更新绑定失败",
         "assigned_proxy": "已分配代理",
-        "default_strategy": "默认 (跟随策略)"
+        "default_strategy": "默认 (跟随策略)",
+        "batch_import": "导入绑定",
+        "batch_import_short": "批量",
+        "batch_hint": "JSON 数组 [{account_id, proxy_id}] 或 CSV（表头 account_id,proxy_id）",
+        "batch_run": "导入",
+        "batch_empty": "没有可导入的绑定",
+        "batch_done": "成功 {{applied}}，失败 {{errors}}",
+        "unbound": "未绑定",
+        "unbound_alert": "{{count}} 个账号未绑定代理",
+        "unhealthy_alert": "{{proxies}} 个不健康代理，{{bindings}} 条绑定指向它们"
       },
       "status": {
         "inactive": "未启用",
@@ -794,6 +803,20 @@
         "clear_bindings_tooltip": "立即断开所有会话与账号的绑定关系，强制下一次请求重新分配账号。",
         "clear_rate_limits": "清除限流记录",
         "clear_rate_limits_tooltip": "立即清除所有账号的本地限流记录，强制下一次请求尝试直接调用上游。"
+      },
+      "serial_pool": {
+        "title": "串行号池",
+        "tooltip": "全局单游标，接管固定账号 / preferred。在配额保护、限流或 invalid_grant 时自动推进。",
+        "takes_over_preferred": "串行号池已启用 — 固定账号由串行游标接管。",
+        "cursor": "当前游标",
+        "none": "—",
+        "last_reason": "上次推进原因",
+        "require_binding": "要求绑定代理",
+        "advance_on": "推进触发",
+        "debounce_ms": "防抖 (ms)",
+        "advance": "切到下一号",
+        "saved": "串行号池已更新",
+        "advanced": "已推进到 {{email}}"
       },
       "circuit_breaker": {
         "title": "自适应熔断器",
