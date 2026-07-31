@@ -49,7 +49,10 @@ import { cn } from '../../utils/cn';
 import { QuotaItem } from './QuotaItem';
 import { getModelProtectionKey } from '../../utils/modelCategory';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
-import { formatQuotaTooltip, getBillingGroupDisplays } from '../../utils/quotaDisplay';
+import { formatQuotaTooltip, getListQuotaDisplays } from '../../utils/quotaDisplay';
+import { getLiveLimitForModel } from '../../utils/liveLimit';
+import { useConfigStore } from '../../stores/useConfigStore';
+import { MODEL_CONFIG } from '../../config/modelConfig';
 import { Gemini, Claude } from '@lobehub/icons';
 import {
     proxyUsageBadgeClass,
@@ -278,6 +281,7 @@ function AccountRowContent({
     isSerialCursor,
 }: AccountRowContentProps) {
     const { t } = useTranslation();
+    const { config, showAllQuotas } = useConfigStore();
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
 
     // 自定义标签编辑状态
@@ -304,16 +308,15 @@ function AccountRowContent({
         }
     };
 
-    // Official billing groups (Gemini / Claude) — primary list view
-    const billingRows = getBillingGroupDisplays(account);
-    const displayModels = billingRows.map((row) => ({
-        id: row.id,
-        label: row.label,
-        protectedKey: row.id,
-        percentage: row.percentage,
-        officialPercentage: row.officialPercentage,
-        reset_time: row.reset_time,
-        Icon: row.id === 'claude' ? Claude.Color : Gemini.Color,
+    // List rows: four-slot default / pinned subset / show-all with billing %
+    const displayModels = getListQuotaDisplays(account, {
+        showAll: showAllQuotas,
+        pinnedModels: config?.pinned_quota_models?.models,
+    }).map((row) => ({
+        ...row,
+        Icon:
+            MODEL_CONFIG[row.id]?.Icon ||
+            (row.protectedKey === 'claude' ? Claude.Color : Gemini.Color),
     }));
 
 
@@ -491,6 +494,7 @@ function AccountRowContent({
                                     percentage={model.percentage || 0}
                                     resetTime={model.reset_time}
                                     isProtected={isModelProtected(account.protected_models, model.protectedKey)}
+                                    liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                     Icon={model.Icon || Bot}
                                     quotaTitle={formatQuotaTooltip(model.percentage, model.officialPercentage)}
                                 />
@@ -663,7 +667,7 @@ function AccountTable({
     const { t } = useTranslation();
 
     const [activeId, setActiveId] = useState<string | null>(null);
-    // Account list uses official billing groups (Gemini / Claude)
+    // Account list: four slots, percentages from official billing buckets
 
     // 配置拖拽传感器
     const sensors = useSensors(

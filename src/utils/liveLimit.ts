@@ -1,21 +1,46 @@
 import { Account, LiveLimitStatus } from '../types/account';
+import { normalizeToBillingGroup } from './modelCategory';
+
+function pickLatest(a: LiveLimitStatus, b: LiveLimitStatus): LiveLimitStatus {
+    return a.until >= b.until ? a : b;
+}
 
 export function getLiveLimitForModel(
     account: Account,
     modelId?: string,
     protectedKey?: string
 ): LiveLimitStatus | undefined {
-    if (!account.live_limited_models) return undefined;
-    
-    if (modelId && account.live_limited_models[modelId]) {
-        return account.live_limited_models[modelId];
+    const map = account.live_limited_models;
+    if (!map) return undefined;
+
+    if (modelId && map[modelId]) {
+        return map[modelId];
     }
-    
-    if (protectedKey && account.live_limited_models[protectedKey]) {
-        return account.live_limited_models[protectedKey];
+
+    const lowerId = modelId?.toLowerCase();
+    if (lowerId) {
+        for (const [key, value] of Object.entries(map)) {
+            if (key.toLowerCase() === lowerId) return value;
+        }
     }
-    
-    return undefined;
+
+    if (protectedKey && map[protectedKey]) {
+        return map[protectedKey];
+    }
+
+    const billing =
+        (protectedKey && normalizeToBillingGroup(protectedKey)) ||
+        (modelId ? normalizeToBillingGroup(modelId) : null);
+
+    if (!billing) return undefined;
+
+    let best: LiveLimitStatus | undefined;
+    for (const [key, value] of Object.entries(map)) {
+        if (normalizeToBillingGroup(key) === billing) {
+            best = best ? pickLatest(best, value) : value;
+        }
+    }
+    return best;
 }
 
 export interface LiveLimitState {
@@ -38,7 +63,7 @@ export function getLiveLimitState(liveLimit?: LiveLimitStatus): LiveLimitState {
     const now = Math.floor(Date.now() / 1000);
     const secondsRemaining = Math.max(0, liveLimit.until - now);
     const secondsAgo = Math.max(0, now - liveLimit.detected_at);
-    
+
     const isActive = secondsRemaining > 0;
     const shouldShow = isActive || secondsAgo < 600; // 10 minutes
 
@@ -52,11 +77,11 @@ export function getLiveLimitState(liveLimit?: LiveLimitStatus): LiveLimitState {
 
 export function formatCompactDuration(seconds: number): string {
     if (seconds <= 0) return '0s';
-    
+
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = Math.floor(seconds % 60);
-    
+
     if (h > 0) {
         return `${h}h ${m}m`;
     }

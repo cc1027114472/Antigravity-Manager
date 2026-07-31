@@ -225,6 +225,83 @@ pub fn migrate_estimated_quotas(
     merged
 }
 
+/// Cooldown between online calibrations triggered by local ledger crossing the
+/// protection threshold (per account + billing group).
+pub const THRESHOLD_CALIBRATE_COOLDOWN_SECS: i64 = 600;
+
+/// Decision for a single burn against the protection threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThresholdCrossDecision {
+    /// Local % crossed from above threshold to `<= threshold`.
+    pub crossed: bool,
+    /// Persist / memory protect immediately (no pending calibrate).
+    pub should_protect_now: bool,
+    /// Spawn async online calibrate before deciding protection.
+    pub should_trigger_calibrate: bool,
+}
+
+/// Evaluate burn vs protection threshold.
+///
+/// - Crossing (`current > threshold` → `new <= threshold`) with protect on:
+///   delay protect and trigger calibrate unless cooldown is active (then protect
+///   on local estimate as fallback).
+/// - Already at/below threshold: protect now, no calibrate.
+/// - Protection off: never protect / calibrate from this path.
+pub fn evaluate_threshold_cross(
+    protection_on: bool,
+    current_pct: i32,
+    new_pct: i32,
+    threshold: i32,
+    in_cooldown: bool,
+) -> ThresholdCrossDecision {
+    if !protection_on {
+        return ThresholdCrossDecision {
+            crossed: false,
+            should_protect_now: false,
+            should_trigger_calibrate: false,
+        };
+    }
+
+    let crossed = current_pct > threshold && new_pct <= threshold;
+    if crossed {
+        if in_cooldown {
+            ThresholdCrossDecision {
+                crossed: true,
+                should_protect_now: true,
+                should_trigger_calibrate: false,
+            }
+        } else {
+            ThresholdCrossDecision {
+                crossed: true,
+                should_protect_now: false,
+                should_trigger_calibrate: true,
+            }
+        }
+    } else {
+        ThresholdCrossDecision {
+            crossed: false,
+            should_protect_now: new_pct <= threshold,
+            should_trigger_calibrate: false,
+        }
+    }
+}
+
+/// Whether a previous calibrate timestamp is still inside the cooldown window.
+pub fn is_calibrate_cooldown_active(
+    last_ts: Option<i64>,
+    now_ts: i64,
+    cooldown_secs: i64,
+) -> bool {
+    match last_ts {
+        Some(last) => now_ts.saturating_sub(last) < cooldown_secs,
+        None => false,
+    }
+}
+
+pub fn threshold_calibrate_cooldown_key(account_id: &str, billing_group: &str) -> String {
+    format!("{}:{}", account_id, billing_group)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +330,55 @@ mod tests {
         assert_eq!(cfg.compute_burn_pct(Some(20_001)), 2);
         assert_eq!(cfg.compute_burn_pct(Some(40_000)), 2);
         assert_eq!(cfg.compute_burn_pct(Some(40_001)), 3);
+    }
+
+    #[test]
+    fn threshold_cross_delays_protect_and_triggers_calibrate() {
+        let d = evaluate_threshold_cross(true, 15, 8, 10, false);
+        assert!(d.crossed);
+        assert!(!d.should_protect_now);
+        assert!(d.should_trigger_calibrate);
+    }
+
+    #[test]
+    fn threshold_cross_in_cooldown_protects_without_calibrate() {
+        let d = evaluate_threshold_cross(true, 15, 8, 10, true);
+        assert!(d.crossed);
+        assert!(d.should_protect_now);
+        assert!(!d.should_trigger_calibrate);
+    }
+
+    #[test]
+    fn already_below_threshold_protects_no_calibrate() {
+        let d = evaluate_threshold_cross(true, 8, 5, 10, false);
+        assert!(!d.crossed);
+        assert!(d.should_protect_now);
+        assert!(!d.should_trigger_calibrate);
+    }
+
+    #[test]
+    fn protection_off_never_calibrates() {
+        let d = evaluate_threshold_cross(false, 15, 8, 10, false);
+        assert!(!d.crossed);
+        assert!(!d.should_protect_now);
+        assert!(!d.should_trigger_calibrate);
+    }
+
+    #[test]
+    fn calibrate_cooldown_window() {
+        assert!(!is_calibrate_cooldown_active(None, 1000, 600));
+        assert!(is_calibrate_cooldown_active(Some(500), 1000, 600));
+        assert!(!is_calibrate_cooldown_active(Some(300), 1000, 600));
+        assert!(is_calibrate_cooldown_active(
+            Some(1000),
+            1000 + THRESHOLD_CALIBRATE_COOLDOWN_SECS - 1,
+            THRESHOLD_CALIBRATE_COOLDOWN_SECS
+        ));
+        assert!(!is_calibrate_cooldown_active(
+            Some(1000),
+            1000 + THRESHOLD_CALIBRATE_COOLDOWN_SECS,
+            THRESHOLD_CALIBRATE_COOLDOWN_SECS
+        ));
     }
 
     #[test]

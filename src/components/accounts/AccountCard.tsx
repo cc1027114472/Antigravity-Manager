@@ -5,8 +5,11 @@ import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
 import { QuotaItem } from './QuotaItem';
 import { getModelProtectionKey } from '../../config/modelConfig';
+import { MODEL_CONFIG } from '../../config/modelConfig';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
-import { formatQuotaTooltip, getBillingGroupDisplays } from '../../utils/quotaDisplay';
+import { formatQuotaTooltip, getListQuotaDisplays } from '../../utils/quotaDisplay';
+import { getLiveLimitForModel } from '../../utils/liveLimit';
+import { useConfigStore } from '../../stores/useConfigStore';
 import { Gemini, Claude } from '@lobehub/icons';
 import {
     proxyUsageBadgeClass,
@@ -37,6 +40,7 @@ interface AccountCardProps {
 
 function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError, proxyBindingLabel, proxyUsage = 'unknown' }: AccountCardProps) {
     const { t } = useTranslation();
+    const { config, showAllQuotas } = useConfigStore();
     const isDisabled = Boolean(account.disabled);
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
 
@@ -68,16 +72,21 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
     };
 
     const displayModels = useMemo(() => {
-        return getBillingGroupDisplays(account).map((row) => ({
+        return getListQuotaDisplays(account, {
+            showAll: showAllQuotas,
+            pinnedModels: config?.pinned_quota_models?.models,
+        }).map((row) => ({
             id: row.id,
             label: row.label,
-            protectedKey: row.id,
-            Icon: row.id === 'claude' ? Claude.Color : Gemini.Color,
+            protectedKey: row.protectedKey,
+            Icon:
+                MODEL_CONFIG[row.id]?.Icon ||
+                (row.protectedKey === 'claude' ? Claude.Color : Gemini.Color),
             percentage: row.percentage,
             officialPercentage: row.officialPercentage,
             reset_time: row.reset_time,
         }));
-    }, [account]);
+    }, [account, showAllQuotas, config?.pinned_quota_models?.models]);
 
     const isModelProtected = (key?: string) => {
         if (!key) return false;
@@ -231,6 +240,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                 percentage={model.percentage || 0}
                                 resetTime={model.reset_time}
                                 isProtected={isModelProtected(model.protectedKey)}
+                                liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                 Icon={model.Icon}
                                 quotaTitle={formatQuotaTooltip(model.percentage, model.officialPercentage)}
                             />

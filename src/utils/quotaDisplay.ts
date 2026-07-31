@@ -1,10 +1,11 @@
 /**
  * Merge online quota snapshot with local estimated_quotas for UI display.
- * Primary bar % = local ledger when present; official % kept for tooltip.
- * List views use official billing groups (gemini | claude).
+ * Billing truth: gemini | claude big buckets.
+ * List UI: four slots (Pro / Flash / Image / Claude); Gemini slots share one bucket %.
  */
 import type { Account, EstimatedModelQuota, ModelQuota, QuotaGroup } from '../types/account';
 import {
+    ensurePinnedImageSelector,
     findImageQuotaModel,
     findQuotaModel,
     getModelProtectionKey,
@@ -25,6 +26,32 @@ export type BillingGroupDisplay = {
     officialPercentage?: number;
     reset_time?: string;
 };
+
+/** Four-column list slot: labels split, percentages bound to billing groups. */
+export type SplitQuotaSlotId = 'gemini-pro' | 'gemini-flash' | 'gemini-image' | 'claude';
+
+export type SplitQuotaDisplay = {
+    id: SplitQuotaSlotId;
+    label: string;
+    /** Official billing group key used for % and protection lock */
+    protectedKey: BillingGroup;
+    percentage: number;
+    officialPercentage?: number;
+    reset_time?: string;
+    /** True when ledger/official/online has any signal for this billing group */
+    hasData: boolean;
+};
+
+const SPLIT_SLOTS: Array<{
+    id: SplitQuotaSlotId;
+    label: string;
+    billing: BillingGroup;
+}> = [
+    { id: 'gemini-pro', label: 'G3.1 Pro', billing: 'gemini' },
+    { id: 'gemini-flash', label: 'G3 Flash', billing: 'gemini' },
+    { id: 'gemini-image', label: 'G3 Image', billing: 'gemini' },
+    { id: 'claude', label: 'Claude', billing: 'claude' },
+];
 
 function lookupEstimated(
     estimated: Record<string, EstimatedModelQuota> | undefined,
@@ -83,22 +110,9 @@ export function officialBillingPercentages(
     return { ...fallback, ...fiveH };
 }
 
-/**
- * Primary list display: two official billing groups.
- */
-export function getBillingGroupDisplays(
-    account: Account | null | undefined,
-): BillingGroupDisplay[] {
-    if (!account) return [];
-
-    const estimated = account.estimated_quotas;
-    const official = officialBillingPercentages(account.quota?.quota_groups);
-    const labels: Record<BillingGroup, string> = {
-        gemini: 'Gemini',
-        claude: 'Claude',
-    };
-
-    // Fallback min from online models when no groups / ledger
+function onlineBillingMins(
+    account: Account,
+): Partial<Record<BillingGroup, number>> {
     const onlineMin: Partial<Record<BillingGroup, number>> = {};
     for (const m of account.quota?.models ?? []) {
         const g = normalizeToBillingGroup(m.name);
@@ -108,43 +122,222 @@ export function getBillingGroupDisplays(
                 ? m.percentage
                 : Math.min(onlineMin[g]!, m.percentage);
     }
+    return onlineMin;
+}
+
+export type BillingQuotaResolved = {
+    percentage: number;
+    officialPercentage?: number;
+    reset_time?: string;
+    hasData: boolean;
+};
+
+/** Unified list/card row (split slots or expanded model rows). */
+export type ListQuotaDisplay = {
+    id: string;
+    label: string;
+    protectedKey: BillingGroup;
+    percentage: number;
+    officialPercentage?: number;
+    reset_time?: string;
+};
+
+export type ListQuotaDisplayOptions = {
+    showAll?: boolean;
+    /** Raw pinned model ids from settings; billing-normalized when showAll is off. */
+    pinnedModels?: string[];
+};
+
+function resolveBillingPct(
+    account: Account,
+    billing: BillingGroup,
+): BillingQuotaResolved {
+    const estimated = account.estimated_quotas;
+    const official = officialBillingPercentages(account.quota?.quota_groups);
+    const onlineMin = onlineBillingMins(account);
+
+    const est = estimated?.[billing] ?? lookupEstimated(estimated, billing);
+    const off = official[billing];
+    const hasEst = !!est;
+    const hasOff = off !== undefined;
+    const hasOnline = onlineMin[billing] !== undefined;
+    const hasData = hasEst || hasOff || hasOnline;
+
+    const percentage =
+        est?.percentage ??
+        off?.percentage ??
+        onlineMin[billing] ??
+        0;
+
+    const rawOfficial = est?.lastOnlinePct ?? off?.percentage ?? onlineMin[billing];
+    const officialPercentage =
+        rawOfficial !== undefined && rawOfficial !== percentage
+            ? rawOfficial
+            : undefined;
+
+    return {
+        percentage,
+        officialPercentage,
+        reset_time: off?.reset_time,
+        hasData,
+    };
+}
+
+/** Public alias for list overlay / callers that need billing bucket %. */
+export function resolveBillingQuota(
+    account: Account,
+    billing: BillingGroup,
+): BillingQuotaResolved {
+    return resolveBillingPct(account, billing);
+}
+
+function modelLabel(name: string, displayName?: string): string {
+    const lower = name.toLowerCase();
+    // Keep list labels readable without pulling MODEL_CONFIG (icons / React).
+    const SHORT: Record<string, string> = {
+        'gemini-pro': 'G3.1 Pro',
+        'gemini-flash': 'G3 Flash',
+        'gemini-image': 'G3 Image',
+        gemini: 'Gemini',
+        claude: 'Claude',
+        'gemini-3.1-pro-high': 'G3.1 Pro',
+        'gemini-3-pro-high': 'G3.1 Pro',
+        'gemini-3-flash': 'G3 Flash',
+        'gemini-3-flash-agent': 'G3 Flash',
+        'gemini-pro-agent': 'G3.1 Pro',
+        'gemini-3.1-flash-image': 'G3 Image',
+        'gemini-3-pro-image': 'G3 Image',
+    };
+    return displayName || SHORT[lower] || name;
+}
+
+function sortListRows(rows: ListQuotaDisplay[]): ListQuotaDisplay[] {
+    const weight = (id: string): number => {
+        const n = id.toLowerCase();
+        if (n.includes('pro') && n.includes('image')) return 30;
+        if (n.includes('flash') && n.includes('image')) return 31;
+        if (n.includes('image')) return 32;
+        if (n.includes('pro')) return 10;
+        if (n.includes('flash')) return 20;
+        if (n.includes('claude') || n.includes('opus') || n.includes('sonnet')) return 40;
+        return 50;
+    };
+    return [...rows].sort((a, b) => {
+        const d = weight(a.id) - weight(b.id);
+        return d !== 0 ? d : a.id.localeCompare(b.id);
+    });
+}
+
+function dedupeListRows(rows: ListQuotaDisplay[]): ListQuotaDisplay[] {
+    const uniqueLabels = new Set<string>();
+    const withDataPass = rows.filter((m) => {
+        if (m.id.includes('thinking')) return false;
+        const labelKey = `${m.label}-${m.protectedKey}`;
+        if (uniqueLabels.has(labelKey)) return false;
+        uniqueLabels.add(labelKey);
+        return true;
+    });
+    return withDataPass.filter((m, index, self) => {
+        const labelKey = `${m.label}-${m.protectedKey}`;
+        return self.findIndex((t) => `${t.label}-${t.protectedKey}` === labelKey) === index;
+    });
+}
+
+/**
+ * Account list/card rows:
+ * - showAll off + no pins → four split slots
+ * - showAll off + pins → split slots filtered by pinned billing groups
+ * - showAll on → all online/ledger models with billing % overlay
+ */
+export function getListQuotaDisplays(
+    account: Account | null | undefined,
+    options: ListQuotaDisplayOptions = {},
+): ListQuotaDisplay[] {
+    if (!account) return [];
+
+    const { showAll = false, pinnedModels } = options;
+
+    if (!showAll) {
+        const splits = getSplitQuotaDisplays(account);
+        const pins = (pinnedModels ?? []).map((p) => p.trim()).filter(Boolean);
+        if (pins.length === 0) return splits;
+
+        const billingPins = new Set(ensurePinnedImageSelector(pins));
+        const filtered = splits.filter((row) => billingPins.has(row.protectedKey));
+        return filtered.length > 0 ? filtered : splits;
+    }
+
+    const ledgerModels = getDisplayQuotaModels(account);
+    const rows: ListQuotaDisplay[] = ledgerModels.map((m) => {
+        const billing = normalizeToBillingGroup(m.name) ?? 'gemini';
+        const resolved = resolveBillingPct(account, billing);
+        return {
+            id: m.name.toLowerCase(),
+            label: modelLabel(m.name, m.display_name),
+            protectedKey: billing,
+            percentage: resolved.hasData ? resolved.percentage : m.percentage,
+            officialPercentage: resolved.officialPercentage ?? m.officialPercentage,
+            reset_time: resolved.reset_time || m.reset_time,
+        };
+    });
+
+    return sortListRows(dedupeListRows(rows));
+}
+
+/**
+ * List/card primary display: four columns.
+ * Pro / Flash / Image share billing group `gemini`; Claude uses `claude`.
+ */
+export function getSplitQuotaDisplays(
+    account: Account | null | undefined,
+): SplitQuotaDisplay[] {
+    if (!account) return [];
+
+    return SPLIT_SLOTS.map((slot) => {
+        const resolved = resolveBillingPct(account, slot.billing);
+        return {
+            id: slot.id,
+            label: slot.label,
+            protectedKey: slot.billing,
+            percentage: resolved.percentage,
+            officialPercentage: resolved.officialPercentage,
+            reset_time: resolved.reset_time,
+            hasData: resolved.hasData,
+        };
+    }).filter((row) => row.hasData || row.percentage > 0);
+}
+
+/**
+ * Two official billing groups (kept for settings / debug).
+ */
+export function getBillingGroupDisplays(
+    account: Account | null | undefined,
+): BillingGroupDisplay[] {
+    if (!account) return [];
+
+    const labels: Record<BillingGroup, string> = {
+        gemini: 'Gemini',
+        claude: 'Claude',
+    };
 
     return BILLING_GROUPS.map((id) => {
-        const est = estimated?.[id] ?? lookupEstimated(estimated, id);
-        const off = official[id];
-        const percentage =
-            est?.percentage ??
-            off?.percentage ??
-            onlineMin[id] ??
-            0;
-        const officialPercentage =
-            est?.lastOnlinePct ?? off?.percentage ?? onlineMin[id];
+        const resolved = resolveBillingPct(account, id);
         return {
             id,
             label: labels[id],
-            percentage,
-            officialPercentage:
-                officialPercentage !== undefined && officialPercentage !== percentage
-                    ? officialPercentage
-                    : est?.lastOnlinePct !== undefined && est.lastOnlinePct !== percentage
-                      ? est.lastOnlinePct
-                      : off?.percentage !== percentage
-                        ? off?.percentage
-                        : undefined,
-            reset_time: off?.reset_time,
+            percentage: resolved.percentage,
+            officialPercentage: resolved.officialPercentage,
+            reset_time: resolved.reset_time,
         };
     }).filter((row) => {
-        // Show row if we have any signal for this group
-        const hasEst = !!(estimated && (estimated[row.id] || lookupEstimated(estimated, row.id)));
-        const hasOff = official[row.id] !== undefined;
-        const hasOnline = onlineMin[row.id] !== undefined;
-        return hasEst || hasOff || hasOnline || row.percentage > 0;
+        const resolved = resolveBillingPct(account, row.id);
+        return resolved.hasData || resolved.percentage > 0;
     });
 }
 
 /**
  * Models list for UI: percentage from local ledger when available.
- * (Per-model detail / auxiliary — not the primary billing view.)
+ * (Per-model detail / auxiliary — not the primary list view.)
  */
 export function getDisplayQuotaModels(account: Account | null | undefined): DisplayModelQuota[] {
     if (!account) return [];
@@ -201,11 +394,44 @@ export function findDisplayQuotaModel(
     account: Account | null | undefined,
     category: ModelCategory,
 ): DisplayModelQuota | undefined {
+    // Prefer split-slot billing % so Pro/Flash read the same gemini bucket
+    const splits = getSplitQuotaDisplays(account);
+    const slotId: SplitQuotaSlotId | null =
+        category === 'gemini-pro'
+            ? 'gemini-pro'
+            : category === 'gemini-flash'
+              ? 'gemini-flash'
+              : category === 'claude'
+                ? 'claude'
+                : category === 'gemini-flash-image' || category === 'gemini-pro-image'
+                  ? 'gemini-image'
+                  : null;
+    if (slotId) {
+        const slot = splits.find((s) => s.id === slotId);
+        if (slot) {
+            return {
+                name: slot.id,
+                percentage: slot.percentage,
+                reset_time: slot.reset_time || '',
+                officialPercentage: slot.officialPercentage,
+            };
+        }
+    }
     return findQuotaModel(getDisplayQuotaModels(account), category);
 }
 
 export function findDisplayImageQuotaModel(
     account: Account | null | undefined,
 ): DisplayModelQuota | undefined {
+    const splits = getSplitQuotaDisplays(account);
+    const slot = splits.find((s) => s.id === 'gemini-image');
+    if (slot) {
+        return {
+            name: slot.id,
+            percentage: slot.percentage,
+            reset_time: slot.reset_time || '',
+            officialPercentage: slot.officialPercentage,
+        };
+    }
     return findImageQuotaModel(getDisplayQuotaModels(account));
 }

@@ -1,9 +1,13 @@
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, ToggleLeft, ToggleRight, Fingerprint } from 'lucide-react';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint } from 'lucide-react';
 import { Account } from '../../types/account';
-import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../../utils/format';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
-import { formatQuotaTooltip, getBillingGroupDisplays } from '../../utils/quotaDisplay';
+import { formatQuotaTooltip, getListQuotaDisplays } from '../../utils/quotaDisplay';
+import { getLiveLimitForModel } from '../../utils/liveLimit';
+import { useConfigStore } from '../../stores/useConfigStore';
+import { QuotaItem } from './QuotaItem';
+import { Gemini, Claude } from '@lobehub/icons';
+import { MODEL_CONFIG } from '../../config/modelConfig';
 
 interface AccountRowProps {
     account: Account;
@@ -23,27 +27,12 @@ interface AccountRowProps {
 
 function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice }: AccountRowProps) {
     const { t } = useTranslation();
-    const billingRows = getBillingGroupDisplays(account);
+    const { config, showAllQuotas } = useConfigStore();
+    const displayModels = getListQuotaDisplays(account, {
+        showAll: showAllQuotas,
+        pinnedModels: config?.pinned_quota_models?.models,
+    });
     const isDisabled = Boolean(account.disabled);
-
-    const getColorClass = (percentage: number) => {
-        const color = getQuotaColor(percentage);
-        switch (color) {
-            case 'success': return 'bg-emerald-500';
-            case 'warning': return 'bg-amber-500';
-            case 'error': return 'bg-rose-500';
-            default: return 'bg-gray-500';
-        }
-    };
-
-    const getTimeColorClass = (resetTime: string | undefined) => {
-        const color = getTimeRemainingColor(resetTime);
-        switch (color) {
-            case 'success': return 'text-emerald-500 dark:text-emerald-400';
-            case 'warning': return 'text-amber-500 dark:text-amber-400';
-            default: return 'text-blue-600 dark:text-blue-400';
-        }
-    };
 
     return (
         <tr className={cn(
@@ -140,47 +129,25 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                         <span>{t('accounts.forbidden_msg')}</span>
                     </div>
                 ) : (
-                    <div className="grid grid-cols-2 gap-x-4 gap-y-1 py-0">
-                        {billingRows.map((row) => {
-                            const isProtected = account.protected_models?.includes(row.id);
-                            return (
-                                <div
-                                    key={row.id}
-                                    className="relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5"
-                                >
-                                    <div
-                                        className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(row.percentage)}`}
-                                        style={{ width: `${row.percentage}%` }}
-                                    />
-                                    <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                        <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title={row.label}>
-                                            {isProtected && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
-                                            <span className="truncate">{row.label}</span>
-                                        </span>
-                                        <div className="flex-1 flex justify-center">
-                                            {row.reset_time ? (
-                                                <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(row.reset_time))}>
-                                                    <Clock className="w-2.5 h-2.5" />
-                                                    {formatTimeRemaining(row.reset_time)}
-                                                </span>
-                                            ) : (
-                                                <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
-                                            )}
-                                        </div>
-                                        <span
-                                            className={cn(
-                                                "w-[36px] text-right font-bold transition-colors",
-                                                getQuotaColor(row.percentage) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
-                                                    getQuotaColor(row.percentage) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                            )}
-                                            title={formatQuotaTooltip(row.percentage, row.officialPercentage)}
-                                        >
-                                            {`${row.percentage}%`}
-                                        </span>
-                                    </div>
-                                </div>
-                            );
-                        })}
+                    <div className={cn(
+                        "grid gap-x-4 gap-y-1 py-0",
+                        displayModels.length === 1 ? "grid-cols-1" : "grid-cols-2"
+                    )}>
+                        {displayModels.map((row) => (
+                            <QuotaItem
+                                key={row.id}
+                                label={row.label}
+                                percentage={row.percentage}
+                                resetTime={row.reset_time}
+                                isProtected={account.protected_models?.includes(row.protectedKey)}
+                                liveLimit={getLiveLimitForModel(account, row.id, row.protectedKey)}
+                                Icon={
+                                    MODEL_CONFIG[row.id]?.Icon ||
+                                    (row.protectedKey === 'claude' ? Claude.Color : Gemini.Color)
+                                }
+                                quotaTitle={formatQuotaTooltip(row.percentage, row.officialPercentage)}
+                            />
+                        ))}
                     </div>
                 )}
             </td>

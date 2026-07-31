@@ -1,8 +1,10 @@
-import { CheckCircle, Mail, Diamond, Gem, Circle, Tag, Lock } from 'lucide-react';
+import { CheckCircle, Mail, Diamond, Gem, Circle, Tag } from 'lucide-react';
 import { Account } from '../../types/account';
-import { formatTimeRemaining } from '../../utils/format';
-import { formatQuotaTooltip, getBillingGroupDisplays } from '../../utils/quotaDisplay';
+import { formatQuotaTooltip, getSplitQuotaDisplays } from '../../utils/quotaDisplay';
+import { getLiveLimitForModel } from '../../utils/liveLimit';
 import { useTranslation } from 'react-i18next';
+import { QuotaItem } from '../accounts/QuotaItem';
+import { Gemini, Claude } from '@lobehub/icons';
 
 interface CurrentAccountProps {
     account: Account | null;
@@ -25,7 +27,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
         );
     }
 
-    const billingRows = getBillingGroupDisplays(account);
+    const splitRows = getSplitQuotaDisplays(account);
 
     return (
         <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 h-full flex flex-col">
@@ -34,7 +36,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                 {t('dashboard.current_account')}
             </h2>
 
-            <div className="space-y-4 flex-1">
+            <div className="space-y-3 flex-1">
                 <div className="flex items-center gap-3 mb-1">
                     <div className="flex items-center gap-2 flex-1 min-w-0">
                         <Mail className="w-3.5 h-3.5 text-gray-400" />
@@ -73,49 +75,20 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                     )}
                 </div>
 
-                {billingRows.map((row) => (
-                    <div key={row.id} className="space-y-1.5">
-                        <div className="flex justify-between items-baseline">
-                            <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {account.protected_models?.includes(row.id) && (
-                                    <Lock className="w-2.5 h-2.5 text-rose-500" />
-                                )}
-                                {row.label}
-                            </span>
-                            <div className="flex items-center gap-2">
-                                <span className="text-[10px] text-gray-400 dark:text-gray-500">
-                                    {row.reset_time
-                                        ? `R: ${formatTimeRemaining(row.reset_time)}`
-                                        : t('common.unknown')}
-                                </span>
-                                <span
-                                    className={`text-xs font-bold ${
-                                        row.percentage >= 50
-                                            ? 'text-emerald-600 dark:text-emerald-400'
-                                            : row.percentage >= 20
-                                              ? 'text-amber-600 dark:text-amber-400'
-                                              : 'text-rose-600 dark:text-rose-400'
-                                    }`}
-                                    title={formatQuotaTooltip(row.percentage, row.officialPercentage)}
-                                >
-                                    {row.percentage}%
-                                </span>
-                            </div>
-                        </div>
-                        <div className="w-full bg-gray-100 dark:bg-base-300 rounded-full h-1.5 overflow-hidden">
-                            <div
-                                className={`h-full rounded-full transition-all duration-700 ${
-                                    row.percentage >= 50
-                                        ? 'bg-gradient-to-r from-emerald-400 to-emerald-500'
-                                        : row.percentage >= 20
-                                          ? 'bg-gradient-to-r from-amber-400 to-amber-500'
-                                          : 'bg-gradient-to-r from-rose-400 to-rose-500'
-                                }`}
-                                style={{ width: `${row.percentage}%` }}
-                            />
-                        </div>
-                    </div>
-                ))}
+                <div className="grid grid-cols-1 gap-2">
+                    {splitRows.map((row) => (
+                        <QuotaItem
+                            key={row.id}
+                            label={row.label}
+                            percentage={row.percentage}
+                            resetTime={row.reset_time}
+                            isProtected={account.protected_models?.includes(row.protectedKey)}
+                            liveLimit={getLiveLimitForModel(account, row.id, row.protectedKey)}
+                            Icon={row.protectedKey === 'claude' ? Claude.Color : Gemini.Color}
+                            quotaTitle={formatQuotaTooltip(row.percentage, row.officialPercentage)}
+                        />
+                    ))}
+                </div>
             </div>
 
             {onSwitch && (

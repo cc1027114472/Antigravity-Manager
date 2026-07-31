@@ -68,7 +68,8 @@ pub fn start_scheduler(
                 continue;
             };
 
-            if !app_config.auto_refresh {
+            // Only run when auto warmup switch is enabled
+            if !app_config.scheduled_warmup.enabled {
                 continue;
             }
 
@@ -337,6 +338,10 @@ pub async fn trigger_warmup_for_account(account: &Account) {
         logger::log_warn("[Scheduler] Failed to load app config, skipping warmup check");
         return;
     };
+
+    if !app_config.scheduled_warmup.enabled {
+        return;
+    }
 
     let now_ts = Utc::now().timestamp();
     let mut tasks_to_run = Vec::new();

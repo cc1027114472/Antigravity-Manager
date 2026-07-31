@@ -68,6 +68,10 @@ pub struct TokenManager {
     load_code_assist_inflight:
         Arc<DashMap<String, tokio::sync::watch::Receiver<Option<Result<String, String>>>>>,
 
+    /// Per account+billing-group cooldown for threshold-cross online calibrate.
+    /// Key: "{account_id}:{billing_group}" → last trigger unix seconds.
+    threshold_calibrate_cooldown: Arc<DashMap<String, i64>>,
+
     /// 串行号池配置（默认关闭）
     serial_pool: Arc<tokio::sync::RwLock<SerialPoolConfig>>,
     /// advance 互斥锁
@@ -100,6 +104,7 @@ impl TokenManager {
             )),
             refresh_locks: Arc::new(DashMap::new()),
             load_code_assist_inflight: Arc::new(DashMap::new()), // 初始化 inflight 表
+            threshold_calibrate_cooldown: Arc::new(DashMap::new()),
             serial_pool: Arc::new(tokio::sync::RwLock::new(SerialPoolConfig::default())),
             advance_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_advance: Arc::new(tokio::sync::RwLock::new(None)),
@@ -866,6 +871,7 @@ impl TokenManager {
 
         let mut new_pct = 0;
         let mut should_protect = false;
+        let mut should_calibrate = false;
         let threshold = app_config.quota_protection.threshold_percentage as i32;
         let protection_on = app_config.quota_protection.enabled
             && app_config.quota_protection.monitored_models.iter().any(|m| {
@@ -908,17 +914,38 @@ impl TokenManager {
             {
                 entry.remaining_quota = Some(max_q);
             }
-            if protection_on && new_pct <= threshold {
+
+            let cooldown_key =
+                crate::modules::quota_ledger::threshold_calibrate_cooldown_key(&account_id, &std_id);
+            let now_ts = chrono::Utc::now().timestamp();
+            let in_cooldown = crate::modules::quota_ledger::is_calibrate_cooldown_active(
+                self.threshold_calibrate_cooldown
+                    .get(&cooldown_key)
+                    .map(|v| *v),
+                now_ts,
+                crate::modules::quota_ledger::THRESHOLD_CALIBRATE_COOLDOWN_SECS,
+            );
+            let decision = crate::modules::quota_ledger::evaluate_threshold_cross(
+                protection_on,
+                current,
+                new_pct,
+                threshold,
+                in_cooldown,
+            );
+            should_protect = decision.should_protect_now;
+            should_calibrate = decision.should_trigger_calibrate;
+
+            if should_protect {
                 entry.protected_models.insert(std_id.clone());
-                should_protect = true;
             }
             tracing::debug!(
-                "[QuotaLedger] burn account={} model={} -{}% -> {}% protect={}",
+                "[QuotaLedger] burn account={} model={} -{}% -> {}% protect={} calibrate={}",
                 account_id,
                 std_id,
                 burn,
                 new_pct,
-                should_protect
+                should_protect,
+                should_calibrate
             );
         } else {
             return;
@@ -937,6 +964,148 @@ impl TokenManager {
                 tracing::debug!("[QuotaLedger] persist burn failed: {}", e);
             }
         });
+
+        if should_calibrate {
+            let cooldown_key =
+                crate::modules::quota_ledger::threshold_calibrate_cooldown_key(&account_id, &std_id);
+            let now_ts = chrono::Utc::now().timestamp();
+            // Stamp cooldown before spawn to prevent concurrent double-fire.
+            self.threshold_calibrate_cooldown
+                .insert(cooldown_key, now_ts);
+
+            tracing::info!(
+                "[QuotaLedger] Threshold cross → online calibrate: account={} group={} local={}% threshold={}%",
+                account_id,
+                std_id,
+                new_pct,
+                threshold
+            );
+
+            if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                let account_id_c = account_id.clone();
+                let billing_c = std_id.clone();
+                let fallback_pct = new_pct;
+                tauri::async_runtime::spawn(async move {
+                    tm.calibrate_on_threshold_cross(&account_id_c, &billing_c, fallback_pct)
+                        .await;
+                });
+            } else {
+                tracing::warn!(
+                    "[QuotaLedger] No shared TokenManager; falling back to local protect for {} / {}",
+                    account_id,
+                    std_id
+                );
+                self.apply_threshold_cross_protect_fallback(&account_id, &std_id, new_pct);
+            }
+        }
+    }
+
+    /// Apply local protect after a failed / unavailable threshold-cross calibrate.
+    fn apply_threshold_cross_protect_fallback(
+        &self,
+        account_id: &str,
+        billing_group: &str,
+        local_pct: i32,
+    ) {
+        if let Some(mut entry) = self.tokens.get_mut(account_id) {
+            entry.protected_models.insert(billing_group.to_string());
+        }
+        let account_id = account_id.to_string();
+        let billing_group = billing_group.to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = crate::modules::account::persist_estimated_quota_burn(
+                &account_id,
+                &billing_group,
+                local_pct,
+                true,
+            ) {
+                tracing::warn!(
+                    "[QuotaLedger] Fallback protect persist failed for {} / {}: {}",
+                    account_id,
+                    billing_group,
+                    e
+                );
+            }
+        });
+    }
+
+    /// Fetch official quota after local ledger crossed the protection threshold.
+    /// On success: calibrate + apply_protection via update_account_quota, then reload.
+    /// On failure: protect based on the local burned percentage.
+    async fn calibrate_on_threshold_cross(
+        &self,
+        account_id: &str,
+        billing_group: &str,
+        fallback_local_pct: i32,
+    ) {
+        let (access_token, email) = match self.tokens.get(account_id) {
+            Some(entry) => (entry.access_token.clone(), entry.email.clone()),
+            None => {
+                tracing::warn!(
+                    "[QuotaLedger] Threshold calibrate skipped: account {} not in pool",
+                    account_id
+                );
+                self.apply_threshold_cross_protect_fallback(
+                    account_id,
+                    billing_group,
+                    fallback_local_pct,
+                );
+                return;
+            }
+        };
+
+        match crate::modules::quota::fetch_quota(&access_token, &email, Some(account_id)).await {
+            Ok((quota_data, _project_id)) => {
+                match crate::modules::account::update_account_quota(account_id, quota_data) {
+                    Ok(()) => {
+                        if let Err(e) = self.reload_account(account_id).await {
+                            tracing::warn!(
+                                "[QuotaLedger] Threshold calibrate reload failed for {}: {}",
+                                account_id,
+                                e
+                            );
+                        } else {
+                            let official = self
+                                .tokens
+                                .get(account_id)
+                                .and_then(|e| e.model_quotas.get(billing_group).copied());
+                            tracing::info!(
+                                "[QuotaLedger] Threshold calibrate OK: account={} group={} official_pct={:?} (was local {}%)",
+                                account_id,
+                                billing_group,
+                                official,
+                                fallback_local_pct
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[QuotaLedger] Threshold calibrate persist failed for {}: {}; falling back to local protect",
+                            account_id,
+                            e
+                        );
+                        self.apply_threshold_cross_protect_fallback(
+                            account_id,
+                            billing_group,
+                            fallback_local_pct,
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[QuotaLedger] Threshold calibrate fetch failed for {} / {}: {}; falling back to local protect",
+                    email,
+                    billing_group,
+                    e
+                );
+                self.apply_threshold_cross_protect_fallback(
+                    account_id,
+                    billing_group,
+                    fallback_local_pct,
+                );
+            }
+        }
     }
 
     /// 计算账号的最大剩余配额百分比（用于排序）

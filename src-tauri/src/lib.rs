@@ -345,9 +345,9 @@ pub fn run() {
 
                     info!("Headless proxy service is running.");
 
-                    // [DISABLED] Start smart scheduler (Automatic warmup disabled as per user request)
-                    // modules::scheduler::start_scheduler(None, proxy_state.clone());
-                    info!("Smart scheduler (Automatic Warmup) is DISABLED.");
+                    // Start smart scheduler (respects scheduled_warmup.enabled at runtime)
+                    modules::scheduler::start_scheduler(None, proxy_state.clone());
+                    info!("Smart scheduler started (auto warmup gated by settings).");
 
                     // Local ledger calibration: online fetch on auto_refresh interval (no UI needed).
                     modules::quota_calibration::start_quota_calibration_ticker();
@@ -473,10 +473,10 @@ pub fn run() {
                 }
             });
 
-            // [DISABLED] Start smart scheduler (Automatic warmup disabled as per user request)
-            // let scheduler_state = app.handle().state::<commands::proxy::ProxyServiceState>();
-            // modules::scheduler::start_scheduler(Some(app.handle().clone()), scheduler_state.inner().clone());
-            info!("Smart scheduler (Automatic Warmup) is DISABLED.");
+            // Start smart scheduler (respects scheduled_warmup.enabled at runtime)
+            let scheduler_state = app.handle().state::<commands::proxy::ProxyServiceState>();
+            modules::scheduler::start_scheduler(Some(app.handle().clone()), scheduler_state.inner().clone());
+            info!("Smart scheduler started (auto warmup gated by settings).");
 
             // Online quota → local ledger calibration (also covers cases where UI timer is idle).
             modules::quota_calibration::start_quota_calibration_ticker();

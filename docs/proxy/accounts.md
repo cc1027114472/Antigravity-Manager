@@ -55,6 +55,7 @@ Burn on successful proxy responses (`ProxyMonitor::log_request` → `TokenManage
 - `burn = max(min_burn_pct, ceil(tokens / tokens_per_percent))` (no usage → `min_burn_pct` only)
 - Config: `AppConfig.quota_ledger` (`enabled`, `min_burn_pct` default 1, `tokens_per_percent` default 20000)
 - Threshold compare uses `<=` so reserve at exactly the threshold is protected
+- **Threshold-cross calibrate:** when quota protection is on and a monitored billing group first crosses from above the threshold to `<= threshold`, the proxy fetches official quota once (10‑minute cooldown per account+group), overwrites the local ledger via `update_account_quota`, then decides protection from the calibrated %. Calibrate failure falls back to protecting on the local estimate.
 
 **Serial pool vs ledger:** serial advance still keys off `protected_models` / rate limits (AI selection). The ledger only makes protection trip sooner between online refreshes. Both share the same account↔proxy binding table for egress; they are not the same feature.
 

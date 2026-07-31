@@ -7,7 +7,7 @@ import { AppConfig } from '../types/config';
 import ModalDialog from '../components/common/ModalDialog';
 import { showToast } from '../components/common/ToastContainer';
 import QuotaProtection from '../components/settings/QuotaProtection';
-// import SmartWarmup from '../components/settings/SmartWarmup';
+import SmartWarmup from '../components/settings/SmartWarmup';
 import PinnedQuotaModels from '../components/settings/PinnedQuotaModels';
 import { useDebugConsole } from '../stores/useDebugConsole';
 
@@ -792,8 +792,8 @@ function Settings() {
                                 )}
                             </div>
 
-                            {/* 智能预热 (Smart Warmup) - [DISABLED] Backend scheduler commented out as per user request */}
-                            {/* <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-orange-200 transition-all duration-300 shadow-sm">
+                            {/* 智能预热 (Smart Warmup) */}
+                            <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-orange-200 transition-all duration-300 shadow-sm">
                                 <SmartWarmup
                                     config={formData.scheduled_warmup}
                                     onChange={async (newConfig) => {
@@ -810,7 +810,7 @@ function Settings() {
                                         }
                                     }}
                                 />
-                            </div> */}
+                            </div>
 
                             {/* 配额保护 (Quota Protection) */}
                             <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-rose-200 transition-all duration-300 shadow-sm">
