@@ -1197,14 +1197,20 @@ function Accounts() {
         title={
           selectedIds.size > 0
             ? t("accounts.dialog.batch_refresh_title")
-            : t("accounts.dialog.refresh_title")
+            : t("accounts.dialog.refresh_all_title", {
+                defaultValue: t("accounts.dialog.refresh_title"),
+              })
         }
         message={
           selectedIds.size > 0
             ? t("accounts.dialog.batch_refresh_msg", {
               count: selectedIds.size,
             })
-            : t("accounts.dialog.refresh_msg")
+            : t("accounts.dialog.refresh_all_msg", {
+              count: accounts.length,
+              defaultValue:
+                "Are you sure you want to refresh quotas for all {{count}} accounts? This may take some time.",
+            })
         }
         type="confirm"
         confirmText={t("common.refresh")}
