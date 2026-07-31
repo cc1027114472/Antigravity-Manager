@@ -131,12 +131,7 @@ struct Tier {
 /// Get shared HTTP Client (15s timeout) for pure info fetching (No JA3)
 async fn create_standard_client(account_id: Option<&str>) -> rquest::Client {
     if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        if let Some(id) = account_id {
-            return pool
-                .get_effective_standard_client_for_account_ops(id, 15)
-                .await;
-        }
-        pool.get_effective_standard_client(None, 15).await
+        pool.get_effective_standard_client(account_id, 15).await
     } else {
         crate::utils::http::get_standard_client()
     }
@@ -146,12 +141,7 @@ async fn create_standard_client(account_id: Option<&str>) -> rquest::Client {
 #[allow(dead_code)] // 预留给预热/后台任务调用
 async fn create_long_standard_client(account_id: Option<&str>) -> rquest::Client {
     if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        if let Some(id) = account_id {
-            return pool
-                .get_effective_standard_client_for_account_ops(id, 60)
-                .await;
-        }
-        pool.get_effective_standard_client(None, 60).await
+        pool.get_effective_standard_client(account_id, 60).await
     } else {
         crate::utils::http::get_long_standard_client()
     }

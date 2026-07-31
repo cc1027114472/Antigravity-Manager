@@ -1673,6 +1673,7 @@ impl TokenManager {
                             } else {
                                 match crate::proxy::project_resolver::fetch_project_id(
                                     &token.access_token,
+                                    Some(&token.account_id),
                                 )
                                 .await
                                 {
@@ -2111,8 +2112,11 @@ impl TokenManager {
                     tracing::debug!("账号 {} 启动 [SingleFlight] ProjectID 探测...", token.email);
 
                     let result =
-                        match crate::proxy::project_resolver::fetch_project_id(&token.access_token)
-                            .await
+                        match crate::proxy::project_resolver::fetch_project_id(
+                            &token.access_token,
+                            Some(&token.account_id),
+                        )
+                        .await
                         {
                             Ok(pid) => {
                                 if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
@@ -2155,6 +2159,7 @@ impl TokenManager {
                             } else {
                                 match crate::proxy::project_resolver::fetch_project_id(
                                     &entry.access_token,
+                                    Some(&token.account_id),
                                 )
                                 .await
                                 {
@@ -3354,7 +3359,12 @@ impl TokenManager {
         let project_id = if let Some(pid) = project_id {
             pid
         } else {
-            match crate::proxy::project_resolver::fetch_project_id(&token.access_token).await {
+            match crate::proxy::project_resolver::fetch_project_id(
+                &token.access_token,
+                Some(&token.account_id),
+            )
+            .await
+            {
                 Ok(pid) => {
                     if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
                         entry.project_id = Some(pid.clone());
@@ -3542,14 +3552,20 @@ impl TokenManager {
     /// 添加新账号 (纯后端实现，不依赖 Tauri AppHandle)
     pub async fn add_account(&self, email: &str, refresh_token: &str) -> Result<(), String> {
         // 1. 获取 Access Token (验证 refresh_token 有效性)
-        let token_info = crate::modules::oauth::refresh_access_token(refresh_token, None)
-            .await
-            .map_err(|e| format!("Invalid refresh token: {}", e))?;
+        // Use a temp account id so project resolve shares the same pool egress as oauth
+        let temp_account_id = uuid::Uuid::new_v4().to_string();
+        let token_info =
+            crate::modules::oauth::refresh_access_token(refresh_token, Some(&temp_account_id))
+                .await
+                .map_err(|e| format!("Invalid refresh token: {}", e))?;
 
         // 2. 获取项目 ID (Project ID)
-        let project_id = crate::proxy::project_resolver::fetch_project_id(&token_info.access_token)
-            .await
-            .unwrap_or_else(|_| "bamboo-precept-lgxtn".to_string()); // Fallback
+        let project_id = crate::proxy::project_resolver::fetch_project_id(
+            &token_info.access_token,
+            Some(&temp_account_id),
+        )
+        .await
+        .unwrap_or_else(|_| "bamboo-precept-lgxtn".to_string()); // Fallback
 
         // 3. 委托给 modules::account::add_account 处理 (包含文件写入、索引更新、锁)
         let email_clone = email.to_string();

@@ -33,6 +33,19 @@ pub struct PoolProxyConfig {
     pub entry_id: String,
 }
 
+/// Pins a resolved egress for one account so nested ops (token/quota/project)
+/// reuse the same proxy without re-running pool selection (e.g. RoundRobin).
+pub struct AccountEgressGuard {
+    pool: Arc<ProxyPoolManager>,
+    account_id: String,
+}
+
+impl Drop for AccountEgressGuard {
+    fn drop(&mut self) {
+        self.pool.forced_egress.remove(&self.account_id);
+    }
+}
+
 /// 代理池管理器
 pub struct ProxyPoolManager {
     config: Arc<RwLock<ProxyPoolConfig>>,
@@ -45,6 +58,9 @@ pub struct ProxyPoolManager {
 
     /// 轮询索引 (用于 RoundRobin 策略)
     round_robin_index: Arc<AtomicUsize>,
+
+    /// Temporary resolve-once pin: `None` forces upstream/direct (skip pool re-pick).
+    forced_egress: Arc<DashMap<String, Option<PoolProxyConfig>>>,
 }
 
 impl ProxyPoolManager {
@@ -71,6 +87,7 @@ impl ProxyPoolManager {
             usage_counter: Arc::new(DashMap::new()),
             account_bindings,
             round_robin_index: Arc::new(AtomicUsize::new(0)),
+            forced_egress: Arc::new(DashMap::new()),
         }
     }
 
@@ -202,70 +219,7 @@ impl ProxyPoolManager {
         builder.build().unwrap_or_else(|_| Client::new())
     }
 
-    /// 账号运维面（额度/token refresh）出口：仅绑定，禁止未绑定蹭池
-    pub async fn resolve_account_ops_proxy(
-        &self,
-        account_id: &str,
-    ) -> Option<(AccountOpsRoute, PoolProxyConfig)> {
-        let config = self.config.read().await;
-        if !config.enabled || config.proxies.is_empty() {
-            return None;
-        }
-        match self.get_bound_proxy(account_id, &config).await {
-            Ok(Some(proxy)) => Some((AccountOpsRoute::Bound, proxy)),
-            _ => None,
-        }
-    }
-
-    /// 额度/OAuth refresh 等账号运维请求的 Standard Client：
-    /// `bound → upstream → direct`，**绝不** `select_proxy_from_pool`。
-    pub async fn get_effective_standard_client_for_account_ops(
-        &self,
-        account_id: &str,
-        timeout_secs: u64,
-    ) -> Client {
-        let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
-
-        if let Some((route, proxy_cfg)) = self.resolve_account_ops_proxy(account_id).await {
-            tracing::info!(
-                "[Proxy] AccountOps Route: {} -> {:?} ({})",
-                account_id,
-                route,
-                proxy_cfg.entry_id
-            );
-            builder = builder.proxy(proxy_cfg.proxy);
-            return builder.build().unwrap_or_else(|_| Client::new());
-        }
-
-        if let Ok(app_cfg) = crate::modules::config::load_app_config() {
-            let up = app_cfg.proxy.upstream_proxy;
-            if up.enabled && !up.url.is_empty() {
-                if let Ok(p) = rquest::Proxy::all(&up.url) {
-                    tracing::info!(
-                        "[Proxy] AccountOps Route: {} -> Upstream ({})",
-                        account_id,
-                        up.url
-                    );
-                    builder = builder.proxy(p);
-                    return builder.build().unwrap_or_else(|_| Client::new());
-                }
-            }
-        }
-
-        tracing::info!("[Proxy] AccountOps Route: {} -> Direct", account_id);
-        builder.build().unwrap_or_else(|_| Client::new())
-    }
-
-    /// 批量额度刷新用的出口键：同 key 串行，避免多号同 IP 并发
-    pub async fn egress_key_for_account(&self, account_id: &str) -> String {
-        let config = self.config.read().await;
-        if config.enabled {
-            if let Ok(Some(proxy)) = self.get_bound_proxy(account_id, &config).await {
-                return format!("proxy:{}", proxy.entry_id);
-            }
-        }
-        drop(config);
-
+    fn fallback_egress_key() -> String {
         if let Ok(app_cfg) = crate::modules::config::load_app_config() {
             let up = app_cfg.proxy.upstream_proxy;
             if up.enabled && !up.url.is_empty() {
@@ -275,11 +229,61 @@ impl ProxyPoolManager {
         "direct".to_string()
     }
 
-    /// 为账号获取代理
+    fn egress_key_from_proxy(proxy: &Option<PoolProxyConfig>) -> String {
+        match proxy {
+            Some(p) => format!("proxy:{}", p.entry_id),
+            None => Self::fallback_egress_key(),
+        }
+    }
+
+    /// Pin resolved egress for nested account ops (batch refresh resolve-once).
+    pub fn pin_account_egress(
+        self: &Arc<Self>,
+        account_id: String,
+        proxy: Option<PoolProxyConfig>,
+    ) -> AccountEgressGuard {
+        self.forced_egress.insert(account_id.clone(), proxy);
+        AccountEgressGuard {
+            pool: Arc::clone(self),
+            account_id,
+        }
+    }
+
+    /// Resolve AI-identical egress once, pin it, and return the batch semaphore key.
+    pub async fn resolve_and_pin_egress(
+        self: &Arc<Self>,
+        account_id: &str,
+    ) -> (String, AccountEgressGuard) {
+        let proxy = self
+            .get_proxy_for_account(account_id)
+            .await
+            .ok()
+            .flatten();
+        let key = Self::egress_key_from_proxy(&proxy);
+        let guard = self.pin_account_egress(account_id.to_string(), proxy);
+        (key, guard)
+    }
+
+    /// 批量额度刷新用的出口键：与 AI 同源（bound → pool → upstream → direct）
+    pub async fn egress_key_for_account(&self, account_id: &str) -> String {
+        let proxy = self
+            .get_proxy_for_account(account_id)
+            .await
+            .ok()
+            .flatten();
+        Self::egress_key_from_proxy(&proxy)
+    }
+
+    /// 为账号获取代理（与 AI 反代相同：bound → 未绑定池选择）
     pub async fn get_proxy_for_account(
         &self,
         account_id: &str,
     ) -> Result<Option<PoolProxyConfig>, String> {
+        // Resolve-once pin for nested ops within a batch task
+        if let Some(pinned) = self.forced_egress.get(account_id) {
+            return Ok(pinned.value().clone());
+        }
+
         let config = self.config.read().await;
 
         if !config.enabled || config.proxies.is_empty() {
@@ -810,13 +814,6 @@ impl ProxyPoolManager {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccountOpsRoute {
-    Bound,
-    Upstream,
-    Direct,
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchBindApplied {
@@ -936,22 +933,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_account_ops_no_pool_scrape_when_unbound() {
+    async fn test_unbound_ops_use_same_pool_picker_as_ai() {
         let pool = test_pool(vec![proxy("pool-node", None), proxy("spare", None)]);
-        let ops = pool.resolve_account_ops_proxy("unbound-acc").await;
-        assert!(ops.is_none());
-
-        let key = pool.egress_key_for_account("unbound-acc").await;
-        assert!(key == "upstream" || key == "direct");
-
         let ai = pool.get_proxy_for_account("unbound-acc").await.unwrap();
         assert!(ai.is_some());
+
+        let key = pool.egress_key_for_account("unbound-acc").await;
+        assert!(key.starts_with("proxy:"), "unbound with healthy pool should get proxy key, got {key}");
 
         let _ = pool
             .bind_account_to_proxy_inner("a1".into(), "pool-node".into(), false)
             .await;
-        let ops = pool.resolve_account_ops_proxy("a1").await;
-        assert!(matches!(ops, Some((AccountOpsRoute::Bound, _))));
         assert_eq!(pool.egress_key_for_account("a1").await, "proxy:pool-node");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_and_pin_keeps_same_egress() {
+        let pool = Arc::new(test_pool(vec![proxy("p1", None), proxy("p2", None)]));
+
+        let (key, _guard) = pool.resolve_and_pin_egress("acc").await;
+        assert!(key.starts_with("proxy:"));
+        let first = pool.get_proxy_for_account("acc").await.unwrap();
+        let second = pool.get_proxy_for_account("acc").await.unwrap();
+        assert_eq!(
+            first.as_ref().map(|p| p.entry_id.as_str()),
+            second.as_ref().map(|p| p.entry_id.as_str())
+        );
+        assert_eq!(key, format!("proxy:{}", first.as_ref().unwrap().entry_id));
     }
 }

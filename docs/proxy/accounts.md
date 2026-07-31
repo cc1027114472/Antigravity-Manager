@@ -26,21 +26,20 @@ This prevents endless rotation attempts against a dead account.
 `refresh_all_quotas_logic` in [`src-tauri/src/modules/account.rs`](../../src-tauri/src/modules/account.rs):
 - Skips accounts marked `quota.is_forbidden` (not all `disabled` flags).
 - Global concurrency max **5**.
-- **Same egress key** (bound `proxy:{id}`, else `upstream` / `direct`) runs **at most 1** refresh at a time, so multiple accounts sharing one IP do not hit Google in parallel.
+- **Same egress key** (`proxy:{id}` from AI-identical resolve, else `upstream` / `direct`) runs **at most 1** refresh at a time, so multiple accounts sharing one IP do not hit Google in parallel.
+- Per-account **resolve-once + pin**: the batch task resolves egress once via `resolve_and_pin_egress`, so nested token refresh / quota / project calls reuse that same proxy (avoids RoundRobin advancing mid-task).
 
-### 3b) Quota / token-refresh egress (account ops)
-Quota fetch and OAuth `refresh_access_token` (with `account_id`) use **account-ops egress**, not the AI traffic pool picker:
+### 3b) Unified account egress (= AI traffic)
+Quota fetch, OAuth `refresh_access_token` (with `account_id`), `project_resolver::fetch_project_id`, calibration ticker (via batch refresh), and AI chat all share the same picker:
 
 1. Bound proxy for that account  
-2. Else global upstream proxy  
-3. Else direct  
+2. Else unbound pool selection (`select_proxy_from_pool`)  
+3. Else global upstream proxy  
+4. Else direct  
 
-**Unbound accounts never scrape `select_proxy_from_pool`** (avoids sharing someone else’s / random pool IP for ops).  
-AI chat traffic still uses `get_effective_client` / pool selection as before.
+See: `get_proxy_for_account` / `get_effective_standard_client` / `resolve_and_pin_egress` in [`src-tauri/src/proxy/proxy_pool.rs`](../../src-tauri/src/proxy/proxy_pool.rs).
 
-Prefer **one account ↔ one proxy binding** so quota refresh and AI share the same egress.
-
-See: `get_effective_standard_client_for_account_ops` / `egress_key_for_account` in [`src-tauri/src/proxy/proxy_pool.rs`](../../src-tauri/src/proxy/proxy_pool.rs).
+**Sticky same IP across separate requests** still prefers **one account ↔ one proxy binding**. Unbound + RoundRobin/Random may pick different pool nodes on different tasks; within one batch task the pin keeps them aligned.
 
 ### 3c) Local quota ledger (estimate + calibrate)
 Selection and `quota_protection` prefer **local estimated remaining %** per standard model id (`Account.estimated_quotas`), not the last online snapshot alone.

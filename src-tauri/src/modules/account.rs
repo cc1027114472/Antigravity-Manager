@@ -1140,7 +1140,11 @@ async fn ensure_enterprise_project_ready(account: &mut Account) -> Result<(), St
         account.email
     ));
 
-    match crate::proxy::project_resolver::fetch_project_id(&account.token.access_token).await {
+    match crate::proxy::project_resolver::fetch_project_id(
+        &account.token.access_token,
+        Some(&account.id),
+    )
+    .await {
         Ok(project_id) => {
             crate::modules::logger::log_info(&format!(
                 "Resolved enterprise project_id for {}: {}",
@@ -2037,13 +2041,14 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
             let global_sem = global_sem.clone();
             let egress_sems = egress_sems.clone();
             async move {
-                let egress_key = if let Some(pool) =
-                    crate::proxy::proxy_pool::get_global_proxy_pool()
-                {
-                    pool.egress_key_for_account(&account_id).await
-                } else {
-                    "direct".to_string()
-                };
+                let (egress_key, _egress_pin) =
+                    if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                        // Resolve once and pin so token/quota/project share the same egress
+                        let (key, guard) = pool.resolve_and_pin_egress(&account_id).await;
+                        (key, Some(guard))
+                    } else {
+                        ("direct".to_string(), None)
+                    };
 
                 let per_egress = egress_sems
                     .entry(egress_key.clone())
