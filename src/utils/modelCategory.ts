@@ -4,15 +4,35 @@
 
 export type ModelCategory = 'gemini-pro' | 'gemini-flash' | 'gemini-pro-image' | 'gemini-flash-image' | 'claude' | 'other';
 
+/** Official Google billing big buckets */
+export type BillingGroup = 'gemini' | 'claude';
+
+export const BILLING_GROUPS: BillingGroup[] = ['gemini', 'claude'];
+
 export function categorizeModel(name: string): ModelCategory {
     const n = name.trim().toLowerCase();
-    const isGemini = n.startsWith('gemini-');
+    if (n === 'gemini') return 'gemini-flash';
+    if (n === 'claude' || n === '3p') return 'claude';
+    const isGemini = n.startsWith('gemini-') || n.startsWith('gemini');
     const isImage = (isGemini && n.includes('image')) || n.startsWith('image') || n.startsWith('imagen');
     if (isImage) return n.includes('flash') ? 'gemini-flash-image' : 'gemini-pro-image';
     if (isGemini && n.includes('flash')) return 'gemini-flash';
     if (isGemini && n.includes('pro')) return 'gemini-pro';
     if (n.includes('claude') || n.includes('opus') || n.includes('sonnet') || n.includes('haiku')) return 'claude';
+    if (n.includes('gpt') || n.startsWith('o1') || n.startsWith('o3')) return 'claude';
     return 'other';
+}
+
+/** Map any model / legacy std id to official billing group. */
+export function normalizeToBillingGroup(name: string): BillingGroup | null {
+    const n = name.trim().toLowerCase();
+    if (!n) return null;
+    if (n === 'gemini' || n.startsWith('gemini')) return 'gemini';
+    if (n === 'claude' || n === '3p') return 'claude';
+    const cat = categorizeModel(n);
+    if (cat === 'claude') return 'claude';
+    if (cat !== 'other') return 'gemini';
+    return null;
 }
 
 export interface ModelDisplayNameInput {
@@ -41,8 +61,8 @@ export function findQuotaModel<T extends { name: string }>(
     if (!models || models.length === 0) return undefined;
     const preferred: Partial<Record<ModelCategory, string[]>> = {
         'gemini-pro': ['gemini-pro-agent', 'gemini-3.1-pro-high', 'gemini-3.1-pro', 'gemini-3.1-pro-low', 'gemini-2.5-pro'],
-        'gemini-flash': ['gemini-3-flash-agent', 'gemini-3-flash', 'gemini-3.5-flash'],
-        'claude': ['claude-sonnet-4-6', 'claude-opus-4-6-thinking'],
+        'gemini-flash': ['gemini-3-flash-agent', 'gemini-3-flash', 'gemini-3.5-flash', 'gemini'],
+        'claude': ['claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'claude'],
     };
     const names = preferred[category];
     if (names) {
@@ -54,20 +74,13 @@ export function findQuotaModel<T extends { name: string }>(
     return models.find(m => categorizeModel(m.name) === category);
 }
 
+/** Protection / ledger key = official billing group. */
 export function getModelProtectionKey(name: string): string | null {
-    switch (categorizeModel(name)) {
-        case 'gemini-flash': return 'gemini-3-flash';
-        case 'gemini-pro': return 'gemini-3-pro-high';
-        case 'gemini-flash-image': return 'gemini-3.1-flash-image';
-        case 'gemini-pro-image': return 'gemini-3-pro-image';
-        case 'claude': return 'claude';
-        default: return null;
-    }
+    return normalizeToBillingGroup(name);
 }
 
 /**
  * 在任意图片类别中查找第一个实际模型。
- * 用于让新旧 image selector 共享同一配额槽位。
  */
 export function findImageQuotaModel<T extends { name: string }>(
     models: T[] | undefined,
@@ -79,18 +92,18 @@ export function findImageQuotaModel<T extends { name: string }>(
     });
 }
 
-/** 账号管理 pin 列表缺省图像选择器时补入代表 Image，与仪表盘对齐。 */
-export const DEFAULT_IMAGE_PIN_SELECTOR = 'gemini-3.1-flash-image';
+/** @deprecated Pin list now uses billing groups; kept for compat. */
+export const DEFAULT_IMAGE_PIN_SELECTOR = 'gemini';
 
 export function ensurePinnedImageSelector(selectorIds: string[] | undefined): string[] {
     const pinned = selectorIds ? [...selectorIds] : [];
-    const hasImage = pinned.some(id => {
-        const category = categorizeModel(id);
-        return category === 'gemini-flash-image' || category === 'gemini-pro-image';
-    });
-    if (hasImage) return pinned;
-    pinned.push(DEFAULT_IMAGE_PIN_SELECTOR);
-    return pinned;
+    const billingOnly = pinned
+        .map(id => normalizeToBillingGroup(id))
+        .filter((g): g is BillingGroup => !!g);
+    if (billingOnly.length > 0) {
+        return Array.from(new Set(billingOnly));
+    }
+    return ['gemini', 'claude'];
 }
 
 export interface QuotaModelSelection<T> {
@@ -108,14 +121,25 @@ export function resolveQuotaModels<T extends { name: string }>(
 
     for (const selectorId of selectorIds) {
         const normalizedId = selectorId.trim().toLowerCase();
-        const category = categorizeModel(normalizedId);
+        const billing = normalizeToBillingGroup(normalizedId);
+        if (billing) {
+            const selectionKey = `billing:${billing}`;
+            if (seen.has(selectionKey)) continue;
+            seen.add(selectionKey);
+            const model =
+                models?.find(m => m.name === billing)
+                ?? models?.find(m => normalizeToBillingGroup(m.name) === billing);
+            results.push({ selectorId: billing, selectionKey, model });
+            continue;
+        }
 
+        const category = categorizeModel(normalizedId);
         const isImage = category === 'gemini-pro-image' || category === 'gemini-flash-image';
         const selectionKey = isImage
-            ? 'category:gemini-image'
+            ? 'billing:gemini'
             : category === 'other'
                 ? `model:${normalizedId}`
-                : `category:${category}`;
+                : `billing:${normalizeToBillingGroup(normalizedId) ?? category}`;
 
         if (seen.has(selectionKey)) continue;
         seen.add(selectionKey);
@@ -126,7 +150,11 @@ export function resolveQuotaModels<T extends { name: string }>(
                 ? models?.find(m => m.name.trim().toLowerCase() === normalizedId)
                 : findQuotaModel(models, category);
 
-        results.push({ selectorId, selectionKey, model });
+        results.push({
+            selectorId: billing ?? selectorId,
+            selectionKey,
+            model,
+        });
     }
     return results;
 }

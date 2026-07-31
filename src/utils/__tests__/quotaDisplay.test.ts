@@ -5,6 +5,7 @@
 import type { Account } from '../../types/account';
 import {
     formatQuotaTooltip,
+    getBillingGroupDisplays,
     getDisplayQuotaModels,
 } from '../quotaDisplay';
 
@@ -81,8 +82,8 @@ test('overlays estimated percentage onto online model', () => {
 test('synthesizes from ledger when online models missing', () => {
     const account = baseAccount({
         estimated_quotas: {
-            'gemini-3-flash': {
-                model: 'gemini-3-flash',
+            gemini: {
+                model: 'gemini',
                 percentage: 33,
                 lastOnlinePct: 40,
             },
@@ -91,7 +92,36 @@ test('synthesizes from ledger when online models missing', () => {
     const models = getDisplayQuotaModels(account);
     assertEq(models.length, 1);
     assertEq(models[0]?.percentage, 33);
-    assertEq(models[0]?.name, 'gemini-3-flash');
+    assertEq(models[0]?.name, 'gemini');
+});
+
+test('billing group display prefers ledger over official groups', () => {
+    const account = baseAccount({
+        estimated_quotas: {
+            gemini: { model: 'gemini', percentage: 15, lastOnlinePct: 42 },
+            claude: { model: 'claude', percentage: 80, lastOnlinePct: 80 },
+        },
+        quota: {
+            models: [],
+            last_updated: 1,
+            quota_groups: [
+                {
+                    display_name: 'Gemini Models',
+                    buckets: [
+                        {
+                            bucket_id: 'gemini-5h',
+                            window: '5h',
+                            remaining_fraction: 0.42,
+                            reset_time: 't',
+                        },
+                    ],
+                },
+            ],
+        },
+    });
+    const rows = getBillingGroupDisplays(account);
+    const gemini = rows.find((r) => r.id === 'gemini');
+    assertEq(gemini?.percentage, 15);
 });
 
 test('tooltip shows official only when different', () => {

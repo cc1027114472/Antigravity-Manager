@@ -334,6 +334,9 @@ export {
     ensurePinnedImageSelector,
     DEFAULT_IMAGE_PIN_SELECTOR,
     resolveQuotaModels,
+    normalizeToBillingGroup,
+    BILLING_GROUPS,
     type ModelCategory,
+    type BillingGroup,
     type QuotaModelSelection,
 } from '../utils/modelCategory';

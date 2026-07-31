@@ -3,9 +3,7 @@ import { Account } from '../../types/account';
 import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../../utils/format';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
-import { formatCompactDuration, getLiveLimitForModel, getLiveLimitState } from '../../utils/liveLimit';
-import { getModelProtectionKey, findQuotaModel, findImageQuotaModel } from '../../config/modelConfig';
-import { formatQuotaTooltip, getDisplayQuotaModels } from '../../utils/quotaDisplay';
+import { formatQuotaTooltip, getBillingGroupDisplays } from '../../utils/quotaDisplay';
 
 interface AccountRowProps {
     account: Account;
@@ -23,35 +21,11 @@ interface AccountRowProps {
     onToggleProxy: () => void;
 }
 
-
-
 function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice }: AccountRowProps) {
     const { t } = useTranslation();
-    const displayModels = getDisplayQuotaModels(account);
-    // [重构] 按优先级查找配额模型（本地账本优先）
-    const geminiProModel = findQuotaModel(displayModels, 'gemini-pro');
-    const geminiFlashModel = findQuotaModel(displayModels, 'gemini-flash');
-
-    const geminiImageModel = findImageQuotaModel(displayModels);
-    const imageProtectionKey = getModelProtectionKey(geminiImageModel?.name || '');
-    const liveImageLimit = getLiveLimitForModel(account, geminiImageModel?.name, imageProtectionKey ?? undefined);
-    const liveImageState = getLiveLimitState(liveImageLimit);
-    const isImageLiveLimited = liveImageState.shouldShow;
-    const imageLimitTitle = liveImageLimit
-        ? [
-            liveImageState.isActive
-                ? `Live image endpoint is temporarily unavailable for ${formatCompactDuration(liveImageState.secondsRemaining)}.`
-                : `Image endpoint returned ${liveImageLimit.status} ${formatCompactDuration(liveImageState.secondsAgo)} ago.`,
-            `Reason: ${liveImageLimit.reason}.`,
-            `Quota snapshot can still show ${geminiImageModel?.percentage || 0}%.`,
-            liveImageLimit.message ? `Message: ${liveImageLimit.message}` : null,
-        ].filter(Boolean).join(' ')
-        : formatQuotaTooltip(geminiImageModel?.percentage, geminiImageModel?.officialPercentage) || 'Gemini 3.1 Flash Image';
-
-    const claudeModel = findQuotaModel(displayModels, 'claude');
+    const billingRows = getBillingGroupDisplays(account);
     const isDisabled = Boolean(account.disabled);
 
-    // 颜色映射，避免动态类名被 Tailwind purge
     const getColorClass = (percentage: number) => {
         const color = getQuotaColor(percentage);
         switch (color) {
@@ -77,7 +51,6 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
             isCurrent && "bg-blue-50/50 dark:bg-blue-900/10",
             (isRefreshing || isDisabled) && "opacity-70"
         )}>
-            {/* 序号 */}
             <td className="pl-6 py-1 w-12">
                 <input
                     type="checkbox"
@@ -88,7 +61,6 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 />
             </td>
 
-            {/* 邮箱 */}
             <td className="px-4 py-1">
                 <div className="flex items-center gap-3">
                     <span className={cn(
@@ -132,7 +104,6 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             </span>
                         )}
 
-                        {/* 订阅类型徽章 */}
                         {account.quota?.subscription_tier && (() => {
                             const tier = account.quota.subscription_tier.toLowerCase();
                             if (tier.includes('ultra')) {
@@ -162,7 +133,6 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 </div>
             </td>
 
-            {/* 模型配额 */}
             <td className="px-4 py-1">
                 {account.quota?.is_forbidden ? (
                     <div className="flex items-center gap-2 text-xs text-red-500 dark:text-red-400 bg-red-50/50 dark:bg-red-900/10 p-1.5 rounded-lg border border-red-100 dark:border-red-900/30">
@@ -171,144 +141,50 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                     </div>
                 ) : (
                     <div className="grid grid-cols-2 gap-x-4 gap-y-1 py-0">
-                        {/* Gemini Pro */}
-                        <div className={cn(
-                            "relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota",
-                            isImageLiveLimited && "border-amber-400/70 dark:border-amber-500/70 bg-amber-50/80 dark:bg-amber-950/30 ring-1 ring-amber-400/30",
-                            liveImageState.isActive && "border-rose-400/70 dark:border-rose-500/70 bg-rose-50/80 dark:bg-rose-950/30 ring-rose-400/30"
-                        )}>
-                            {geminiProModel && (
+                        {billingRows.map((row) => {
+                            const isProtected = account.protected_models?.includes(row.id);
+                            return (
                                 <div
-                                    className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(geminiProModel.percentage)}`}
-                                    style={{ width: `${geminiProModel.percentage}%` }}
-                                />
-                            )}
-                            <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Gemini 3.1 Pro">
-                                    {(account.protected_models?.includes('gemini-3-pro-high') || account.protected_models?.includes('gemini-3.1-pro-high')) && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
-                                    <span className="truncate">G3.1 Pro</span>
-                                </span>
-                                <div className="flex-1 flex justify-center">
-                                    {geminiProModel?.reset_time ? (
-                                        <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(geminiProModel.reset_time))}>
-                                            <Clock className="w-2.5 h-2.5" />
-                                            {formatTimeRemaining(geminiProModel.reset_time)}
+                                    key={row.id}
+                                    className="relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5"
+                                >
+                                    <div
+                                        className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(row.percentage)}`}
+                                        style={{ width: `${row.percentage}%` }}
+                                    />
+                                    <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
+                                        <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title={row.label}>
+                                            {isProtected && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                            <span className="truncate">{row.label}</span>
                                         </span>
-                                    ) : (
-                                        <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
-                                    )}
-                                </div>
-                                <span className={cn("w-[36px] text-right font-bold transition-colors",
-                                    getQuotaColor(geminiProModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
-                                        getQuotaColor(geminiProModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                )} title={formatQuotaTooltip(geminiProModel?.percentage, geminiProModel?.officialPercentage)}>
-                                    {geminiProModel ? `${geminiProModel.percentage}%` : '-'}
-                                </span>
-                            </div>
-                        </div>
-
-                        {/* Gemini Flash */}
-                        <div className="relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
-                            {geminiFlashModel && (
-                                <div
-                                    className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(geminiFlashModel.percentage)}`}
-                                    style={{ width: `${geminiFlashModel.percentage}%` }}
-                                />
-                            )}
-                            <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Gemini 3 Flash">
-                                    {account.protected_models?.includes('gemini-3-flash') && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
-                                    <span className="truncate">G3 Flash</span>
-                                </span>
-                                <div className="flex-1 flex justify-center">
-                                    {geminiFlashModel?.reset_time ? (
-                                        <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(geminiFlashModel.reset_time))}>
-                                            <Clock className="w-2.5 h-2.5" />
-                                            {formatTimeRemaining(geminiFlashModel.reset_time)}
+                                        <div className="flex-1 flex justify-center">
+                                            {row.reset_time ? (
+                                                <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(row.reset_time))}>
+                                                    <Clock className="w-2.5 h-2.5" />
+                                                    {formatTimeRemaining(row.reset_time)}
+                                                </span>
+                                            ) : (
+                                                <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
+                                            )}
+                                        </div>
+                                        <span
+                                            className={cn(
+                                                "w-[36px] text-right font-bold transition-colors",
+                                                getQuotaColor(row.percentage) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
+                                                    getQuotaColor(row.percentage) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
+                                            )}
+                                            title={formatQuotaTooltip(row.percentage, row.officialPercentage)}
+                                        >
+                                            {`${row.percentage}%`}
                                         </span>
-                                    ) : (
-                                        <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
-                                    )}
+                                    </div>
                                 </div>
-                                <span className={cn("w-[36px] text-right font-bold transition-colors",
-                                    getQuotaColor(geminiFlashModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
-                                        getQuotaColor(geminiFlashModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                )} title={formatQuotaTooltip(geminiFlashModel?.percentage, geminiFlashModel?.officialPercentage)}>
-                                    {geminiFlashModel ? `${geminiFlashModel.percentage}%` : '-'}
-                                </span>
-                            </div>
-                        </div>
-
-                        {/* Gemini Image */}
-                        <div className="relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
-                            {geminiImageModel && (
-                                <div
-                                    className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(geminiImageModel.percentage)}`}
-                                    style={{ width: `${geminiImageModel.percentage}%` }}
-                                />
-                            )}
-                            <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title={imageLimitTitle}>
-                                    {isImageLiveLimited && <Clock className={cn("w-2.5 h-2.5 shrink-0 z-10", liveImageState.isActive ? "text-rose-500" : "text-amber-500")} />}
-                                    {(imageProtectionKey && account.protected_models?.includes(imageProtectionKey)) && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
-                                    <span className="truncate">G3 Image</span>
-                                </span>
-                                <div className="flex-1 flex justify-center">
-                                    {geminiImageModel?.reset_time ? (
-                                        <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(geminiImageModel.reset_time))}>
-                                            <Clock className="w-2.5 h-2.5" />
-                                            {formatTimeRemaining(geminiImageModel.reset_time)}
-                                        </span>
-                                    ) : (
-                                        <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
-                                    )}
-                                </div>
-                                <span className={cn("w-[36px] text-right font-bold transition-colors",
-                                    isImageLiveLimited ? (liveImageState.isActive ? 'text-rose-600 dark:text-rose-400' : 'text-amber-600 dark:text-amber-400') :
-                                        getQuotaColor(geminiImageModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
-                                        getQuotaColor(geminiImageModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                )} title={isImageLiveLimited ? imageLimitTitle : formatQuotaTooltip(geminiImageModel?.percentage, geminiImageModel?.officialPercentage)}>
-                                    {isImageLiveLimited ? `${liveImageLimit?.status || 'ERR'}` : (geminiImageModel ? `${geminiImageModel.percentage}%` : '-')}
-                                </span>
-                            </div>
-                        </div>
-
-                        {/* Claude */}
-                        <div className="relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
-                            {claudeModel && (
-                                <div
-                                    className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(claudeModel.percentage)}`}
-                                    style={{ width: `${claudeModel.percentage}%` }}
-                                />
-                            )}
-                            <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Claude Series">
-                                    {account.protected_models?.includes('claude') && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
-                                    <span className="truncate">Claude</span>
-                                </span>
-                                <div className="flex-1 flex justify-center">
-                                    {claudeModel?.reset_time ? (
-                                        <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(claudeModel.reset_time))}>
-                                            <Clock className="w-2.5 h-2.5" />
-                                            {formatTimeRemaining(claudeModel.reset_time)}
-                                        </span>
-                                    ) : (
-                                        <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
-                                    )}
-                                </div>
-                                <span className={cn("w-[36px] text-right font-bold transition-colors",
-                                    getQuotaColor(claudeModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
-                                        getQuotaColor(claudeModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                )} title={formatQuotaTooltip(claudeModel?.percentage, claudeModel?.officialPercentage)}>
-                                    {claudeModel ? `${claudeModel.percentage}%` : '-'}
-                                </span>
-                            </div>
-                        </div>
+                            );
+                        })}
                     </div>
                 )}
             </td>
 
-            {/* 最后使用 */}
             <td className="px-4 py-1">
                 <div className="flex flex-col">
                     <span className="text-xs font-medium text-gray-600 dark:text-gray-400 font-mono whitespace-nowrap">
@@ -320,67 +196,27 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                 </div>
             </td>
 
-            {/* 操作 */}
-            <td className="px-4 py-1">
-                <div className="flex items-center gap-0.5 opacity-60 group-hover:opacity-100 transition-opacity">
-                    <button
-                        className="p-1.5 text-gray-500 dark:text-gray-400 hover:text-sky-600 dark:hover:text-sky-400 hover:bg-sky-50 dark:hover:bg-sky-900/30 rounded-lg transition-all"
-                        onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
-                        title={t('common.details')}
-                    >
+            <td className="px-2 py-1 sticky right-0 bg-inherit">
+                <div className="flex items-center justify-center gap-0.5 opacity-60 group-hover:opacity-100 transition-opacity">
+                    <button className="btn btn-ghost btn-xs btn-square" onClick={onSwitch} disabled={isSwitching} title={t('accounts.switch')}>
+                        <ArrowRightLeft className="w-3.5 h-3.5" />
+                    </button>
+                    <button className="btn btn-ghost btn-xs btn-square" onClick={onRefresh} disabled={isRefreshing} title={t('accounts.refresh')}>
+                        <RefreshCw className={cn("w-3.5 h-3.5", isRefreshing && "animate-spin")} />
+                    </button>
+                    <button className="btn btn-ghost btn-xs btn-square" onClick={onViewDetails} title={t('accounts.details')}>
                         <Info className="w-3.5 h-3.5" />
-                        <button
-                            className="p-1.5 text-gray-500 dark:text-gray-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 rounded-lg transition-all"
-                            onClick={(e) => { e.stopPropagation(); onViewDevice(); }}
-                            title={t('accounts.device_fingerprint')}
-                        >
-                            <Fingerprint className="w-3.5 h-3.5" />
-                        </button>
                     </button>
-                    <button
-                        className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onSwitch(); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to'))}
-                        disabled={isSwitching || isDisabled}
-                    >
-                        <ArrowRightLeft className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
+                    <button className="btn btn-ghost btn-xs btn-square" onClick={onViewDevice} title={t('accounts.device')}>
+                        <Fingerprint className="w-3.5 h-3.5" />
                     </button>
-                    <button
-                        className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isRefreshing || isDisabled) ? 'bg-green-50 dark:bg-green-900/10 text-green-600 dark:text-green-400 cursor-not-allowed' : 'hover:text-green-600 dark:hover:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onRefresh(); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isRefreshing ? t('common.refreshing') : t('common.refresh'))}
-                        disabled={isRefreshing || isDisabled}
-                    >
-                        <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
-                    </button>
-                    <button
-                        className="p-1.5 text-gray-500 dark:text-gray-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 rounded-lg transition-all"
-                        onClick={(e) => { e.stopPropagation(); onExport(); }}
-                        title={t('common.export')}
-                    >
+                    <button className="btn btn-ghost btn-xs btn-square" onClick={onExport} title={t('accounts.export')}>
                         <Download className="w-3.5 h-3.5" />
                     </button>
-                    <button
-                        className={cn(
-                            "p-1.5 rounded-lg transition-all",
-                            account.proxy_disabled
-                                ? "text-gray-500 dark:text-gray-400 hover:text-green-600 dark:hover:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30"
-                                : "text-gray-500 dark:text-gray-400 hover:text-orange-600 dark:hover:text-orange-400 hover:bg-orange-50 dark:hover:bg-orange-900/30"
-                        )}
-                        onClick={(e) => { e.stopPropagation(); onToggleProxy(); }}
-                        title={account.proxy_disabled ? t('accounts.enable_proxy') : t('accounts.disable_proxy')}
-                    >
-                        {account.proxy_disabled ? (
-                            <ToggleRight className="w-3.5 h-3.5" />
-                        ) : (
-                            <ToggleLeft className="w-3.5 h-3.5" />
-                        )}
+                    <button className="btn btn-ghost btn-xs btn-square" onClick={onToggleProxy} title={t('accounts.toggle_proxy')}>
+                        {account.proxy_disabled ? <ToggleLeft className="w-3.5 h-3.5" /> : <ToggleRight className="w-3.5 h-3.5" />}
                     </button>
-                    <button
-                        className="p-1.5 text-gray-500 dark:text-gray-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-all"
-                        onClick={(e) => { e.stopPropagation(); onDelete(); }}
-                        title={t('common.delete')}
-                    >
+                    <button className="btn btn-ghost btn-xs btn-square text-rose-500" onClick={onDelete} title={t('accounts.delete')}>
                         <Trash2 className="w-3.5 h-3.5" />
                     </button>
                 </div>

@@ -1,14 +1,13 @@
 import { useMemo, useState } from 'react';
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Bot, Repeat2, Terminal } from 'lucide-react';
-import { Account, ModelQuota } from '../../types/account';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Repeat2, Terminal } from 'lucide-react';
+import { Account } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
-import { useConfigStore } from '../../stores/useConfigStore';
 import { QuotaItem } from './QuotaItem';
-import { MODEL_CONFIG, sortModels, getModelProtectionKey, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
+import { getModelProtectionKey } from '../../config/modelConfig';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
-import { getLiveLimitForModel } from '../../utils/liveLimit';
-import { formatQuotaTooltip, getDisplayQuotaModels } from '../../utils/quotaDisplay';
+import { formatQuotaTooltip, getBillingGroupDisplays } from '../../utils/quotaDisplay';
+import { Gemini, Claude } from '@lobehub/icons';
 import {
     proxyUsageBadgeClass,
     proxyUsageTooltipKey,
@@ -36,17 +35,8 @@ interface AccountCardProps {
     proxyUsage?: ProxyEgressUsage;
 }
 
-// 使用统一的模型配置
-const DEFAULT_MODELS = Object.entries(MODEL_CONFIG).map(([id, config]) => ({
-    id,
-    label: config.label,
-    protectedKey: config.protectedKey,
-    Icon: config.Icon
-}));
-
 function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError, proxyBindingLabel, proxyUsage = 'unknown' }: AccountCardProps) {
     const { t } = useTranslation();
-    const { config, showAllQuotas } = useConfigStore();
     const isDisabled = Boolean(account.disabled);
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
 
@@ -78,68 +68,21 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
     };
 
     const displayModels = useMemo(() => {
-        // Build map of friendly labels and icons from DEFAULT_MODELS
-        const iconMap = new Map(DEFAULT_MODELS.map(m => [m.id, m.Icon]));
-
-        // Get all models from account (local ledger primary for %)
-        const accountModels = getDisplayQuotaModels(account).map(m => {
-            // 注意：DEFAULT_MODELS 现在应该包含 shortLabel，我们需要确保它被正确映射
-            // 但 DEFAULT_MODELS 是从 MODEL_CONFIG 生成的，我们需要确保它包含 shortLabel
-            // 这里为了安全，直接从 MODEL_CONFIG 获取
-            const fullConfig = MODEL_CONFIG[m.name.toLowerCase()];
-            return {
-                id: m.name,
-                label: m.display_name || fullConfig?.shortLabel || fullConfig?.label || m.name,
-                protectedKey: getModelProtectionKey(m.name) ?? fullConfig?.protectedKey ?? m.name,
-                Icon: iconMap.get(m.name) || Bot,
-                data: m
-            };
-        });
-
-        let models: typeof accountModels;
-
-        if (showAllQuotas) {
-            models = accountModels;
-        } else {
-            // Filter for pinned or defaults
-            const pinned = config?.pinned_quota_models?.models;
-            if (pinned && pinned.length > 0) {
-                const selections = resolveQuotaModels(
-                    accountModels.map(m => m.data),
-                    ensurePinnedImageSelector(pinned),
-                );
-                models = selections
-                    .map(sel => sel.model ? accountModels.find(am => am.data === sel.model) : undefined)
-                    .filter((m): m is typeof accountModels[number] => m !== undefined);
-                // 也保留无配额数据的 pinned 模型（显示 0%）
-                for (const sel of selections) {
-                    if (!sel.model) {
-                        const selectorConfig = MODEL_CONFIG[sel.selectorId.toLowerCase()];
-                        if (selectorConfig) {
-                            models = [...models, {
-                                id: sel.selectorId,
-                                label: selectorConfig.shortLabel || selectorConfig.label,
-                                protectedKey: selectorConfig.protectedKey,
-                                Icon: selectorConfig.Icon,
-                                data: { name: sel.selectorId, percentage: 0 } as ModelQuota,
-                            }];
-                        }
-                    }
-                }
-            } else {
-                // Default fallback: show known default models, plus we show all dynamic pinned models
-                // 暂时退化：如果没有 config 就不阻拦了？不，没有 pinned 就显示内置+有 display_name 的。
-                models = accountModels.filter(m => DEFAULT_MODELS.some(d => d.id === m.id) || m.data.display_name);
-            }
-        }
-
-        // 应用排序并过滤过期模型
-        return sortModels(models).filter(m => m.id !== 'claude-sonnet-4-6-thinking' && m.id !== 'claude-sonnet-4-5-thinking' && m.id !== 'claude-opus-4-5-thinking');
-    }, [config, account, showAllQuotas]);
+        return getBillingGroupDisplays(account).map((row) => ({
+            id: row.id,
+            label: row.label,
+            protectedKey: row.id,
+            Icon: row.id === 'claude' ? Claude.Color : Gemini.Color,
+            percentage: row.percentage,
+            officialPercentage: row.officialPercentage,
+            reset_time: row.reset_time,
+        }));
+    }, [account]);
 
     const isModelProtected = (key?: string) => {
         if (!key) return false;
-        return account.protected_models?.includes(key);
+        return account.protected_models?.includes(key)
+            || account.protected_models?.some(m => getModelProtectionKey(m) === key);
     };
 
     return (
@@ -285,12 +228,11 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                             <QuotaItem
                                 key={model.id}
                                 label={model.label}
-                                percentage={model.data?.percentage || 0}
-                                resetTime={model.data?.reset_time}
+                                percentage={model.percentage || 0}
+                                resetTime={model.reset_time}
                                 isProtected={isModelProtected(model.protectedKey)}
-                                liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                 Icon={model.Icon}
-                                quotaTitle={formatQuotaTooltip(model.data?.percentage, model.data?.officialPercentage)}
+                                quotaTitle={formatQuotaTooltip(model.percentage, model.officialPercentage)}
                             />
                         ))}
                     </div>

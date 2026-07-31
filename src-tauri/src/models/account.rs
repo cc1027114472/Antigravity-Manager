@@ -128,27 +128,31 @@ impl Account {
     }
 
     /// Overwrite local ledger from online quota snapshot (calibration).
+    /// Prefer official `quota_groups` (5h); fall back to per-model billing-group min.
     pub fn calibrate_estimated_from_quota(&mut self, quota: &QuotaData) {
         let now = chrono::Utc::now().timestamp();
+        let percentages =
+            crate::modules::quota_ledger::online_percentage_map_from_quota(quota);
         let mut next: HashMap<String, EstimatedModelQuota> = HashMap::new();
-        let mut group_max: HashMap<String, i32> = HashMap::new();
-
-        for model in &quota.models {
-            let std_id = crate::proxy::common::model_mapping::normalize_to_standard_id(&model.name)
-                .unwrap_or_else(|| model.name.clone());
-            let entry = group_max.entry(std_id).or_insert(-1);
-            if model.percentage > *entry {
-                *entry = model.percentage;
-            }
-        }
-
-        for (std_id, pct) in group_max {
+        for (billing_id, pct) in percentages {
             next.insert(
-                std_id.clone(),
-                EstimatedModelQuota::from_online(std_id, pct, now),
+                billing_id.clone(),
+                EstimatedModelQuota::from_online(billing_id, pct, now),
             );
         }
         self.estimated_quotas = next;
+    }
+
+    /// Normalize legacy fine-grained ledger / protection keys to billing groups.
+    pub fn migrate_billing_group_fields(&mut self) {
+        self.estimated_quotas =
+            crate::modules::quota_ledger::migrate_estimated_quotas(std::mem::take(
+                &mut self.estimated_quotas,
+            ));
+        self.protected_models =
+            crate::proxy::common::model_mapping::migrate_protected_models_set(
+                &self.protected_models,
+            );
     }
 }
 

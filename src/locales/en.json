@@ -394,8 +394,8 @@
       "enable": "Enable Quota Protection",
       "enable_desc": "Automatically disable proxy when account quota falls below threshold, and auto-restore when quota resets",
       "threshold_label": "Reserved Quota Percentage",
-      "monitored_models_label": "Monitored Models (Trigger Conditions)",
-      "monitored_models_desc": "Select at least one. Protection triggers if ANY selected model falls below threshold",
+      "monitored_models_label": "Monitored billing groups",
+      "monitored_models_desc": "Official big buckets: Gemini (Flash/Pro/Image) and Claude. Protection triggers if ANY selected group falls below threshold",
       "range": "Range",
       "example": "Example: At {{percentage}}%, an account with {{total}} quota will be disabled when remaining ≤ {{threshold}}",
       "auto_restore_info": "Account will be automatically re-enabled when quota resets"

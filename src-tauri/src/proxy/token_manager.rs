@@ -506,16 +506,19 @@ impl TokenManager {
         // .filter(|&r| r > 0); // 移除 >0 过滤，因为 0% 也是有效数据，只是优先级低
 
         // 【新增 #621】提取受限模型列表
-        let protected_models: HashSet<String> = account
-            .get("protected_models")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let protected_models: HashSet<String> = {
+            let raw: HashSet<String> = account
+                .get("protected_models")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::proxy::common::model_mapping::migrate_protected_models_set(&raw)
+        };
 
         let health_score = self
             .health_scores
@@ -526,33 +529,62 @@ impl TokenManager {
         // [NEW] 提取最近的配额刷新时间（用于排序优化：刷新时间越近优先级越高）
         let reset_time = self.extract_earliest_reset_time(&account);
 
-        // [OPTIMIZATION] 构建模型配额内存缓存，避免排序时读取磁盘
+        // [OPTIMIZATION] Build billing-group quota cache (gemini | claude)
         let mut model_quotas = HashMap::new();
         // [NEW] 构建模型输出限额内存缓存 (max_output_tokens)
         let mut model_limits: HashMap<String, u64> = HashMap::new();
+        // Also keep fine-grained capability keys so get_token can verify model presence
+        let mut capability_keys: HashSet<String> = HashSet::new();
+
         if let Some(models) = account
             .get("quota")
             .and_then(|q| q.get("models"))
             .and_then(|m| m.as_array())
         {
+            // Aggregate online models by billing group (min = conservative)
+            let mut billing_min: HashMap<String, i32> = HashMap::new();
             for model in models {
                 if let (Some(name), Some(pct)) = (
                     model.get("name").and_then(|v| v.as_str()),
                     model.get("percentage").and_then(|v| v.as_i64()),
                 ) {
-                    // Normalize name to standard ID
-                    let standard_id =
+                    if let Some(billing) =
+                        crate::proxy::common::model_mapping::normalize_to_billing_group(name)
+                    {
+                        let entry = billing_min.entry(billing.clone()).or_insert(pct as i32);
+                        if (pct as i32) < *entry {
+                            *entry = pct as i32;
+                        }
+                    }
+                    if let Some(std_id) =
                         crate::proxy::common::model_mapping::normalize_to_standard_id(name)
-                            .unwrap_or_else(|| name.to_string());
-                    model_quotas.insert(standard_id, pct as i32);
+                    {
+                        capability_keys.insert(std_id);
+                    }
+                    capability_keys.insert(name.to_string());
                 }
-                // [NEW] 解析并缓存 max_output_tokens (按原始 model name，不归一化)
                 if let (Some(name), Some(limit)) = (
                     model.get("name").and_then(|v| v.as_str()),
                     model.get("max_output_tokens").and_then(|v| v.as_u64()),
                 ) {
                     model_limits.insert(name.to_string(), limit);
                 }
+            }
+            // Prefer official quota_groups when present on disk
+            if let Some(groups) = account
+                .get("quota")
+                .and_then(|q| q.get("quota_groups"))
+                .and_then(|g| serde_json::from_value::<Vec<crate::models::quota::QuotaGroup>>(g.clone()).ok())
+            {
+                let from_groups =
+                    crate::modules::quota_ledger::billing_percentages_from_quota_groups(&groups);
+                if !from_groups.is_empty() {
+                    model_quotas = from_groups;
+                } else {
+                    model_quotas = billing_min;
+                }
+            } else {
+                model_quotas = billing_min;
             }
         }
 
@@ -562,14 +594,30 @@ impl TokenManager {
             .unwrap_or(true);
         if ledger_enabled {
             if let Some(estimated) = account.get("estimated_quotas").and_then(|v| v.as_object()) {
-                for (std_id, entry) in estimated {
-                    if let Some(pct) = entry
-                        .get("percentage")
-                        .and_then(|v| v.as_i64())
-                        .or_else(|| entry.get("percentage").and_then(|v| v.as_i64()))
-                    {
-                        model_quotas.insert(std_id.clone(), pct as i32);
+                for (raw_id, entry) in estimated {
+                    if let Some(pct) = entry.get("percentage").and_then(|v| v.as_i64()) {
+                        let billing =
+                            crate::proxy::common::model_mapping::migrate_to_billing_group_id(raw_id)
+                                .unwrap_or_else(|| raw_id.clone());
+                        let pct_i = pct as i32;
+                        let slot = model_quotas.entry(billing).or_insert(pct_i);
+                        if pct_i < *slot {
+                            *slot = pct_i;
+                        }
                     }
+                }
+            }
+        }
+
+        // Store capability keys with a sentinel so contains_key works for fine-grained checks
+        // without overriding billing percentages (use same pct as billing group when known).
+        for cap in capability_keys {
+            if !model_quotas.contains_key(&cap) {
+                if let Some(billing) =
+                    crate::proxy::common::model_mapping::normalize_to_billing_group(&cap)
+                {
+                    let pct = model_quotas.get(&billing).copied().unwrap_or(100);
+                    model_quotas.insert(cap, pct);
                 }
             }
         }
@@ -802,7 +850,7 @@ impl TokenManager {
         };
 
         let model_raw = model.unwrap_or("unknown");
-        let std_id = crate::proxy::common::model_mapping::normalize_to_standard_id(model_raw)
+        let std_id = crate::proxy::common::model_mapping::normalize_to_billing_group(model_raw)
             .unwrap_or_else(|| model_raw.to_string());
 
         let total_tokens = match (input_tokens, output_tokens) {
@@ -820,11 +868,12 @@ impl TokenManager {
         let mut should_protect = false;
         let threshold = app_config.quota_protection.threshold_percentage as i32;
         let protection_on = app_config.quota_protection.enabled
-            && app_config
-                .quota_protection
-                .monitored_models
-                .iter()
-                .any(|m| m == &std_id);
+            && app_config.quota_protection.monitored_models.iter().any(|m| {
+                crate::proxy::common::model_mapping::migrate_to_billing_group_id(m)
+                    .map(|g| g == std_id)
+                    .unwrap_or(false)
+                    || m == &std_id
+            });
 
         if let Some(mut entry) = self.tokens.get_mut(&account_id) {
             let current = entry
@@ -834,7 +883,29 @@ impl TokenManager {
                 .unwrap_or(100);
             new_pct = (current - burn).max(0);
             entry.model_quotas.insert(std_id.clone(), new_pct);
-            if let Some(max_q) = entry.model_quotas.values().copied().max() {
+            // Keep fine-grained capability keys in sync with billing burn
+            let billing = std_id.clone();
+            let sync_keys: Vec<String> = entry
+                .model_quotas
+                .keys()
+                .filter(|k| {
+                    *k != &billing
+                        && crate::proxy::common::model_mapping::normalize_to_billing_group(k)
+                            .as_deref()
+                            == Some(billing.as_str())
+                })
+                .cloned()
+                .collect();
+            for k in sync_keys {
+                entry.model_quotas.insert(k, new_pct);
+            }
+            if let Some(max_q) = entry
+                .model_quotas
+                .iter()
+                .filter(|(k, _)| *k == "gemini" || *k == "claude")
+                .map(|(_, v)| *v)
+                .max()
+            {
                 entry.remaining_quota = Some(max_q);
             }
             if protection_on && new_pct <= threshold {
@@ -905,22 +976,51 @@ impl TokenManager {
     fn get_model_quota_from_json(account_path: &PathBuf, model_name: &str) -> Option<i32> {
         let content = std::fs::read_to_string(account_path).ok()?;
         let account: serde_json::Value = serde_json::from_str(&content).ok()?;
-        let models = account.get("quota")?.get("models")?.as_array()?;
 
-        for model in models {
-            if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
-                if crate::proxy::common::model_mapping::normalize_to_standard_id(name)
-                    .unwrap_or_else(|| name.to_string())
-                    == model_name
-                {
-                    return model
-                        .get("percentage")
-                        .and_then(|v| v.as_i64())
-                        .map(|p| p as i32);
+        // Prefer estimated / official billing group
+        let billing =
+            crate::proxy::common::model_mapping::normalize_to_billing_group(model_name)
+                .unwrap_or_else(|| model_name.to_string());
+        if let Some(est) = account.get("estimated_quotas").and_then(|v| v.as_object()) {
+            if let Some(pct) = est
+                .get(&billing)
+                .and_then(|e| e.get("percentage"))
+                .and_then(|v| v.as_i64())
+            {
+                return Some(pct as i32);
+            }
+        }
+        if let Some(groups_val) = account.get("quota").and_then(|q| q.get("quota_groups")) {
+            if let Ok(groups) =
+                serde_json::from_value::<Vec<crate::models::quota::QuotaGroup>>(groups_val.clone())
+            {
+                let map =
+                    crate::modules::quota_ledger::billing_percentages_from_quota_groups(&groups);
+                if let Some(pct) = map.get(&billing) {
+                    return Some(*pct);
                 }
             }
         }
-        None
+
+        let models = account.get("quota")?.get("models")?.as_array()?;
+        let mut min_pct: Option<i32> = None;
+        for model in models {
+            if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
+                let matches = crate::proxy::common::model_mapping::normalize_to_billing_group(name)
+                    .as_deref()
+                    == Some(billing.as_str())
+                    || crate::proxy::common::model_mapping::normalize_to_standard_id(name)
+                        .unwrap_or_else(|| name.to_string())
+                        == model_name;
+                if matches {
+                    if let Some(p) = model.get("percentage").and_then(|v| v.as_i64()) {
+                        let p = p as i32;
+                        min_pct = Some(min_pct.map_or(p, |m| m.min(p)));
+                    }
+                }
+            }
+        }
+        min_pct
     }
 
     fn get_available_models_from_json(account_path: &PathBuf) -> Option<HashSet<String>> {
@@ -1133,7 +1233,7 @@ impl TokenManager {
         let mut protected_list = Vec::new();
 
         if let Some(models) = quota.get("models").and_then(|m| m.as_array()) {
-            let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
+            let mut group_min_percentage: HashMap<String, i32> = HashMap::new();
 
             for model in models {
                 let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -1142,20 +1242,38 @@ impl TokenManager {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0) as i32;
 
-                if let Some(std_id) =
-                    crate::proxy::common::model_mapping::normalize_to_standard_id(name)
+                if let Some(billing) =
+                    crate::proxy::common::model_mapping::normalize_to_billing_group(name)
                 {
-                    let entry = group_max_percentage.entry(std_id).or_insert(-1);
-                    if percentage > *entry {
+                    let entry = group_min_percentage.entry(billing).or_insert(percentage);
+                    if percentage < *entry {
                         *entry = percentage;
                     }
                 }
             }
 
-            for std_id in &config.monitored_models {
-                let max_pct = group_max_percentage.get(std_id).cloned().unwrap_or(100);
+            // Prefer quota_groups when present
+            if let Some(groups_val) = quota.get("quota_groups") {
+                if let Ok(groups) =
+                    serde_json::from_value::<Vec<crate::models::quota::QuotaGroup>>(groups_val.clone())
+                {
+                    let from_groups =
+                        crate::modules::quota_ledger::billing_percentages_from_quota_groups(&groups);
+                    if !from_groups.is_empty() {
+                        group_min_percentage = from_groups;
+                    }
+                }
+            }
+
+            for raw_id in &config.monitored_models {
+                let Some(billing) =
+                    crate::proxy::common::model_mapping::migrate_to_billing_group_id(raw_id)
+                else {
+                    continue;
+                };
+                let max_pct = group_min_percentage.get(&billing).cloned().unwrap_or(100);
                 if max_pct < threshold {
-                    protected_list.push(serde_json::Value::String(std_id.clone()));
+                    protected_list.push(serde_json::Value::String(billing));
                 }
             }
         }
@@ -1394,29 +1512,39 @@ impl TokenManager {
         // 定义常量
         const RESET_TIME_THRESHOLD_SECS: i64 = 600; // 10 分钟阈值
 
-        // 归一化目标模型名为标准 ID
-        let normalized_target =
+        // Official billing group for ledger / protection / sorting
+        let billing_target = crate::proxy::common::model_mapping::normalize_to_billing_group(
+            target_model,
+        )
+        .unwrap_or_else(|| target_model.to_string());
+
+        // Fine-grained id kept for capability presence checks
+        let fine_target =
             crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
                 .unwrap_or_else(|| target_model.to_string());
 
-        // 仅保留明确拥有该模型配额的账号
-        // 这一步确保了 "保证有模型才可以进入轮询"，特别是对 Opus 4.6 等高端模型
+        // Alias used by the rest of this function for protection / sorting
+        let normalized_target = billing_target.clone();
+
+        // 仅保留明确拥有该计费组（或细粒度能力键）的账号
         let candidate_count_before = tokens_snapshot.len();
 
-        // 此处假设所有受支持的模型都会出现在 model_quotas 中
-        // 如果 API 返回的配额信息不完整，可能会导致误杀，但为了严格性，我们执行此过滤
-        tokens_snapshot.retain(|t| t.model_quotas.contains_key(&normalized_target));
+        tokens_snapshot.retain(|t| {
+            t.model_quotas.contains_key(&billing_target)
+                || t.model_quotas.contains_key(&fine_target)
+                || t.model_quotas.contains_key(target_model)
+        });
 
         if tokens_snapshot.is_empty() {
             if candidate_count_before > 0 {
-                // 如果过滤前有账号，过滤后没了，说明所有账号都没有该模型的配额
                 tracing::warn!(
-                    "No accounts have satisfied quota for model: {}",
-                    normalized_target
+                    "No accounts have satisfied quota for billing group: {} (model: {})",
+                    billing_target,
+                    target_model
                 );
                 return Err(format!(
                     "No accounts available with quota for model: {}",
-                    normalized_target
+                    target_model
                 ));
             }
             return Err("Token pool is empty".to_string());
@@ -1565,19 +1693,22 @@ impl TokenManager {
                         }
                     }
                     OnDiskAccountState::Enabled => {
-                        let normalized_target =
+                        let billing_target =
+                            crate::proxy::common::model_mapping::normalize_to_billing_group(
+                                target_model,
+                            )
+                            .unwrap_or_else(|| target_model.to_string());
+                        let fine_target =
                             crate::proxy::common::model_mapping::normalize_to_standard_id(
                                 target_model,
                             )
                             .unwrap_or_else(|| target_model.to_string());
 
                         let is_rate_limited = self
-                            .is_rate_limited(&preferred_token.account_id, Some(&normalized_target))
+                            .is_rate_limited(&preferred_token.account_id, Some(&fine_target))
                             .await;
                         let is_quota_protected = quota_protection_enabled
-                            && preferred_token
-                                .protected_models
-                                .contains(&normalized_target);
+                            && preferred_token.protected_models.contains(&billing_target);
 
                         if !is_rate_limited && !is_quota_protected {
                             tracing::info!(
@@ -2567,8 +2698,13 @@ impl TokenManager {
                 continue;
             }
 
-            // 2. 检查是否被配额保护(如果启用)
-            if quota_protection_enabled && token.protected_models.contains(target_model) {
+            // 2. 检查是否被配额保护(如果启用) — billing group keys
+            let billing = crate::proxy::common::model_mapping::normalize_to_billing_group(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+            if quota_protection_enabled
+                && (token.protected_models.contains(&billing)
+                    || token.protected_models.contains(target_model))
+            {
                 tracing::debug!(
                     "[Fallback Check] Account {} is quota-protected for model {}, skipping",
                     token.email,
@@ -3163,10 +3299,16 @@ impl TokenManager {
             return true;
         };
 
+        let billing = crate::proxy::common::model_mapping::normalize_to_billing_group(model)
+            .unwrap_or_else(|| model.to_string());
+
         if self.is_rate_limited(&token.account_id, Some(model)).await {
             return false;
         }
-        if quota_protection_enabled && token.protected_models.contains(model) {
+        if quota_protection_enabled
+            && (token.protected_models.contains(&billing)
+                || token.protected_models.contains(model))
+        {
             return false;
         }
         true
@@ -3374,7 +3516,7 @@ impl TokenManager {
         crate::proxy::sticky_config::warn_serial_pool_scheduling_override(scheduling.mode);
 
         let normalized_target =
-            crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+            crate::proxy::common::model_mapping::normalize_to_billing_group(target_model)
                 .unwrap_or_else(|| target_model.to_string());
         let ordered = self.ordered_pool_tokens(tokens_snapshot);
 

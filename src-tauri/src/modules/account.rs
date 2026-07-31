@@ -747,7 +747,21 @@ fn atomic_replace_file(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
 pub fn load_account(account_id: &str) -> Result<Account, String> {
     let accounts_dir = get_accounts_dir()?;
     let account_path = accounts_dir.join(format!("{}.json", account_id));
-    load_account_at_path(&account_path)
+    let mut account = load_account_at_path(&account_path)?;
+    let needs_migrate = account.estimated_quotas.keys().any(|k| {
+        crate::proxy::common::model_mapping::migrate_to_billing_group_id(k)
+            .map(|g| g != *k)
+            .unwrap_or(false)
+    }) || account.protected_models.iter().any(|k| {
+        crate::proxy::common::model_mapping::migrate_to_billing_group_id(k)
+            .map(|g| g != *k)
+            .unwrap_or(false)
+    });
+    account.migrate_billing_group_fields();
+    if needs_migrate {
+        let _ = save_account(&account);
+    }
+    Ok(account)
 }
 
 /// Save account data
@@ -1537,7 +1551,9 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
             let recovered = q.models.iter().any(|m| {
                 let is_matching = m.name == *model_key
                     || crate::proxy::common::model_mapping::normalize_to_standard_id(&m.name)
-                        .map_or(false, |std| std == *model_key);
+                        .map_or(false, |std| std == *model_key)
+                    || crate::proxy::common::model_mapping::normalize_to_billing_group(&m.name)
+                        .map_or(false, |g| g == *model_key);
                 is_matching && m.percentage > 0
             });
             !recovered
@@ -1575,20 +1591,24 @@ pub fn persist_estimated_quota_burn(
     protect_model: bool,
 ) -> Result<(), String> {
     let mut account = load_account(account_id)?;
+    let billing_id =
+        crate::proxy::common::model_mapping::migrate_to_billing_group_id(std_model_id)
+            .unwrap_or_else(|| std_model_id.to_string());
     let entry = account
         .estimated_quotas
-        .entry(std_model_id.to_string())
+        .entry(billing_id.clone())
         .or_insert_with(|| crate::models::EstimatedModelQuota {
-            model: std_model_id.to_string(),
+            model: billing_id.clone(),
             percentage: 100,
             last_online_pct: None,
             last_calibrated_at: None,
         });
     entry.percentage = new_percentage.clamp(0, 100);
+    entry.model = billing_id.clone();
     // Keep last calibration metadata; only update percentage.
 
     if protect_model {
-        account.protected_models.insert(std_model_id.to_string());
+        account.protected_models.insert(billing_id);
     }
 
     // If protection enabled, re-evaluate all monitored models from estimated map.

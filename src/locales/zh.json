@@ -393,8 +393,8 @@
       "enable": "启用配额保护",
       "enable_desc": "当账号剩余配额低于阈值时自动禁用反代功能，配额重置后将自动恢复账号",
       "threshold_label": "保留配额百分比",
-      "monitored_models_label": "监控模型 (触发条件)",
-      "monitored_models_desc": "至少选择一个核心模型。任一勾选模型额度低于阈值将触发保护",
+      "monitored_models_label": "监控计费组 (触发条件)",
+      "monitored_models_desc": "按官方大桶监控：Gemini（含 Flash/Pro/Image）与 Claude。任一组剩余额度低于阈值将触发保护",
       "range": "范围",
       "example": "示例：设置 {{percentage}}% 时，{{total}} 次配额的账号剩余 ≤ {{threshold}} 次时将被自动禁用",
       "auto_restore_info": "配额重置后将自动重新启用账号"

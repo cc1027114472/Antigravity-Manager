@@ -14,7 +14,10 @@ interface AccountDetailsDialogProps {
 
 export default function AccountDetailsDialog({ account, onClose }: AccountDetailsDialogProps) {
     const { t } = useTranslation();
-    const [activeTab, setActiveTab] = useState<'basic' | 'detailed'>('basic');
+    const hasOfficialGroups = !!(account?.quota?.quota_groups && account.quota.quota_groups.length > 0);
+    const [activeTab, setActiveTab] = useState<'basic' | 'detailed'>(
+        hasOfficialGroups ? 'detailed' : 'basic',
+    );
     if (!account) return null;
 
     return createPortal(
@@ -90,7 +93,7 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                             onClick={() => setActiveTab('basic')}
                             className={`pb-2 text-xs font-bold uppercase tracking-widest transition-colors border-b-2 ${activeTab === 'basic' ? 'border-blue-500 text-blue-600 dark:text-blue-400' : 'border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'}`}
                         >
-                            {t('accounts.details.model_quota')}
+                            {t('accounts.details.model_quota_ref', '模型明细（参考，非计费桶）')}
                         </button>
                         {account.quota?.quota_groups && account.quota.quota_groups.length > 0 && (
                             <button
@@ -98,7 +101,7 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                                 className={`pb-2 text-xs font-bold uppercase tracking-widest transition-colors border-b-2 flex items-center gap-1.5 ${activeTab === 'detailed' ? 'border-blue-500 text-blue-600 dark:text-blue-400' : 'border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'}`}
                             >
                                 <Bot size={12} className={activeTab === 'detailed' ? 'text-blue-500' : ''} />
-                                {t('accounts.details.quota_groups', 'Detailed Quota')}
+                                {t('accounts.details.quota_groups', '官方计费桶')}
                             </button>
                         )}
                     </div>

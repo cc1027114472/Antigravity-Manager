@@ -1,19 +1,13 @@
-import { CheckCircle, Mail, Diamond, Gem, Circle, Tag, Lock, Clock } from 'lucide-react';
+import { CheckCircle, Mail, Diamond, Gem, Circle, Tag, Lock } from 'lucide-react';
 import { Account } from '../../types/account';
 import { formatTimeRemaining } from '../../utils/format';
-import { getModelProtectionKey, getModelDisplayName } from '../../config/modelConfig';
-import {
-    findDisplayImageQuotaModel,
-    findDisplayQuotaModel,
-    formatQuotaTooltip,
-} from '../../utils/quotaDisplay';
+import { formatQuotaTooltip, getBillingGroupDisplays } from '../../utils/quotaDisplay';
+import { useTranslation } from 'react-i18next';
 
 interface CurrentAccountProps {
     account: Account | null;
     onSwitch?: () => void;
 }
-
-import { useTranslation } from 'react-i18next';
 
 function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
     const { t } = useTranslation();
@@ -31,18 +25,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
         );
     }
 
-    const geminiProModel = findDisplayQuotaModel(account, 'gemini-pro');
-    const geminiFlashModel = findDisplayQuotaModel(account, 'gemini-flash');
-
-    const geminiImageModel = findDisplayImageQuotaModel(account);
-    const nowSeconds = Math.floor(Date.now() / 1000);
-    const imageProtectionKey = getModelProtectionKey(geminiImageModel?.name || '');
-    const liveImageLimit = imageProtectionKey
-        ? account.live_limited_models?.[imageProtectionKey]
-        : undefined;
-    const isImageLiveLimited = Boolean(liveImageLimit && liveImageLimit.until > nowSeconds);
-
-    const claudeModel = findDisplayQuotaModel(account, 'claude');
+    const billingRows = getBillingGroupDisplays(account);
 
     return (
         <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 h-full flex flex-col">
@@ -57,7 +40,6 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                         <Mail className="w-3.5 h-3.5 text-gray-400" />
                         <span className="text-sm font-medium text-gray-700 dark:text-gray-300 truncate">{account.email}</span>
                     </div>
-                    {/* 订阅类型 */}
                     {account.quota?.subscription_tier && (() => {
                         const tier = account.quota.subscription_tier.toLowerCase();
                         if (tier.includes('ultra')) {
@@ -83,7 +65,6 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                             );
                         }
                     })()}
-                    {/* 自定义标签 */}
                     {account.custom_label && (
                         <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400 text-[10px] font-bold shadow-sm shrink-0">
                             <Tag className="w-2.5 h-2.5" />
@@ -92,152 +73,58 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                     )}
                 </div>
 
-                {/* Gemini Pro 配额 */}
-                {geminiProModel && (
-                    <div className="space-y-1.5">
+                {billingRows.map((row) => (
+                    <div key={row.id} className="space-y-1.5">
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {(account.protected_models?.includes('gemini-3-pro-high') || account.protected_models?.includes('gemini-3.1-pro-high')) && <Lock className="w-2.5 h-2.5 text-rose-500" />}
-                                {getModelDisplayName(geminiProModel)}
+                                {account.protected_models?.includes(row.id) && (
+                                    <Lock className="w-2.5 h-2.5 text-rose-500" />
+                                )}
+                                {row.label}
                             </span>
                             <div className="flex items-center gap-2">
-                                <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(geminiProModel.reset_time).toLocaleString()}`}>
-                                    {geminiProModel.reset_time ? `R: ${formatTimeRemaining(geminiProModel.reset_time)}` : t('common.unknown')}
+                                <span className="text-[10px] text-gray-400 dark:text-gray-500">
+                                    {row.reset_time
+                                        ? `R: ${formatTimeRemaining(row.reset_time)}`
+                                        : t('common.unknown')}
                                 </span>
                                 <span
-                                    className={`text-xs font-bold ${geminiProModel.percentage >= 50 ? 'text-emerald-600 dark:text-emerald-400' :
-                                    geminiProModel.percentage >= 20 ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
+                                    className={`text-xs font-bold ${
+                                        row.percentage >= 50
+                                            ? 'text-emerald-600 dark:text-emerald-400'
+                                            : row.percentage >= 20
+                                              ? 'text-amber-600 dark:text-amber-400'
+                                              : 'text-rose-600 dark:text-rose-400'
                                     }`}
-                                    title={formatQuotaTooltip(geminiProModel.percentage, geminiProModel.officialPercentage)}
+                                    title={formatQuotaTooltip(row.percentage, row.officialPercentage)}
                                 >
-                                    {geminiProModel.percentage}%
+                                    {row.percentage}%
                                 </span>
                             </div>
                         </div>
                         <div className="w-full bg-gray-100 dark:bg-base-300 rounded-full h-1.5 overflow-hidden">
                             <div
-                                className={`h-full rounded-full transition-all duration-700 ${geminiProModel.percentage >= 50 ? 'bg-gradient-to-r from-emerald-400 to-emerald-500' :
-                                    geminiProModel.percentage >= 20 ? 'bg-gradient-to-r from-amber-400 to-amber-500' :
-                                        'bg-gradient-to-r from-rose-400 to-rose-500'
-                                    }`}
-                                style={{ width: `${geminiProModel.percentage}%` }}
-                            ></div>
+                                className={`h-full rounded-full transition-all duration-700 ${
+                                    row.percentage >= 50
+                                        ? 'bg-gradient-to-r from-emerald-400 to-emerald-500'
+                                        : row.percentage >= 20
+                                          ? 'bg-gradient-to-r from-amber-400 to-amber-500'
+                                          : 'bg-gradient-to-r from-rose-400 to-rose-500'
+                                }`}
+                                style={{ width: `${row.percentage}%` }}
+                            />
                         </div>
                     </div>
-                )}
-                {/* Gemini 3 Pro Image 配额 */}
-                {geminiImageModel && (
-                    <div className="space-y-1.5">
-                        <div className="flex justify-between items-baseline">
-                            <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {isImageLiveLimited && <Clock className="w-2.5 h-2.5 text-amber-500" />}
-                                {(imageProtectionKey && account.protected_models?.includes(imageProtectionKey)) && <Lock className="w-2.5 h-2.5 text-rose-500" />}
-                                {getModelDisplayName(geminiImageModel)}
-                            </span>
-                            <div className="flex items-center gap-2">
-                                <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(geminiImageModel.reset_time).toLocaleString()}`}>
-                                    {geminiImageModel.reset_time ? `R: ${formatTimeRemaining(geminiImageModel.reset_time)}` : t('common.unknown')}
-                                </span>
-                                <span
-                                    className={`text-xs font-bold ${geminiImageModel.percentage >= 50 ? 'text-emerald-600 dark:text-emerald-400' :
-                                    geminiImageModel.percentage >= 20 ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                    }`}
-                                    title={formatQuotaTooltip(geminiImageModel.percentage, geminiImageModel.officialPercentage)}
-                                >
-                                    {geminiImageModel.percentage}%
-                                </span>
-                            </div>
-                        </div>
-                        <div className="w-full bg-gray-100 dark:bg-base-300 rounded-full h-1.5 overflow-hidden">
-                            <div
-                                className={`h-full rounded-full transition-all duration-700 ${geminiImageModel.percentage >= 50 ? 'bg-gradient-to-r from-emerald-400 to-emerald-500' :
-                                    geminiImageModel.percentage >= 20 ? 'bg-gradient-to-r from-amber-400 to-amber-500' :
-                                        'bg-gradient-to-r from-rose-400 to-rose-500'
-                                    }`}
-                                style={{ width: `${geminiImageModel.percentage}%` }}
-                            ></div>
-                        </div>
-                    </div>
-                )}
-
-                {/* Gemini Flash 配额 */}
-                {geminiFlashModel && (
-                    <div className="space-y-1.5">
-                        <div className="flex justify-between items-baseline">
-                            <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {account.protected_models?.includes('gemini-3-flash') && <Lock className="w-2.5 h-2.5 text-rose-500" />}
-                                {getModelDisplayName(geminiFlashModel)}
-                            </span>
-                            <div className="flex items-center gap-2">
-                                <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(geminiFlashModel.reset_time).toLocaleString()}`}>
-                                    {geminiFlashModel.reset_time ? `R: ${formatTimeRemaining(geminiFlashModel.reset_time)}` : t('common.unknown')}
-                                </span>
-                                <span
-                                    className={`text-xs font-bold ${geminiFlashModel.percentage >= 50 ? 'text-emerald-600 dark:text-emerald-400' :
-                                    geminiFlashModel.percentage >= 20 ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                    }`}
-                                    title={formatQuotaTooltip(geminiFlashModel.percentage, geminiFlashModel.officialPercentage)}
-                                >
-                                    {geminiFlashModel.percentage}%
-                                </span>
-                            </div>
-                        </div>
-                        <div className="w-full bg-gray-100 dark:bg-base-300 rounded-full h-1.5 overflow-hidden">
-                            <div
-                                className={`h-full rounded-full transition-all duration-700 ${geminiFlashModel.percentage >= 50 ? 'bg-gradient-to-r from-emerald-400 to-emerald-500' :
-                                    geminiFlashModel.percentage >= 20 ? 'bg-gradient-to-r from-amber-400 to-amber-500' :
-                                        'bg-gradient-to-r from-rose-400 to-rose-500'
-                                    }`}
-                                style={{ width: `${geminiFlashModel.percentage}%` }}
-                            ></div>
-                        </div>
-                    </div>
-                )}
-
-                {/* Claude 配额 */}
-                {claudeModel && (
-                    <div className="space-y-1.5">
-                        <div className="flex justify-between items-baseline">
-                            <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {account.protected_models?.includes('claude') && <Lock className="w-2.5 h-2.5 text-rose-500" />}
-                                {getModelDisplayName(claudeModel, t('common.claude_series', 'Claude 系列'))}
-                            </span>
-                            <div className="flex items-center gap-2">
-                                <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(claudeModel.reset_time).toLocaleString()}`}>
-                                    {claudeModel.reset_time ? `R: ${formatTimeRemaining(claudeModel.reset_time)}` : t('common.unknown')}
-                                </span>
-                                <span
-                                    className={`text-xs font-bold ${claudeModel.percentage >= 50 ? 'text-cyan-600 dark:text-cyan-400' :
-                                    claudeModel.percentage >= 20 ? 'text-orange-600 dark:text-orange-400' : 'text-rose-600 dark:text-rose-400'
-                                    }`}
-                                    title={formatQuotaTooltip(claudeModel.percentage, claudeModel.officialPercentage)}
-                                >
-                                    {claudeModel.percentage}%
-                                </span>
-                            </div>
-                        </div>
-                        <div className="w-full bg-gray-100 dark:bg-base-300 rounded-full h-1.5 overflow-hidden">
-                            <div
-                                className={`h-full rounded-full transition-all duration-700 ${claudeModel.percentage >= 50 ? 'bg-gradient-to-r from-cyan-400 to-cyan-500' :
-                                    claudeModel.percentage >= 20 ? 'bg-gradient-to-r from-orange-400 to-orange-500' :
-                                        'bg-gradient-to-r from-rose-400 to-rose-500'
-                                    }`}
-                                style={{ width: `${claudeModel.percentage}%` }}
-                            ></div>
-                        </div>
-                    </div>
-                )}
+                ))}
             </div>
 
             {onSwitch && (
-                <div className="mt-auto pt-3">
-                    <button
-                        className="w-full px-3 py-1.5 text-xs text-gray-700 dark:text-gray-300 border border-gray-200 dark:border-base-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
-                        onClick={onSwitch}
-                    >
-                        {t('dashboard.switch_account')}
-                    </button>
-                </div>
+                <button
+                    onClick={onSwitch}
+                    className="mt-4 w-full py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-lg transition-colors"
+                >
+                    {t('dashboard.switch_account')}
+                </button>
             )}
         </div>
     );

@@ -90,6 +90,32 @@ pub fn load_app_config() -> Result<AppConfig, String> {
     let config: AppConfig = serde_json::from_value(v)
         .map_err(|e| format!("failed_to_convert_config_after_migration: {}", e))?;
 
+    // Migrate quota_protection.monitored_models to official billing groups
+    let mut config = config;
+    let migrated = crate::proxy::common::model_mapping::migrate_monitored_models(
+        &config.quota_protection.monitored_models,
+    );
+    if migrated != config.quota_protection.monitored_models {
+        config.quota_protection.monitored_models = migrated;
+        modified = true;
+    }
+    // Also migrate pinned quota models if they still use fine-grained ids
+    let pinned_migrated = crate::proxy::common::model_mapping::migrate_monitored_models(
+        &config.pinned_quota_models.models,
+    );
+    if !pinned_migrated.is_empty() && pinned_migrated != config.pinned_quota_models.models {
+        // Only replace when migration produced billing groups (legacy fine-grained pins)
+        let had_legacy = config.pinned_quota_models.models.iter().any(|m| {
+            crate::proxy::common::model_mapping::normalize_to_billing_group(m)
+                .map(|g| g != *m)
+                .unwrap_or(false)
+        });
+        if had_legacy {
+            config.pinned_quota_models.models = pinned_migrated;
+            modified = true;
+        }
+    }
+
     // If migration occurred, auto-save once to clean up the file
     if modified {
         let _ = save_app_config(&config);

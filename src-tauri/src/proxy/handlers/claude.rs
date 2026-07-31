@@ -490,9 +490,9 @@ pub async fn handle_messages(
         .await;
     }
 
-    // [Issue #703 Fix] 智能兜底判断:需要归一化模型名用于配额保护检查
+    // [Issue #703 Fix] 智能兜底判断:需要归一化到官方计费组用于配额保护检查
     let normalized_model =
-        crate::proxy::common::model_mapping::normalize_to_standard_id(&request.model)
+        crate::proxy::common::model_mapping::normalize_to_billing_group(&request.model)
             .unwrap_or_else(|| request.model.clone());
 
     let use_zai = if !zai_enabled {

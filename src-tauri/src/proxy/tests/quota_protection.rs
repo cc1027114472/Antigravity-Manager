@@ -93,13 +93,15 @@ mod tests {
 
     #[test]
     fn test_protected_models_matching() {
+        use crate::proxy::common::model_mapping::normalize_to_billing_group;
+
         // 创建一个账号，protected_models 中有 claude
         let token = create_mock_token("account-1", "test@example.com", vec!["claude"], Some(50));
 
         // 测试：请求 claude-opus-4-5-thinking 时应该被保护
         let target_model = "claude-opus-4-5-thinking";
         let normalized =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
+            normalize_to_billing_group(target_model).unwrap_or_else(|| target_model.to_string());
 
         assert_eq!(normalized, "claude");
         assert!(
@@ -110,18 +112,19 @@ mod tests {
         // 测试：请求 claude-thinking 时也应该被保护
         let target_model_2 = "claude-thinking";
         let normalized_2 =
-            normalize_to_standard_id(target_model_2).unwrap_or_else(|| target_model_2.to_string());
+            normalize_to_billing_group(target_model_2).unwrap_or_else(|| target_model_2.to_string());
 
         assert!(
             token.protected_models.contains(&normalized_2),
             "claude-thinking 归一化后应该匹配 protected_models"
         );
 
-        // 测试：请求 gemini-3-flash 时不应该被保护（因为 protected_models 中没有）
+        // 测试：请求 gemini-3-flash 时不应该被保护（因为 protected_models 中没有 gemini）
         let target_model_3 = "gemini-3-flash";
         let normalized_3 =
-            normalize_to_standard_id(target_model_3).unwrap_or_else(|| target_model_3.to_string());
+            normalize_to_billing_group(target_model_3).unwrap_or_else(|| target_model_3.to_string());
 
+        assert_eq!(normalized_3, "gemini");
         assert!(
             !token.protected_models.contains(&normalized_3),
             "gemini-3-flash 不应该匹配 claude"
@@ -141,11 +144,11 @@ mod tests {
             create_mock_token("account-1", "user1@example.com", vec!["claude"], Some(20)),
             // 账号 2: 没有被保护
             create_mock_token("account-2", "user2@example.com", vec![], Some(80)),
-            // 账号 3: gemini-3-flash 被保护
+            // 账号 3: gemini 计费组被保护
             create_mock_token(
                 "account-3",
                 "user3@example.com",
-                vec!["gemini-3-flash"],
+                vec!["gemini"],
                 Some(30),
             ),
         ];
@@ -153,7 +156,8 @@ mod tests {
         // 模拟请求 claude-opus-4-5-thinking
         let target_model = "claude-opus-4-5-thinking";
         let normalized_target =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
+            crate::proxy::common::model_mapping::normalize_to_billing_group(target_model)
+                .unwrap_or_else(|| target_model.to_string());
 
         // 过滤掉被保护的账号
         let available_accounts: Vec<_> = tokens
@@ -177,14 +181,15 @@ mod tests {
         // 模拟请求 gemini-3-flash
         let target_model_2 = "gemini-3-flash";
         let normalized_target_2 =
-            normalize_to_standard_id(target_model_2).unwrap_or_else(|| target_model_2.to_string());
+            crate::proxy::common::model_mapping::normalize_to_billing_group(target_model_2)
+                .unwrap_or_else(|| target_model_2.to_string());
 
         let available_accounts_2: Vec<_> = tokens
             .iter()
             .filter(|t| !t.protected_models.contains(&normalized_target_2))
             .collect();
 
-        // 验证：账号 3 被过滤（因为 gemini-3-flash 被保护）
+        // 验证：账号 3 被过滤（因为 gemini 计费组被保护）
         // 账号 1 和 2 可用
         assert_eq!(available_accounts_2.len(), 2);
         assert!(available_accounts_2
@@ -214,7 +219,8 @@ mod tests {
 
         let target_model = "claude-opus-4-5-thinking";
         let normalized_target =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
+            crate::proxy::common::model_mapping::normalize_to_billing_group(target_model)
+                .unwrap_or_else(|| target_model.to_string());
 
         let available_accounts: Vec<_> = tokens
             .iter()
@@ -234,40 +240,49 @@ mod tests {
 
     #[test]
     fn test_monitored_models_normalization_consistency() {
+        use crate::proxy::common::model_mapping::{
+            migrate_monitored_models, normalize_to_billing_group,
+        };
+
         let config = QuotaProtectionConfig {
             enabled: true,
             threshold_percentage: 60,
-            monitored_models: vec![
+            monitored_models: migrate_monitored_models(&[
                 "claude".to_string(),
                 "gemini-3-pro-high".to_string(),
                 "gemini-3-flash".to_string(),
-            ],
+            ]),
         };
 
-        // 测试各种模型名归一化后是否在 monitored_models 中
+        assert_eq!(
+            config.monitored_models,
+            vec!["claude".to_string(), "gemini".to_string()]
+        );
+
         let test_cases = vec![
-            ("claude-opus-4-5-thinking", true), // 归一化为 claude
-            ("claude-thinking", true),          // 归一化为 claude
-            ("claude", true),                   // 直接匹配
-            ("gemini-3-pro-high", true),        // 直接匹配
-            ("gemini-3-pro-low", true),         // 归一化为 gemini-3-pro-high
-            ("gemini-3-flash", true),           // 直接匹配
-            ("gpt-4", false),                   // 不支持的模型
-            ("gemini-2.5-flash", true),         // 在监控列表中 (归一化为 gemini-3-flash)
+            ("claude-opus-4-5-thinking", true),
+            ("claude-thinking", true),
+            ("claude", true),
+            ("gemini-3-pro-high", true),
+            ("gemini-3-pro-low", true),
+            ("gemini-3-flash", true),
+            ("gemini-3.1-flash-image", true),
+            ("gpt-4", true), // 3p → claude billing group
+            ("gemini-2.5-flash", true),
+            ("unknown-xyz", false),
         ];
 
         for (model_name, expected_monitored) in test_cases {
-            let standard_id = normalize_to_standard_id(model_name);
-
-            let is_monitored = match &standard_id {
+            let billing = normalize_to_billing_group(model_name);
+            let is_monitored = match &billing {
                 Some(id) => config.monitored_models.contains(id),
                 None => false,
             };
 
             assert_eq!(
                 is_monitored, expected_monitored,
-                "模型 {} (归一化为 {:?}) 的监控状态应为 {}",
-                model_name, standard_id, expected_monitored
+                "模型 {} (计费组 {:?}) 的监控状态应为 {}",
+                model_name, billing, expected_monitored
             );
         }
     }
@@ -865,7 +880,7 @@ mod tests {
 
     // ==================================================================================
     // 测试 17: get_model_quota_from_json 函数正确性
-    // 验证从磁盘读取特定模型 quota 而非 max(所有模型)
+    // 验证按官方计费组聚合（组内取 min），而非全模型 max
     // ==================================================================================
 
     #[test]
@@ -887,7 +902,7 @@ mod tests {
         let account_path = temp_dir.join(format!("test_quota_{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&account_path, account_json.to_string()).expect("Failed to write temp file");
 
-        // 测试读取 claude 的 quota
+        // 测试读取 claude 计费组：同组取 min(60, 40) = 40
         let sonnet_quota =
             crate::proxy::token_manager::TokenManager::get_model_quota_from_json_for_test(
                 &account_path,
@@ -895,17 +910,17 @@ mod tests {
             );
         assert_eq!(
             sonnet_quota,
-            Some(60),
-            "claude 应该返回 60%，而非 max(100%)"
+            Some(40),
+            "claude 计费组应返回组内 min 40%，而非单模型 60% 或全局 max(100%)"
         );
 
-        // 测试读取 gemini-3-flash 的 quota
+        // 测试读取 gemini-3-flash → gemini 计费组
         let gemini_quota =
             crate::proxy::token_manager::TokenManager::get_model_quota_from_json_for_test(
                 &account_path,
                 "gemini-3-flash",
             );
-        assert_eq!(gemini_quota, Some(100), "gemini-3-flash 应该返回 100%");
+        assert_eq!(gemini_quota, Some(100), "gemini 计费组应该返回 100%");
 
         // 测试读取不存在的模型
         let unknown_quota =

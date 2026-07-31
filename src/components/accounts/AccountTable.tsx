@@ -1,7 +1,3 @@
-/**
- * 账号表格组件
- * 支持拖拽排序功能，用户可以通过拖拽行来调整账号顺序
- */
 import { useMemo, useState } from 'react';
 import {
     DndContext,
@@ -50,13 +46,11 @@ import type { Account } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
 
-import { useConfigStore } from '../../stores/useConfigStore';
 import { QuotaItem } from './QuotaItem';
-import { MODEL_CONFIG, sortModels, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
-import { categorizeModel, getModelProtectionKey } from '../../utils/modelCategory';
+import { getModelProtectionKey } from '../../utils/modelCategory';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
-import { getLiveLimitForModel } from '../../utils/liveLimit';
-import { formatQuotaTooltip, getDisplayQuotaModels, type DisplayModelQuota } from '../../utils/quotaDisplay';
+import { formatQuotaTooltip, getBillingGroupDisplays } from '../../utils/quotaDisplay';
+import { Gemini, Claude } from '@lobehub/icons';
 import {
     proxyUsageBadgeClass,
     proxyUsageTooltipKey,
@@ -151,25 +145,9 @@ interface AccountRowContentProps {
 function isModelProtected(protectedModels: string[] | undefined, modelName: string): boolean {
     if (!protectedModels || protectedModels.length === 0) return false;
     const lowerName = modelName.toLowerCase();
-
-    if (lowerName === 'gemini-pro') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'gemini-pro' && getModelProtectionKey(model) === 'gemini-3-pro-high',
-        );
-    }
-    if (lowerName === 'gemini-flash') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'gemini-flash' && getModelProtectionKey(model) === 'gemini-3-flash',
-        );
-    }
-    if (lowerName === 'claude-sonnet') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'claude' && getModelProtectionKey(model) === 'claude',
-        );
-    }
-
-    const protectionKey = getModelProtectionKey(lowerName);
-    return protectionKey ? protectedModels.includes(protectionKey) : false;
+    const billing = getModelProtectionKey(lowerName) ?? (lowerName === 'gemini' || lowerName === 'claude' ? lowerName : null);
+    if (billing && protectedModels.includes(billing)) return true;
+    return protectedModels.some((m) => m.toLowerCase() === lowerName || getModelProtectionKey(m) === billing);
 }
 
 // ============================================================================
@@ -300,7 +278,6 @@ function AccountRowContent({
     isSerialCursor,
 }: AccountRowContentProps) {
     const { t } = useTranslation();
-    const { config, showAllQuotas } = useConfigStore();
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
 
     // 自定义标签编辑状态
@@ -327,68 +304,17 @@ function AccountRowContent({
         }
     };
 
-    // 使用统一的模型配置
-
-    // 获取要显示的模型列表
-    const pinnedModels = ensurePinnedImageSelector(
-        config?.pinned_quota_models?.models || Object.keys(MODEL_CONFIG),
-    );
-
-    // 根据 show_all 状态决定显示哪些模型（本地账本优先）
-    const uniqueLabels = new Set<string>();
-    const ledgerModels = getDisplayQuotaModels(account);
-    const displayModels = sortModels(
-        (showAllQuotas
-            ? ledgerModels.map(m => {
-                const config = MODEL_CONFIG[m.name.toLowerCase()];
-                const label = m.display_name || (config?.i18nKey ? t(config.i18nKey) : (config?.shortLabel || config?.label || m.name));
-                return {
-                    id: m.name.toLowerCase(),
-                    label: label,
-                    protectedKey: config?.protectedKey || m.name.toLowerCase(),
-                    data: m as DisplayModelQuota
-                };
-            })
-            : resolveQuotaModels(ledgerModels, pinnedModels).map(sel => {
-                const selectorConfig = MODEL_CONFIG[sel.selectorId.toLowerCase()];
-                const resolvedConfig = sel.model ? MODEL_CONFIG[sel.model.name.toLowerCase()] : undefined;
-                if (!selectorConfig && !sel.model) return null;
-                const label = sel.model?.display_name
-                    || (resolvedConfig?.shortLabel || resolvedConfig?.label)
-                    || (selectorConfig?.shortLabel || selectorConfig?.label)
-                    || (resolvedConfig?.i18nKey ? t(resolvedConfig.i18nKey) : undefined)
-                    || (selectorConfig?.i18nKey ? t(selectorConfig.i18nKey) : undefined)
-                    || sel.selectorId;
-                return {
-                    id: sel.model?.name.toLowerCase() ?? sel.selectorId.toLowerCase(),
-                    label,
-                    protectedKey: getModelProtectionKey(sel.model?.name ?? sel.selectorId) ?? resolvedConfig?.protectedKey ?? selectorConfig?.protectedKey ?? sel.selectorId,
-                    data: sel.model as DisplayModelQuota | undefined,
-                };
-            }).filter((item): item is { id: string; label: string; protectedKey: string; data: DisplayModelQuota | undefined } => item !== null)
-    ).filter(m => {
-            // 过滤特定的 Claude/Gemini 思考变体 (在列表页隐藏)
-            const isHiddenThinking = m.id.includes('thinking');
-
-            if (isHiddenThinking) return false;
-
-            // 基于标签去重 (例如 G3.1 Pro 只显示一次)
-            // 优先显示有配额数据的 ID
-            const labelKey = `${m.label}-${m.protectedKey}`;
-            if (uniqueLabels.has(labelKey)) {
-                return false;
-            }
-            if (m.data) {
-                uniqueLabels.add(labelKey);
-                return true;
-            }
-            return true;
-        })
-    ).filter((m, index, self) => {
-        // 第二次过滤：确保即使没有数据的重复 Label 也只保留一个
-        const labelKey = `${m.label}-${m.protectedKey}`;
-        return self.findIndex(t => `${t.label}-${t.protectedKey}` === labelKey) === index;
-    });
+    // Official billing groups (Gemini / Claude) — primary list view
+    const billingRows = getBillingGroupDisplays(account);
+    const displayModels = billingRows.map((row) => ({
+        id: row.id,
+        label: row.label,
+        protectedKey: row.id,
+        percentage: row.percentage,
+        officialPercentage: row.officialPercentage,
+        reset_time: row.reset_time,
+        Icon: row.id === 'claude' ? Claude.Color : Gemini.Color,
+    }));
 
 
     return (
@@ -558,22 +484,17 @@ function AccountRowContent({
                         "grid gap-x-2 gap-y-1 py-0",
                         displayModels.length === 1 ? "grid-cols-1" : "grid-cols-2"
                     )}>
-                        {displayModels.map((model) => {
-                            const modelData = model.data;
-
-                            return (
+                        {displayModels.map((model) => (
                                 <QuotaItem
                                     key={model.id}
                                     label={model.label}
-                                    percentage={modelData?.percentage || 0}
-                                    resetTime={modelData?.reset_time}
+                                    percentage={model.percentage || 0}
+                                    resetTime={model.reset_time}
                                     isProtected={isModelProtected(account.protected_models, model.protectedKey)}
-                                    liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
-                                    Icon={MODEL_CONFIG[model.id]?.Icon || Bot}
-                                    quotaTitle={formatQuotaTooltip(modelData?.percentage, modelData?.officialPercentage)}
+                                    Icon={model.Icon || Bot}
+                                    quotaTitle={formatQuotaTooltip(model.percentage, model.officialPercentage)}
                                 />
-                            );
-                        })}
+                            ))}
                     </div>
                 )}
             </td>
@@ -742,7 +663,7 @@ function AccountTable({
     const { t } = useTranslation();
 
     const [activeId, setActiveId] = useState<string | null>(null);
-    // showAllQuotas 已经在 useConfigStore 中解构获取
+    // Account list uses official billing groups (Gemini / Claude)
 
     // 配置拖拽传感器
     const sensors = useSensors(

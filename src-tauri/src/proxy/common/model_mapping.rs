@@ -311,23 +311,26 @@ pub fn resolve_model_route(
     result
 }
 
-/// Normalize any physical model name to one of the 3 standard protection IDs.
-/// This ensures quota protection works consistently regardless of API versioning or request variations.
+/// Official billing group IDs (Google `retrieveUserQuotaSummary` big buckets).
+/// Ledger / quota protection / get_token sorting use these — not fine-grained std ids.
+pub const BILLING_GEMINI: &str = "gemini";
+pub const BILLING_CLAUDE: &str = "claude";
+
+/// Normalize any physical model name to one of the fine-grained standard IDs.
+/// Kept for display aliases, live-limit matching, and capability hints.
 ///
 /// Standard IDs:
 /// - `gemini-3-flash`: All Flash variants (1.5-flash, 2.5-flash, 3-flash, etc.)
 /// - `gemini-3.1-flash-image`: Flash image generation/edit quota.
 /// - `gemini-3-pro-high`: All Pro variants (1.5-pro, 2.5-pro, etc.)
 /// - `gemini-3-pro-image`: Pro image generation quota.
-/// - `claude-sonnet-4-5`: All Claude Sonnet variants (3-5-sonnet, sonnet-4-5, etc.)
+/// - `claude`: All Claude variants.
 ///
-/// Returns `None` if the model doesn't match any of the 3 protected categories.
+/// Returns `None` if the model doesn't match any protected category.
 pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     let lower = model_name.to_lowercase();
 
-    // 1. Image resources must keep Flash image and Pro image in separate quota buckets.
-    // The quota API exposes `gemini-3.1-flash-image` separately, so grouping it under
-    // `gemini-3-pro-image` makes available Flash image quota look exhausted.
+    // 1. Image resources must keep Flash image and Pro image in separate fine-grained IDs.
     if lower.contains("image") {
         if lower.contains("flash") {
             return Some("gemini-3.1-flash-image".to_string());
@@ -355,6 +358,84 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Map a model name or legacy std id to an official billing group (`gemini` | `claude`).
+///
+/// Aligns with Google quota summary buckets: all Gemini (Flash/Pro/Image) share one pool;
+/// Claude (and other 3p) share another. GPT requests map to `claude` (3p bucket).
+pub fn normalize_to_billing_group(model_name: &str) -> Option<String> {
+    let lower = model_name.trim().to_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    // Already a billing group, or any gemini-* legacy / physical id
+    if lower == BILLING_GEMINI || lower.starts_with("gemini") {
+        return Some(BILLING_GEMINI.to_string());
+    }
+    if lower == BILLING_CLAUDE || lower == "3p" {
+        return Some(BILLING_CLAUDE.to_string());
+    }
+
+    if let Some(std_id) = normalize_to_standard_id(&lower) {
+        if std_id.starts_with("gemini") {
+            return Some(BILLING_GEMINI.to_string());
+        }
+        if std_id == BILLING_CLAUDE {
+            return Some(BILLING_CLAUDE.to_string());
+        }
+    }
+
+    // 3p / GPT fall into the Claude official bucket
+    if lower.contains("gpt") || lower.starts_with("o1") || lower.starts_with("o3") {
+        return Some(BILLING_CLAUDE.to_string());
+    }
+
+    // Catch-all gemini agent / preview names not covered by std id
+    if lower.contains("gemini") {
+        return Some(BILLING_GEMINI.to_string());
+    }
+
+    None
+}
+
+/// Migrate a single monitored/protected/estimated key to a billing group id.
+pub fn migrate_to_billing_group_id(id: &str) -> Option<String> {
+    normalize_to_billing_group(id)
+}
+
+/// Collapse legacy monitored_models list into unique billing groups.
+pub fn migrate_monitored_models(models: &[String]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut set = BTreeSet::new();
+    for m in models {
+        if let Some(g) = migrate_to_billing_group_id(m) {
+            set.insert(g);
+        }
+    }
+    // Stable preferred order: claude then gemini (historical default lead with claude)
+    let mut out = Vec::new();
+    if set.remove(BILLING_CLAUDE) {
+        out.push(BILLING_CLAUDE.to_string());
+    }
+    if set.remove(BILLING_GEMINI) {
+        out.push(BILLING_GEMINI.to_string());
+    }
+    out.extend(set);
+    out
+}
+
+/// Collapse a set of protected model ids into billing groups.
+pub fn migrate_protected_models_set(
+    models: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for m in models {
+        if let Some(g) = migrate_to_billing_group_id(m) {
+            out.insert(g);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -454,6 +535,59 @@ mod tests {
             normalize_to_standard_id("gemini-3.1-flash-image-4k"),
             Some("gemini-3.1-flash-image".to_string())
         );
+    }
+
+    #[test]
+    fn test_normalize_to_billing_group() {
+        assert_eq!(
+            normalize_to_billing_group("gemini-3-flash"),
+            Some("gemini".to_string())
+        );
+        assert_eq!(
+            normalize_to_billing_group("gemini-3.5-flash"),
+            Some("gemini".to_string())
+        );
+        assert_eq!(
+            normalize_to_billing_group("gemini-3.1-pro-high"),
+            Some("gemini".to_string())
+        );
+        assert_eq!(
+            normalize_to_billing_group("gemini-3.1-flash-image"),
+            Some("gemini".to_string())
+        );
+        assert_eq!(
+            normalize_to_billing_group("gemini-3-pro-image"),
+            Some("gemini".to_string())
+        );
+        assert_eq!(
+            normalize_to_billing_group("gemini-pro-agent"),
+            Some("gemini".to_string())
+        );
+        assert_eq!(
+            normalize_to_billing_group("claude-sonnet-4-6"),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            normalize_to_billing_group("claude-opus-4-6-thinking"),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            normalize_to_billing_group("3p"),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            normalize_to_billing_group("gpt-4o"),
+            Some("claude".to_string())
+        );
+        assert_eq!(normalize_to_billing_group("unknown-model"), None);
+
+        let migrated = migrate_monitored_models(&[
+            "gemini-3-flash".into(),
+            "gemini-3-pro-high".into(),
+            "gemini-3.1-flash-image".into(),
+            "claude".into(),
+        ]);
+        assert_eq!(migrated, vec!["claude".to_string(), "gemini".to_string()]);
     }
 
     #[test]

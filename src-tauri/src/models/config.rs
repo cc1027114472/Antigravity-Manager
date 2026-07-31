@@ -80,18 +80,13 @@ pub struct QuotaProtectionConfig {
     /// Reserved quota percentage (1-99)
     pub threshold_percentage: u32,
 
-    /// List of monitored models (e.g. gemini-3-flash, gemini-3-pro-high, gemini-3.1-pro-high, claude-sonnet-4-6)
+    /// List of monitored billing groups (e.g. gemini, claude)
     #[serde(default = "default_monitored_models")]
     pub monitored_models: Vec<String>,
 }
 
 fn default_monitored_models() -> Vec<String> {
-    vec![
-        "claude".to_string(),
-        "gemini-3-pro-high".to_string(),
-        "gemini-3-flash".to_string(),
-        "gemini-3.1-flash-image".to_string(),
-    ]
+    vec!["claude".to_string(), "gemini".to_string()]
 }
 
 impl QuotaProtectionConfig {
@@ -176,12 +171,7 @@ pub struct PinnedQuotaModelsConfig {
 }
 
 fn default_pinned_models() -> Vec<String> {
-    vec![
-        "gemini-3-pro-high".to_string(),
-        "gemini-3-flash".to_string(),
-        "gemini-3.1-flash-image".to_string(),
-        "claude-sonnet-4-6-thinking".to_string(),
-    ]
+    vec!["gemini".to_string(), "claude".to_string()]
 }
 
 impl PinnedQuotaModelsConfig {
