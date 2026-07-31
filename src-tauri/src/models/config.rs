@@ -25,6 +25,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub quota_protection: QuotaProtectionConfig, // [NEW] Quota protection configuration
     #[serde(default)]
+    pub quota_ledger: QuotaLedgerConfig, // Local estimated quota ledger
+    #[serde(default)]
     pub pinned_quota_models: PinnedQuotaModelsConfig, // [NEW] Pinned quota models list
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig, // [NEW] Circuit breaker configuration
@@ -103,6 +105,63 @@ impl QuotaProtectionConfig {
 }
 
 impl Default for QuotaProtectionConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Local quota ledger: burn on success, calibrate from online fetch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaLedgerConfig {
+    /// When false, selection/protection use online snapshot only.
+    #[serde(default = "default_ledger_enabled")]
+    pub enabled: bool,
+    /// Minimum percentage burned per successful request.
+    #[serde(default = "default_min_burn_pct")]
+    pub min_burn_pct: u32,
+    /// Tokens that equal ~1% burn (ceil(total_tokens / N)).
+    #[serde(default = "default_tokens_per_percent")]
+    pub tokens_per_percent: u32,
+}
+
+fn default_ledger_enabled() -> bool {
+    true
+}
+
+fn default_min_burn_pct() -> u32 {
+    1
+}
+
+fn default_tokens_per_percent() -> u32 {
+    20_000
+}
+
+impl QuotaLedgerConfig {
+    pub fn new() -> Self {
+        Self {
+            enabled: true,
+            min_burn_pct: 1,
+            tokens_per_percent: 20_000,
+        }
+    }
+
+    /// Burn percent for one successful request.
+    /// With usage: max(min_burn, ceil(tokens / tokens_per_percent)).
+    /// Without usage: min_burn only.
+    pub fn compute_burn_pct(&self, total_tokens: Option<u64>) -> i32 {
+        let min_burn = self.min_burn_pct.max(1) as i32;
+        match total_tokens {
+            Some(tokens) if tokens > 0 => {
+                let per = self.tokens_per_percent.max(1) as u64;
+                let from_tokens = ((tokens + per - 1) / per) as i32;
+                min_burn.max(from_tokens)
+            }
+            _ => min_burn,
+        }
+    }
+}
+
+impl Default for QuotaLedgerConfig {
     fn default() -> Self {
         Self::new()
     }
@@ -188,6 +247,7 @@ impl AppConfig {
             auto_launch: false,
             scheduled_warmup: ScheduledWarmupConfig::default(),
             quota_protection: QuotaProtectionConfig::default(),
+            quota_ledger: QuotaLedgerConfig::default(),
             pinned_quota_models: PinnedQuotaModelsConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             hidden_menu_items: Vec::new(),

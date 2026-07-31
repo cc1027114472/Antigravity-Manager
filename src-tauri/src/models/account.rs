@@ -1,4 +1,7 @@
-use super::{quota::QuotaData, token::TokenData};
+use super::{
+    quota::{EstimatedModelQuota, QuotaData},
+    token::TokenData,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -27,6 +30,9 @@ pub struct Account {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub device_history: Vec<DeviceProfileVersion>,
     pub quota: Option<QuotaData>,
+    /// Local estimated remaining % per standard model id (selection / protection source when ledger enabled).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub estimated_quotas: HashMap<String, EstimatedModelQuota>,
     /// Disabled accounts are ignored by the proxy token pool (e.g. revoked refresh_token -> invalid_grant).
     #[serde(default)]
     pub disabled: bool,
@@ -87,6 +93,7 @@ impl Account {
             device_profile: None,
             device_history: Vec::new(),
             quota: None,
+            estimated_quotas: HashMap::new(),
             disabled: false,
             disabled_reason: None,
             disabled_at: None,
@@ -118,6 +125,30 @@ impl Account {
             }
         }
         self.quota = Some(quota);
+    }
+
+    /// Overwrite local ledger from online quota snapshot (calibration).
+    pub fn calibrate_estimated_from_quota(&mut self, quota: &QuotaData) {
+        let now = chrono::Utc::now().timestamp();
+        let mut next: HashMap<String, EstimatedModelQuota> = HashMap::new();
+        let mut group_max: HashMap<String, i32> = HashMap::new();
+
+        for model in &quota.models {
+            let std_id = crate::proxy::common::model_mapping::normalize_to_standard_id(&model.name)
+                .unwrap_or_else(|| model.name.clone());
+            let entry = group_max.entry(std_id).or_insert(-1);
+            if model.percentage > *entry {
+                *entry = model.percentage;
+            }
+        }
+
+        for (std_id, pct) in group_max {
+            next.insert(
+                std_id.clone(),
+                EstimatedModelQuota::from_online(std_id, pct, now),
+            );
+        }
+        self.estimated_quotas = next;
     }
 }
 

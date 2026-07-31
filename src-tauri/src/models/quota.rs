@@ -96,3 +96,30 @@ impl Default for QuotaData {
         Self::new()
     }
 }
+
+/// Local estimated remaining quota for one standard model id (ledger).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EstimatedModelQuota {
+    /// Standard model id (e.g. `claude`, `gemini-3-flash`)
+    pub model: String,
+    /// Estimated remaining percentage 0-100
+    pub percentage: i32,
+    /// Last online percentage applied during calibration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_online_pct: Option<i32>,
+    /// Unix timestamp of last online calibration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_calibrated_at: Option<i64>,
+}
+
+impl EstimatedModelQuota {
+    pub fn from_online(model: String, online_pct: i32, now: i64) -> Self {
+        Self {
+            model,
+            percentage: online_pct.clamp(0, 100),
+            last_online_pct: Some(online_pct.clamp(0, 100)),
+            last_calibrated_at: Some(now),
+        }
+    }
+}

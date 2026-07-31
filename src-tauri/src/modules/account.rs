@@ -1492,63 +1492,37 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
     let mut account = load_account(account_id)?;
     account.update_quota(quota);
 
+    let app_config = crate::modules::config::load_app_config().ok();
+    let ledger_enabled = app_config
+        .as_ref()
+        .map(|c| c.quota_ledger.enabled)
+        .unwrap_or(true);
+
+    // Calibrate local ledger from online snapshot when ledger is enabled.
+    if ledger_enabled {
+        if let Some(q) = account.quota.clone() {
+            account.calibrate_estimated_from_quota(&q);
+        }
+    }
+
     // --- Quota protection logic start ---
-    if let Ok(config) = crate::modules::config::load_app_config() {
+    if let Some(ref config) = app_config {
         if config.quota_protection.enabled {
-            if let Some(ref q) = account.quota {
-                let threshold = config.quota_protection.threshold_percentage as i32;
-
-                let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
-
-                for model in &q.models {
-                    if let Some(std_id) =
-                        crate::proxy::common::model_mapping::normalize_to_standard_id(&model.name)
-                    {
-                        let entry = group_max_percentage.entry(std_id).or_insert(-1);
-                        if model.percentage > *entry {
-                            *entry = model.percentage;
-                        }
-                    }
-                }
-
-                for std_id in &config.quota_protection.monitored_models {
-                    let max_pct = group_max_percentage.get(std_id).cloned().unwrap_or(100);
-
-                    if max_pct < threshold {
-                        if !account.protected_models.contains(std_id) {
-                            crate::modules::logger::log_info(&format!(
-                                "[Quota] Triggering model protection: {} (Group: {} Max: {}% < Thres: {}%)",
-                                account.email, std_id, max_pct, threshold
-                            ));
-                            account.protected_models.insert(std_id.clone());
-                        }
-                    } else {
-                        if account.protected_models.contains(std_id) {
-                            crate::modules::logger::log_info(&format!(
-                                "[Quota] Model protection recovered: {} (Group: {} Max: {}% >= Thres: {}%)",
-                                account.email, std_id, max_pct, threshold
-                            ));
-                            account.protected_models.remove(std_id);
-                        }
-                    }
-                }
-
-                // [Compatibility] Migrate from account-level to model-level protection if previously disabled for quota
-                if account.proxy_disabled
-                    && account
-                        .proxy_disabled_reason
-                        .as_ref()
-                        .map_or(false, |r| r == "quota_protection")
-                {
-                    crate::modules::logger::log_info(&format!(
-                        "[Quota] Migrating account {} from account-level to model-level protection",
-                        account.email
-                    ));
-                    account.proxy_disabled = false;
-                    account.proxy_disabled_reason = None;
-                    account.proxy_disabled_at = None;
-                }
-            }
+            let percentages = crate::modules::quota_ledger::effective_percentage_map(
+                &account,
+                &config.quota_ledger,
+            );
+            // If ledger empty (first run before calibrate with ledger off path), fall back online.
+            let percentages = if percentages.is_empty() {
+                crate::modules::quota_ledger::online_percentage_map(&account)
+            } else {
+                percentages
+            };
+            crate::modules::quota_ledger::apply_protection_from_percentages(
+                &mut account,
+                &percentages,
+                &config.quota_protection,
+            );
         }
     }
     // --- Quota protection logic end ---
@@ -1557,8 +1531,8 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
     if let Some(ref q) = account.quota {
         account.live_limited_models.retain(|model_key, _| {
             let recovered = q.models.iter().any(|m| {
-                let is_matching = m.name == *model_key || 
-                    crate::proxy::common::model_mapping::normalize_to_standard_id(&m.name)
+                let is_matching = m.name == *model_key
+                    || crate::proxy::common::model_mapping::normalize_to_standard_id(&m.name)
                         .map_or(false, |std| std == *model_key);
                 is_matching && m.percentage > 0
             });
@@ -1585,6 +1559,57 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
     // [FIX] Trigger TokenManager account reload signal
     // This ensures in-memory protected_models are updated
     crate::proxy::server::trigger_account_reload(account_id);
+
+    Ok(())
+}
+
+/// Persist a single-model estimated burn without online recalibration.
+pub fn persist_estimated_quota_burn(
+    account_id: &str,
+    std_model_id: &str,
+    new_percentage: i32,
+    protect_model: bool,
+) -> Result<(), String> {
+    let mut account = load_account(account_id)?;
+    let entry = account
+        .estimated_quotas
+        .entry(std_model_id.to_string())
+        .or_insert_with(|| crate::models::EstimatedModelQuota {
+            model: std_model_id.to_string(),
+            percentage: 100,
+            last_online_pct: None,
+            last_calibrated_at: None,
+        });
+    entry.percentage = new_percentage.clamp(0, 100);
+    // Keep last calibration metadata; only update percentage.
+
+    if protect_model {
+        account.protected_models.insert(std_model_id.to_string());
+    }
+
+    // If protection enabled, re-evaluate all monitored models from estimated map.
+    if let Ok(config) = crate::modules::config::load_app_config() {
+        if config.quota_protection.enabled {
+            let percentages = crate::modules::quota_ledger::estimated_percentage_map(&account);
+            crate::modules::quota_ledger::apply_protection_from_percentages(
+                &mut account,
+                &percentages,
+                &config.quota_protection,
+            );
+        }
+    }
+
+    save_account(&account)?;
+
+    let _lock = ACCOUNT_INDEX_LOCK
+        .lock()
+        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+    if let Ok(mut index) = load_account_index() {
+        if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {
+            summary.protected_models = account.protected_models.clone();
+            let _ = save_account_index(&index);
+        }
+    }
 
     Ok(())
 }

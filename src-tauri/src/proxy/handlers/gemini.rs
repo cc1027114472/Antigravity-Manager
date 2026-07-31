@@ -483,6 +483,7 @@ pub async fn handle_generate(
                         .header("Connection", "keep-alive")
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
+                        .header("X-Account-Id", &account_id)
                         .header("X-Mapped-Model", &mapped_model)
                         .body(body)
                         .unwrap()

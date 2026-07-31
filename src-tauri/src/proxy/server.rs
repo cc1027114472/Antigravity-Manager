@@ -26,12 +26,39 @@ static PENDING_RELOAD_ACCOUNTS: OnceLock<std::sync::RwLock<HashSet<String>>> = O
 // 当账号被删除后，将账号 ID 加入此队列，TokenManager 在 get_token 时会检查并清理内存缓存
 static PENDING_DELETE_ACCOUNTS: OnceLock<std::sync::RwLock<HashSet<String>>> = OnceLock::new();
 
+/// Shared TokenManager for quota-ledger burns from monitor (outside request State).
+static SHARED_TOKEN_MANAGER: OnceLock<std::sync::RwLock<Option<Arc<TokenManager>>>> =
+    OnceLock::new();
+
 fn get_pending_reload_accounts() -> &'static std::sync::RwLock<HashSet<String>> {
     PENDING_RELOAD_ACCOUNTS.get_or_init(|| std::sync::RwLock::new(HashSet::new()))
 }
 
 fn get_pending_delete_accounts() -> &'static std::sync::RwLock<HashSet<String>> {
     PENDING_DELETE_ACCOUNTS.get_or_init(|| std::sync::RwLock::new(HashSet::new()))
+}
+
+fn shared_token_manager_slot() -> &'static std::sync::RwLock<Option<Arc<TokenManager>>> {
+    SHARED_TOKEN_MANAGER.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+pub fn register_shared_token_manager(tm: Arc<TokenManager>) {
+    if let Ok(mut slot) = shared_token_manager_slot().write() {
+        *slot = Some(tm);
+    }
+}
+
+pub fn clear_shared_token_manager() {
+    if let Ok(mut slot) = shared_token_manager_slot().write() {
+        *slot = None;
+    }
+}
+
+pub fn try_get_shared_token_manager() -> Option<Arc<TokenManager>> {
+    shared_token_manager_slot()
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
 }
 
 /// 触发账号重新加载信号（供 update_account_quota 调用）
@@ -380,6 +407,8 @@ impl AxumServer {
         let experimental_state = Arc::new(RwLock::new(experimental_config));
         let debug_logging_state = Arc::new(RwLock::new(debug_logging));
         let is_running_state = Arc::new(RwLock::new(false));
+
+        register_shared_token_manager(token_manager.clone());
 
         let state = AppState {
             token_manager: token_manager.clone(),

@@ -348,7 +348,9 @@ pub fn run() {
                     // [DISABLED] Start smart scheduler (Automatic warmup disabled as per user request)
                     // modules::scheduler::start_scheduler(None, proxy_state.clone());
                     info!("Smart scheduler (Automatic Warmup) is DISABLED.");
-                    info!("Smart scheduler started in headless mode.");
+
+                    // Local ledger calibration: online fetch on auto_refresh interval (no UI needed).
+                    modules::quota_calibration::start_quota_calibration_ticker();
                 }
                 Err(e) => {
                     error!("Failed to load config for headless mode: {}", e);
@@ -475,6 +477,9 @@ pub fn run() {
             // let scheduler_state = app.handle().state::<commands::proxy::ProxyServiceState>();
             // modules::scheduler::start_scheduler(Some(app.handle().clone()), scheduler_state.inner().clone());
             info!("Smart scheduler (Automatic Warmup) is DISABLED.");
+
+            // Online quota → local ledger calibration (also covers cases where UI timer is idle).
+            modules::quota_calibration::start_quota_calibration_ticker();
 
             // [PHASE 1] 已整合至 Axum 端口 (8045)，不再单独启动 19527 端口
             info!("Management API integrated into main proxy server (port 8045)");

@@ -15,6 +15,8 @@ pub struct ProxyRequestLog {
     pub model: Option<String>,        // 客户端请求的模型名
     pub mapped_model: Option<String>, // 实际路由后使用的模型名
     pub account_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub client_ip: Option<String>, // 客户端 IP 地址
     pub error: Option<String>,
     pub request_body: Option<String>,
@@ -80,6 +82,23 @@ impl ProxyMonitor {
     }
 
     pub async fn log_request(&self, log: ProxyRequestLog) {
+        // Local quota ledger burn on successful responses (independent of monitor toggle).
+        if (200..400).contains(&log.status) {
+            if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                let model = log
+                    .mapped_model
+                    .clone()
+                    .or_else(|| log.model.clone());
+                tm.burn_estimated_quota(
+                    log.account_id.as_deref(),
+                    log.account_email.as_deref(),
+                    model.as_deref(),
+                    log.input_tokens,
+                    log.output_tokens,
+                );
+            }
+        }
+
         if let (Some(account), Some(input), Some(output)) =
             (&log.account_email, log.input_tokens, log.output_tokens)
         {
@@ -161,6 +180,7 @@ impl ProxyMonitor {
                 model: log.model.clone(),
                 mapped_model: log.mapped_model.clone(),
                 account_email: log.account_email.clone(),
+                account_id: log.account_id.clone(),
                 client_ip: log.client_ip.clone(),
                 error: log.error.clone(),
                 request_body: None,  // Don't send body in event

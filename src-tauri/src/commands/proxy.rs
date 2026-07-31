@@ -326,6 +326,7 @@ pub async fn stop_proxy_service(state: State<'_, ProxyServiceState>) -> Result<(
     if let Some(instance) = instance_lock.take() {
         instance.token_manager.abort_background_tasks().await;
         instance.axum_server.set_running(false).await;
+        crate::proxy::server::clear_shared_token_manager();
         // 已移除 instance.axum_server.stop() 调用，防止杀死 Admin Server
     }
 

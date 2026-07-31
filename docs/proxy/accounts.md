@@ -42,6 +42,27 @@ Prefer **one account ↔ one proxy binding** so quota refresh and AI share the s
 
 See: `get_effective_standard_client_for_account_ops` / `egress_key_for_account` in [`src-tauri/src/proxy/proxy_pool.rs`](../../src-tauri/src/proxy/proxy_pool.rs).
 
+### 3c) Local quota ledger (estimate + calibrate)
+Selection and `quota_protection` prefer **local estimated remaining %** per standard model id (`Account.estimated_quotas`), not the last online snapshot alone.
+
+| Role | Source |
+|------|--------|
+| Real-time intercept / sort | Local ledger (`estimated_quotas` → in-memory `ProxyToken.model_quotas`) |
+| Calibration | Online `fetch_quota` via `update_account_quota` (overwrites estimates) |
+| Hard backstop | Google 429 / realtime fetch also calibrates the ledger before lockout |
+
+Burn on successful proxy responses (`ProxyMonitor::log_request` → `TokenManager::burn_estimated_quota`):
+
+- `burn = max(min_burn_pct, ceil(tokens / tokens_per_percent))` (no usage → `min_burn_pct` only)
+- Config: `AppConfig.quota_ledger` (`enabled`, `min_burn_pct` default 1, `tokens_per_percent` default 20000)
+- Threshold compare uses `<=` so reserve at exactly the threshold is protected
+
+**Serial pool vs ledger:** serial advance still keys off `protected_models` / rate limits (AI selection). The ledger only makes protection trip sooner between online refreshes. Both share the same account↔proxy binding table for egress; they are not the same feature.
+
+Headless calibration: Rust ticker `modules/quota_calibration.rs` follows `auto_refresh` + `refresh_interval` (does not depend on the UI `BackgroundTaskRunner`).
+
+When `quota_ledger.enabled=false`, protection/selection fall back to the online `quota` snapshot only.
+
 ### 4) UI surfaces disabled state and blocks actions
 The accounts UI reads `disabled` fields and shows a “Disabled” badge and tooltip, and disables “switch / refresh” controls:
 - Account type includes `disabled*` fields: [`src/types/account.ts`](../../src/types/account.ts)

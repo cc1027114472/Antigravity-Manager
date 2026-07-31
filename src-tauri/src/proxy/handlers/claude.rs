@@ -1414,6 +1414,7 @@ pub async fn handle_messages(
                                 .header(header::CONNECTION, "keep-alive")
                                 .header("X-Accel-Buffering", "no")
                                 .header("X-Account-Email", &email)
+                                .header("X-Account-Id", &account_id)
                                 .header("X-Mapped-Model", &request_with_mapped.model)
                                 .header(
                                     "X-Context-Purified",
@@ -1435,6 +1436,7 @@ pub async fn handle_messages(
                                         .status(StatusCode::OK)
                                         .header(header::CONTENT_TYPE, "application/json")
                                         .header("X-Account-Email", &email)
+                                        .header("X-Account-Id", &account_id)
                                         .header("X-Mapped-Model", &request_with_mapped.model)
                                         .header(
                                             "X-Context-Purified",

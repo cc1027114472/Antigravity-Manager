@@ -556,6 +556,30 @@ impl TokenManager {
             }
         }
 
+        // Prefer local ledger estimates for selection when enabled.
+        let ledger_enabled = crate::modules::config::load_app_config()
+            .map(|c| c.quota_ledger.enabled)
+            .unwrap_or(true);
+        if ledger_enabled {
+            if let Some(estimated) = account.get("estimated_quotas").and_then(|v| v.as_object()) {
+                for (std_id, entry) in estimated {
+                    if let Some(pct) = entry
+                        .get("percentage")
+                        .and_then(|v| v.as_i64())
+                        .or_else(|| entry.get("percentage").and_then(|v| v.as_i64()))
+                    {
+                        model_quotas.insert(std_id.clone(), pct as i32);
+                    }
+                }
+            }
+        }
+
+        let remaining_quota = if !model_quotas.is_empty() {
+            model_quotas.values().copied().max()
+        } else {
+            remaining_quota
+        };
+
         // [NEW] 启动时自动同步持久化的淘汰模型路由表，注入热更新拦截器
         if let Some(rules) = account
             .get("quota")
@@ -648,34 +672,51 @@ impl TokenManager {
 
         // [修复 #1344] 不再处理其他禁用原因,让调用方负责检查手动禁用
 
-        // 4. 获取模型列表
-        let models = match quota.get("models").and_then(|m| m.as_array()) {
-            Some(m) => m,
-            None => return false,
-        };
+        // 4. 按 standard id 聚合百分比：优先本地账本，否则线上 snapshot
+        let ledger_enabled = crate::modules::config::load_app_config()
+            .map(|c| c.quota_ledger.enabled)
+            .unwrap_or(true);
 
-        // 5. [重构] 聚合判定逻辑：按 Standard ID 对账号所有型号进行分组
-        // 解决如 Pro-Low (0%) 和 Pro-High (100%) 在同一账号内导致状态冲突的问题
         let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
 
-        for model in models {
-            let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let percentage = model
-                .get("percentage")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(100) as i32;
-
-            if let Some(std_id) =
-                crate::proxy::common::model_mapping::normalize_to_standard_id(name)
+        if ledger_enabled {
+            if let Some(estimated) = account_json
+                .get("estimated_quotas")
+                .and_then(|v| v.as_object())
             {
-                let entry = group_max_percentage.entry(std_id).or_insert(-1);
-                if percentage > *entry {
-                    *entry = percentage;
+                for (std_id, entry) in estimated {
+                    if let Some(pct) = entry.get("percentage").and_then(|v| v.as_i64()) {
+                        group_max_percentage.insert(std_id.clone(), pct as i32);
+                    }
                 }
             }
         }
 
-        // 6. 遍历受监控的 Standard ID，根据组内“最好状态”执行锁定或恢复
+        if group_max_percentage.is_empty() {
+            let models = match quota.get("models").and_then(|m| m.as_array()) {
+                Some(m) => m,
+                None => return false,
+            };
+
+            for model in models {
+                let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let percentage = model
+                    .get("percentage")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(100) as i32;
+
+                if let Some(std_id) =
+                    crate::proxy::common::model_mapping::normalize_to_standard_id(name)
+                {
+                    let entry = group_max_percentage.entry(std_id).or_insert(-1);
+                    if percentage > *entry {
+                        *entry = percentage;
+                    }
+                }
+            }
+        }
+
+        // 5. 遍历受监控的 Standard ID，根据组内“最好状态”执行锁定或恢复
         let threshold = config.threshold_percentage as i32;
         let account_id = account_json
             .get("id")
@@ -688,7 +729,7 @@ impl TokenManager {
             // 获取该组的最高百分比，如果账号没该组型号则视为 100%
             let max_pct = group_max_percentage.get(std_id).cloned().unwrap_or(100);
 
-            if max_pct < threshold {
+            if max_pct <= threshold {
                 // 只有组内所有模型都不行，才触发全组保护
                 if self
                     .trigger_quota_protection(
@@ -731,6 +772,100 @@ impl TokenManager {
         // 我们不再因为配额原因返回 true（即不再跳过账号），
         // 而是加载并在 get_token 时进行过滤。
         false
+    }
+
+    /// Burn local estimated quota after a successful proxy request.
+    /// Updates in-memory `model_quotas` / `protected_models` first, then persists async.
+    pub fn burn_estimated_quota(
+        &self,
+        account_id: Option<&str>,
+        account_email: Option<&str>,
+        model: Option<&str>,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+    ) {
+        let app_config = match crate::modules::config::load_app_config() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if !app_config.quota_ledger.enabled {
+            return;
+        }
+
+        let account_id = account_id
+            .map(|s| s.to_string())
+            .or_else(|| {
+                account_email.and_then(|email| self.get_account_id_by_email(email))
+            });
+        let Some(account_id) = account_id else {
+            return;
+        };
+
+        let model_raw = model.unwrap_or("unknown");
+        let std_id = crate::proxy::common::model_mapping::normalize_to_standard_id(model_raw)
+            .unwrap_or_else(|| model_raw.to_string());
+
+        let total_tokens = match (input_tokens, output_tokens) {
+            (Some(i), Some(o)) => Some(i as u64 + o as u64),
+            (Some(i), None) => Some(i as u64),
+            (None, Some(o)) => Some(o as u64),
+            (None, None) => None,
+        };
+        let burn = app_config.quota_ledger.compute_burn_pct(total_tokens);
+        if burn <= 0 {
+            return;
+        }
+
+        let mut new_pct = 0;
+        let mut should_protect = false;
+        let threshold = app_config.quota_protection.threshold_percentage as i32;
+        let protection_on = app_config.quota_protection.enabled
+            && app_config
+                .quota_protection
+                .monitored_models
+                .iter()
+                .any(|m| m == &std_id);
+
+        if let Some(mut entry) = self.tokens.get_mut(&account_id) {
+            let current = entry
+                .model_quotas
+                .get(&std_id)
+                .copied()
+                .unwrap_or(100);
+            new_pct = (current - burn).max(0);
+            entry.model_quotas.insert(std_id.clone(), new_pct);
+            if let Some(max_q) = entry.model_quotas.values().copied().max() {
+                entry.remaining_quota = Some(max_q);
+            }
+            if protection_on && new_pct <= threshold {
+                entry.protected_models.insert(std_id.clone());
+                should_protect = true;
+            }
+            tracing::debug!(
+                "[QuotaLedger] burn account={} model={} -{}% -> {}% protect={}",
+                account_id,
+                std_id,
+                burn,
+                new_pct,
+                should_protect
+            );
+        } else {
+            return;
+        }
+
+        let account_id_persist = account_id.clone();
+        let std_id_persist = std_id.clone();
+        let protected = should_protect;
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = crate::modules::account::persist_estimated_quota_burn(
+                &account_id_persist,
+                &std_id_persist,
+                new_pct,
+                protected,
+            ) {
+                tracing::debug!("[QuotaLedger] persist burn failed: {}", e);
+            }
+        });
     }
 
     /// 计算账号的最大剩余配额百分比（用于排序）
@@ -2566,6 +2701,25 @@ impl TokenManager {
         tracing::info!("账号 {} 正在实时刷新配额...", email);
         match crate::modules::quota::fetch_quota(&access_token, email, Some(&account_id)).await {
             Ok((quota_data, _project_id)) => {
+                // Calibrate local ledger + protection from online snapshot (not lockout-only).
+                if let Err(e) =
+                    crate::modules::account::update_account_quota(&account_id, quota_data.clone())
+                {
+                    tracing::warn!(
+                        "账号 {} 实时配额校准落盘失败: {} (仍尝试 lockout)",
+                        email,
+                        e
+                    );
+                } else if let Err(e) = self.reload_account(&account_id).await {
+                    tracing::debug!(
+                        "账号 {} 实时配额校准后内存重载失败: {}",
+                        account_id,
+                        e
+                    );
+                } else {
+                    tracing::info!("账号 {} 实时配额已校准本地账本", email);
+                }
+
                 // 3. 从最新配额中提取 reset_time
                 let earliest_reset = quota_data
                     .models

@@ -807,5 +807,6 @@ POST /api/proxy/pool/unbind
 | 二期做什么？ | 代理批量/健康 API + **页面 UI** |
 | 和 sub2api？ | Manager 当 upstream；OAuth 只在 Manager；不计费 UI |
 | 额度刷新出口？ | 运维面：`绑定 → upstream → direct`，禁止未绑定蹭池；全量刷新同 egress 串行（见 [`docs/proxy/accounts.md`](proxy/accounts.md)） |
+| 本地额度账本？ | 选号/保护看 `estimated_quotas`；线上 `fetch_quota` 校准；成功请求 burn；429 也会校准（见 accounts.md §3c） |
 
 **一句话**：把 Manager 打磨成可编排的 Antigravity 引擎——**默认行为不变，打开串行后整池钉在同一游标号，用尽则切下一号并带走绑定出口**。

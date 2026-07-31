@@ -465,6 +465,12 @@ pub async fn monitor_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    let account_id = response
+        .headers()
+        .get("X-Account-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     // Extract mapped model from X-Mapped-Model header if present
     let mapped_model = response
         .headers()
@@ -502,6 +508,7 @@ pub async fn monitor_middleware(
         model,
         mapped_model,
         account_email,
+        account_id,
         client_ip,
         error: None,
         request_body: request_body_str,

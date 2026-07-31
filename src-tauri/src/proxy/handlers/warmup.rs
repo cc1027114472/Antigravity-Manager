@@ -250,6 +250,7 @@ pub async fn handle_warmup(
                 model: Some(req.model.clone()),
                 mapped_model: Some(req.model.clone()),
                 account_email: Some(req.email.clone()),
+                account_id: None,
                 client_ip: Some("127.0.0.1".to_string()),
                 error: if status.is_success() {
                     None
@@ -352,6 +353,7 @@ pub async fn handle_warmup(
                 model: Some(req.model.clone()),
                 mapped_model: Some(req.model.clone()),
                 account_email: Some(req.email.clone()),
+                account_id: None,
                 client_ip: Some("127.0.0.1".to_string()),
                 error: Some(e.clone()),
                 request_body: Some(format!(
