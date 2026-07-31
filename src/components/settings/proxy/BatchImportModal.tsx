@@ -22,67 +22,83 @@ export default function BatchImportModal({ isOpen, onClose, onImport }: BatchImp
     const parseProxies = (text: string) => {
         const lines = text.split('\n').filter(line => line.trim() !== '');
         const newProxies: ProxyEntry[] = [];
-        const urlRegex = /([a-zA-Z0-9]+:\/\/[^\s]+)/; // Basic protocol://url matcher
+        const urlRegex = /([a-zA-Z0-9]+:\/\/[^\s]+)/;
+
+        const peelAuth = (rawUrl: string): { url: string; auth?: { username: string; password: string } } => {
+            try {
+                const parsed = new URL(rawUrl.includes('://') ? rawUrl : `http://${rawUrl}`);
+                if (!parsed.username) {
+                    return { url: rawUrl };
+                }
+                const auth = {
+                    username: decodeURIComponent(parsed.username),
+                    password: decodeURIComponent(parsed.password || ''),
+                };
+                parsed.username = '';
+                parsed.password = '';
+                // Avoid trailing slash from URL.toString() for host:port proxies
+                let cleaned = parsed.toString();
+                if (cleaned.endsWith('/') && (!parsed.pathname || parsed.pathname === '/')) {
+                    cleaned = cleaned.replace(/\/$/, '');
+                }
+                return { url: cleaned, auth };
+            } catch {
+                return { url: rawUrl };
+            }
+        };
 
         lines.forEach((line, index) => {
             try {
                 const trimmedLine = line.trim();
                 let url = '';
-                // Strategy 1: Regex search for protocol://...
+                let auth: { username: string; password: string } | undefined;
+
                 const match = trimmedLine.match(urlRegex);
                 if (match) {
-                    url = match[0];
+                    const peeled = peelAuth(match[0]);
+                    url = peeled.url;
+                    auth = peeled.auth;
                 } else {
-                    // Check for host:port:user:pass or host:port
-                    // logic: split by space first to get the "proxy part"
                     const firstWord = trimmedLine.split(/\s+/)[0];
                     const parts = firstWord.split(':');
 
                     if (parts.length === 4) {
-                        // host:port:user:pass format
-                        // Reconstruct to http://user:pass@host:port
+                        // host:port:user:pass
                         const [host, port, user, pass] = parts;
-                        url = `http://${user}:${pass}@${host}:${port}`;
-                    } else if (parts.length === 2) {
-                        // host:port format
-                        const [host, port] = parts;
-                        // Basic sanity check on port
-                        if (!isNaN(Number(port))) {
-                            url = `http://${host}:${port}`;
-                        }
+                        url = `http://${host}:${port}`;
+                        auth = { username: user, password: pass };
+                    } else if (parts.length === 2 && !isNaN(Number(parts[1]))) {
+                        url = `http://${parts[0]}:${parts[1]}`;
                     }
                 }
 
                 if (!url) {
-                    // console.warn(`Line ${index + 1} skipped: no valid proxy found`);
                     return;
                 }
 
-                // Validation
                 try {
-                    new URL(url);
-                } catch (e) {
+                    new URL(url.includes('://') ? url : `http://${url}`);
+                } catch {
                     console.warn(`Line ${index + 1} invalid URL: ${url}`);
                     return;
                 }
 
                 newProxies.push({
                     id: generateUUID(),
-                    // Name will be assigned when adding to main list or just generic here
                     name: `Imported Proxy`,
-                    url: url,
+                    url,
+                    auth,
                     enabled: true,
                     priority: 1,
                     tags: ['imported'],
                     is_healthy: false,
-                    latency: undefined
+                    latency: undefined,
                 });
             } catch (e) {
-                console.error("Failed to parse line", line, e);
+                console.error('Failed to parse line', line, e);
             }
         });
 
-        // Fix names to be unique/sequential relative to this batch
         newProxies.forEach((p, i) => {
             p.name = `Proxy ${i + 1}`;
         });

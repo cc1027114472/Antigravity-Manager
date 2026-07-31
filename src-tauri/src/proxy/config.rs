@@ -20,6 +20,31 @@ pub fn normalize_proxy_url(url: &str) -> String {
     }
 }
 
+/// Split `http://user:pass@host:port` into a credential-free URL plus auth parts.
+/// Returns `(url_without_userinfo, username, password)`.
+pub fn split_proxy_url_credentials(url: &str) -> (String, Option<String>, Option<String>) {
+    let normalized = normalize_proxy_url(url);
+    if normalized.is_empty() {
+        return (normalized, None, None);
+    }
+
+    let Ok(mut parsed) = url::Url::parse(&normalized) else {
+        return (normalized, None, None);
+    };
+
+    let username = parsed.username();
+    if username.is_empty() {
+        return (normalized, None, None);
+    }
+
+    let user = username.to_string();
+    let password = parsed.password().map(|p| p.to_string());
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+
+    (parsed.to_string(), Some(user), password)
+}
+
 // ============================================================================
 // 全局 Thinking Budget 配置存储
 // 用于在 request transform 函数中访问配置（无需修改函数签名）
@@ -893,5 +918,20 @@ mod tests {
         // 测试边缘情况
         assert_eq!(normalize_proxy_url(""), "");
         assert_eq!(normalize_proxy_url("   "), "");
+    }
+
+    #[test]
+    fn test_split_proxy_url_credentials() {
+        let (url, user, pass) = split_proxy_url_credentials(
+            "http://USER085446-zone-custom:6d1666@global.rotgb.711proxy.com:10000",
+        );
+        assert_eq!(url, "http://global.rotgb.711proxy.com:10000/");
+        assert_eq!(user.as_deref(), Some("USER085446-zone-custom"));
+        assert_eq!(pass.as_deref(), Some("6d1666"));
+
+        let (url2, user2, pass2) = split_proxy_url_credentials("http://127.0.0.1:7890");
+        assert_eq!(url2, "http://127.0.0.1:7890");
+        assert!(user2.is_none());
+        assert!(pass2.is_none());
     }
 }

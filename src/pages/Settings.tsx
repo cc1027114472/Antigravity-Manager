@@ -1288,28 +1288,30 @@ function Settings() {
                                     strategy: 'priority'
                                 }}
                                 onChange={(newConfig, silent = false) => {
-                                    const updatedFormData = {
-                                        ...formData,
-                                        proxy: {
-                                            ...formData.proxy,
-                                            proxy_pool: newConfig
+                                    setFormData(prev => {
+                                        const updatedFormData = {
+                                            ...prev,
+                                            proxy: {
+                                                ...prev.proxy,
+                                                proxy_pool: newConfig
+                                            }
+                                        };
+
+                                        // [FIX] Silent updates (like health polling) should NOT trigger saveConfig
+                                        // to prevent race conditions where old memory state rolls back new manual changes
+                                        if (!silent) {
+                                            // Hot reload: save immediately for manual changes
+                                            saveConfig({ ...updatedFormData, auto_refresh: true })
+                                                .then(() => {
+                                                    console.log('Proxy config saved');
+                                                })
+                                                .catch(err => console.error('Save failed:', err));
+                                        } else {
+                                            console.log('Proxy status sync (silent)');
                                         }
-                                    };
-                                    setFormData(updatedFormData);
 
-                                    // [FIX] Silent updates (like health polling) should NOT trigger saveConfig
-                                    // to prevent race conditions where old memory state rolls back new manual changes
-                                    if (silent) {
-                                        console.log('Proxy status sync (silent)');
-                                        return;
-                                    }
-
-                                    // Hot reload: save immediately for manual changes
-                                    saveConfig({ ...updatedFormData, auto_refresh: true })
-                                        .then(() => {
-                                            console.log('Proxy config saved');
-                                        })
-                                        .catch(err => console.error('Save failed:', err));
+                                        return updatedFormData;
+                                    });
                                 }}
                             />
 

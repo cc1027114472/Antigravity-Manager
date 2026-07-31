@@ -1615,13 +1615,9 @@ async fn admin_trigger_proxy_health_check(
         )
     })?;
 
-    // 返回更新后的代理池配置（包含健康状态）
+    // 返回更新后的代理池配置（与桌面端 check_proxy_health 同形，便于前端合并状态）
     let config = state.proxy_pool_state.read().await;
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "message": "Health check completed",
-        "proxies": config.proxies,
-    })))
+    Ok(Json(config.clone()))
 }
 
 async fn admin_get_proxy_status(

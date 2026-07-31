@@ -147,13 +147,11 @@ export default function ProxyList({ proxies, onUpdate, accountBindings, accounts
                                                 >
                                                     <div className={`w-2 h-2 rounded-full transition-all duration-500 shadow-lg ${!proxy.enabled
                                                         ? 'bg-gray-400'
-                                                        : proxy.latency !== undefined && proxy.latency !== null
-                                                            ? 'bg-emerald-500 shadow-emerald-500/50'
+                                                        : isTesting
+                                                            ? 'bg-blue-400 animate-pulse'
                                                             : proxy.is_healthy
                                                                 ? 'bg-emerald-500 shadow-emerald-500/50'
-                                                                : isTesting && !proxy.latency
-                                                                    ? 'bg-blue-400 animate-pulse'
-                                                                    : 'bg-rose-500 shadow-rose-500/50'
+                                                                : 'bg-rose-500 shadow-rose-500/50'
                                                         }`}></div>
                                                 </button>
                                             </div>
@@ -161,24 +159,36 @@ export default function ProxyList({ proxies, onUpdate, accountBindings, accounts
                                             {/* Status Pill Tag */}
                                             <div className={`px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-tighter border transition-all duration-300 ${!proxy.enabled
                                                 ? 'bg-gray-100 text-gray-400 border-gray-200 dark:bg-gray-800 dark:border-gray-700'
-                                                : proxy.latency !== undefined && proxy.latency !== null
-                                                    ? 'bg-emerald-50 text-emerald-600 border-emerald-100 dark:bg-emerald-900/20 dark:text-emerald-400 dark:border-emerald-800/50 shadow-sm'
-                                                    : isTesting
-                                                        ? 'bg-blue-50 text-blue-600 border-blue-100 dark:bg-blue-900/20 dark:text-blue-400 dark:border-blue-800/50 animate-pulse'
-                                                        : proxy.is_healthy
-                                                            ? 'bg-emerald-50 text-emerald-600 border-emerald-100 dark:bg-emerald-900/20 dark:text-emerald-400 dark:border-emerald-800/50'
-                                                            : 'bg-rose-50 text-rose-600 border-rose-100 dark:bg-rose-900/20 dark:text-rose-400 dark:border-rose-800/50 shadow-sm'
+                                                : isTesting
+                                                    ? 'bg-blue-50 text-blue-600 border-blue-100 dark:bg-blue-900/20 dark:text-blue-400 dark:border-blue-800/50 animate-pulse'
+                                                    : proxy.is_healthy
+                                                        ? 'bg-emerald-50 text-emerald-600 border-emerald-100 dark:bg-emerald-900/20 dark:text-emerald-400 dark:border-emerald-800/50 shadow-sm'
+                                                        : 'bg-rose-50 text-rose-600 border-rose-100 dark:bg-rose-900/20 dark:text-rose-400 dark:border-rose-800/50 shadow-sm'
                                                 }`}>
-                                                {!proxy.enabled
-                                                    ? t('settings.proxy_pool.status.inactive', 'Inactive')
-                                                    : proxy.latency !== undefined && proxy.latency !== null
-                                                        ? `${proxy.latency}ms`
-                                                        : isTesting
-                                                            ? t('settings.proxy_pool.status.checking', 'Checking')
-                                                            : proxy.is_healthy
-                                                                ? t('settings.proxy_pool.status.healthy', 'Healthy')
-                                                                : t('settings.proxy_pool.status.timeout', 'Timeout')
-                                                }
+                                                {(() => {
+                                                    if (!proxy.enabled) {
+                                                        return t('settings.proxy_pool.status.inactive', 'Inactive');
+                                                    }
+                                                    if (isTesting) {
+                                                        return t('settings.proxy_pool.status.checking', 'Checking');
+                                                    }
+                                                    if (proxy.is_healthy) {
+                                                        return proxy.latency != null
+                                                            ? `${proxy.latency}ms`
+                                                            : t('settings.proxy_pool.status.healthy', 'Healthy');
+                                                    }
+                                                    // Near the 20s probe budget → timed out; otherwise unreachable.
+                                                    if (proxy.latency != null && proxy.latency >= 15000) {
+                                                        return t('settings.proxy_pool.status.timeout', 'Timed out');
+                                                    }
+                                                    if (proxy.latency != null) {
+                                                        return t('settings.proxy_pool.status.unreachable_ms', {
+                                                            defaultValue: 'Unreachable ({{ms}}ms)',
+                                                            ms: proxy.latency,
+                                                        });
+                                                    }
+                                                    return t('settings.proxy_pool.status.unreachable', 'Unreachable');
+                                                })()}
                                             </div>
                                         </div>
                                     </td>

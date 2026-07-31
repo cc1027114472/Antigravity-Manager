@@ -128,8 +128,8 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
             proxies: updatedProxies
         });
 
-        // Auto-trigger test after import is fully committed
-        handleTestAll();
+        // Pass the fresh list — props `config` is still stale until the next render.
+        handleTestAll(updatedProxies);
     };
 
     const handleBatchDelete = () => {
@@ -151,34 +151,90 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
         showToast(t(enabled ? 'common.enabled' : 'common.disabled', enabled ? 'Enabled' : 'Disabled'), 'success');
     };
 
-    const handleTestAll = async () => {
+    const handleTestAll = async (proxiesSnapshot?: ProxyEntry[]) => {
         setIsTesting(true);
         try {
             const liveConfig = await request<ProxyPoolConfig>('check_proxy_health');
             if (liveConfig && liveConfig.proxies) {
-                // [FIX] Use incremental merge to prevent race condition rollbacks
-                const liveMap = new Map(liveConfig.proxies.map(p => [p.id, p]));
-
-                const updatedProxies = config.proxies.map(p => {
-                    const live = liveMap.get(p.id);
-                    if (live) {
-                        return {
-                            ...p,
+                // Merge by id: never shrink the UI list when props are briefly stale after import.
+                const byId = new Map<string, ProxyEntry>();
+                for (const p of (proxiesSnapshot ?? config.proxies)) {
+                    byId.set(p.id, p);
+                }
+                for (const live of liveConfig.proxies) {
+                    const local = byId.get(live.id);
+                    if (local) {
+                        byId.set(live.id, {
+                            ...local,
                             is_healthy: live.is_healthy,
                             latency: live.latency,
-                            last_check_time: live.last_check_time
-                        };
+                            last_check_time: live.last_check_time,
+                        });
+                    } else {
+                        byId.set(live.id, live);
                     }
-                    return p;
-                });
+                }
+                const updatedProxies = Array.from(byId.values());
 
                 // Update local UI state silently (syncing health stats only)
                 onChange({ ...config, proxies: updatedProxies }, true);
+
+                const enabled = updatedProxies.filter(p => p.enabled);
+                const ok = enabled.filter(p => p.is_healthy).length;
+                const bad = enabled.length - ok;
+                if (enabled.length === 0) {
+                    showToast(
+                        t('settings.proxy_pool.test_no_enabled', 'No enabled proxies to check'),
+                        'info'
+                    );
+                } else if (bad === 0) {
+                    showToast(
+                        t('settings.proxy_pool.test_completed', {
+                            defaultValue: 'Health check completed: {{ok}} ok',
+                            ok,
+                        }),
+                        'success'
+                    );
+                } else {
+                    // Probe finished successfully — unhealthy proxies are a result, not a tool failure.
+                    showToast(
+                        t('settings.proxy_pool.test_partial', {
+                            defaultValue:
+                                'Check finished: {{ok}} ok, {{bad}} unreachable (high latency / auth / network)',
+                            ok,
+                            bad,
+                        }),
+                        'warning'
+                    );
+                }
+            } else {
+                showToast(t('settings.proxy_pool.test_completed', 'Health check completed'), 'success');
             }
-            showToast(t('settings.proxy_pool.test_completed', 'Health check completed'), 'success');
         } catch (error) {
             console.error('Test all failed:', error);
-            showToast(t('settings.proxy_pool.test_failed', 'Health check failed'), 'error');
+            const raw = String(error ?? '');
+            const lower = raw.toLowerCase();
+            if (
+                lower.includes('服务未运行') ||
+                lower.includes('service not running') ||
+                lower.includes('管理服务未就绪')
+            ) {
+                showToast(
+                    t(
+                        'settings.proxy_pool.test_service_required',
+                        'Cannot run health check: start the API Proxy service first'
+                    ),
+                    'error'
+                );
+            } else {
+                showToast(
+                    t('settings.proxy_pool.test_failed_detail', {
+                        defaultValue: 'Could not run health check: {{reason}}',
+                        reason: raw || t('settings.proxy_pool.test_failed', 'Unknown error'),
+                    }),
+                    'error'
+                );
+            }
         } finally {
             setIsTesting(false);
         }
@@ -287,7 +343,7 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
                         <>
                             <div className="flex items-center gap-1 p-1 bg-gray-50 dark:bg-gray-800/50 rounded-xl border border-gray-100 dark:border-gray-800/50">
                                 <button
-                                    onClick={handleTestAll}
+                                    onClick={() => handleTestAll()}
                                     disabled={isTesting}
                                     className={`p-2 text-gray-400 hover:text-emerald-500 hover:bg-white dark:hover:bg-gray-800 rounded-lg transition-all ${isTesting ? 'animate-spin opacity-50' : 'active:scale-90'}`}
                                     title={t('settings.proxy_pool.test_all', 'Test All')}

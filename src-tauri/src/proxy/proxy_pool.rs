@@ -346,14 +346,22 @@ impl ProxyPoolManager {
 
     /// 构建 reqwest::Proxy 配置
     fn build_proxy_config(&self, entry: &ProxyEntry) -> Result<PoolProxyConfig, String> {
-        let url = crate::proxy::config::normalize_proxy_url(&entry.url);
+        let raw_url = crate::proxy::config::normalize_proxy_url(&entry.url);
 
-        let mut proxy =
-            rquest::Proxy::all(&url).map_err(|e| format!("Invalid proxy URL: {}", e))?;
+        // Prefer explicit auth fields; also peel userinfo out of the URL so batch-imported
+        // `http://user:pass@host:port` entries authenticate reliably via basic_auth.
+        let (url_for_proxy, url_user, url_pass) =
+            crate::proxy::config::split_proxy_url_credentials(&raw_url);
 
-        // 添加认证
+        let mut proxy = rquest::Proxy::all(&url_for_proxy)
+            .map_err(|e| format!("Invalid proxy URL: {}", e))?;
+
         if let Some(auth) = &entry.auth {
-            proxy = proxy.basic_auth(&auth.username, &auth.password);
+            if !auth.username.is_empty() {
+                proxy = proxy.basic_auth(&auth.username, &auth.password);
+            }
+        } else if let Some(user) = url_user {
+            proxy = proxy.basic_auth(&user, url_pass.as_deref().unwrap_or(""));
         }
 
         Ok(PoolProxyConfig {
@@ -654,10 +662,11 @@ impl ProxyPoolManager {
         }
         let proxy_cfg = proxy_res.unwrap();
 
+        // Residential proxies often need >10s; keep a bit of headroom for CONNECT + TLS.
         let client_result = Client::builder()
             .proxy(proxy_cfg.proxy)
             .emulation(Emulation::Chrome123)
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
             .build();
 
@@ -677,16 +686,24 @@ impl ProxyPoolManager {
                     (true, Some(latency))
                 } else {
                     tracing::warn!(
-                        "Proxy {} health check status error: {}",
+                        "Proxy {} health check status error: {} ({}ms)",
                         entry.url,
-                        resp.status()
+                        resp.status(),
+                        latency
                     );
-                    (false, None)
+                    // Keep elapsed so UI can show "unreachable" with timing, not a blank "timeout".
+                    (false, Some(latency))
                 }
             }
             Err(e) => {
-                tracing::warn!("Proxy {} health check request failed: {}", entry.url, e);
-                (false, None)
+                let latency = start.elapsed().as_millis() as u64;
+                tracing::warn!(
+                    "Proxy {} health check request failed: {} ({}ms)",
+                    entry.url,
+                    e,
+                    latency
+                );
+                (false, Some(latency))
             }
         }
     }

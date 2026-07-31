@@ -423,8 +423,12 @@
       "add_tag_placeholder": "添加标签...",
       "seconds": "秒",
       "interval_tooltip": "健康检查间隔 (秒)",
-      "test_completed": "健康检查已完成",
-      "test_failed": "健康检查失败",
+      "test_completed": "检测完成：{{ok}} 个正常",
+      "test_partial": "检测完成：{{ok}} 个正常，{{bad}} 个当前不可达（延迟高/认证/网络不稳）",
+      "test_failed": "无法执行健康检查",
+      "test_failed_detail": "无法执行健康检查：{{reason}}",
+      "test_service_required": "无法检测：请先在「API 代理」页启动服务",
+      "test_no_enabled": "没有已启用的代理可检测",
       "confirm_delete": "确定要删除此代理吗？",
       "empty": "暂无代理",
       "column_priority": "权重",
@@ -459,7 +463,9 @@
         "inactive": "未启用",
         "checking": "正在检测",
         "healthy": "正常",
-        "timeout": "已超时"
+        "timeout": "已超时",
+        "unreachable": "不可达",
+        "unreachable_ms": "不可达 ({{ms}}ms)"
       }
     },
     "advanced": {

@@ -423,8 +423,12 @@
       "tags": "Tags",
       "add_tag_placeholder": "Add tag...",
       "seconds": "Sec",
-      "test_completed": "Health check completed",
-      "test_failed": "Health check failed",
+      "test_completed": "Check finished: {{ok}} ok",
+      "test_partial": "Check finished: {{ok}} ok, {{bad}} unreachable (high latency / auth / network)",
+      "test_failed": "Could not run health check",
+      "test_failed_detail": "Could not run health check: {{reason}}",
+      "test_service_required": "Cannot run health check: start the API Proxy service first",
+      "test_no_enabled": "No enabled proxies to check",
       "confirm_delete": "Are you sure you want to delete this proxy?",
       "empty": "No proxies available",
       "column_priority": "Priority",
@@ -459,7 +463,9 @@
         "inactive": "Inactive",
         "checking": "Checking",
         "healthy": "Healthy",
-        "timeout": "Timeout"
+        "timeout": "Timed out",
+        "unreachable": "Unreachable",
+        "unreachable_ms": "Unreachable ({{ms}}ms)"
       }
     },
     "advanced": {
