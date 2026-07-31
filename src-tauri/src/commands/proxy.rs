@@ -147,6 +147,9 @@ pub async fn internal_start_proxy_service(
     token_manager
         .update_sticky_config(config.scheduling.clone())
         .await;
+    token_manager
+        .update_serial_pool_config(config.serial_pool.clone())
+        .await;
 
     // [NEW] 加载熔断配置 (从主配置加载)
     let app_config = crate::modules::config::load_app_config()
@@ -239,6 +242,17 @@ pub async fn ensure_admin_server(
     let token_manager = Arc::new(TokenManager::new(app_data_dir));
     // [NEW] 加载账号数据，否则管理界面统计为 0
     let _ = token_manager.load_accounts().await;
+    token_manager
+        .update_sticky_config(config.scheduling.clone())
+        .await;
+    token_manager
+        .update_serial_pool_config(config.serial_pool.clone())
+        .await;
+    if let Some(ref account_id) = config.preferred_account_id {
+        token_manager
+            .set_preferred_account(Some(account_id.clone()))
+            .await;
+    }
 
     let (axum_server, server_handle) = match crate::proxy::AxumServer::start(
         config.get_bind_address().to_string(),
@@ -689,31 +703,10 @@ pub async fn set_preferred_account(
 ) -> Result<(), String> {
     let instance_lock = state.instance.read().await;
     if let Some(instance) = instance_lock.as_ref() {
-        // 过滤空字符串为 None
-        let cleaned_id = account_id.filter(|s| !s.trim().is_empty());
-
-        // 1. 更新内存状态
         instance
             .token_manager
-            .set_preferred_account(cleaned_id.clone())
-            .await;
-
-        // 2. 持久化到配置文件 (修复 Issue #820 自动关闭问题)
-        let mut app_config = crate::modules::config::load_app_config()
-            .map_err(|e| format!("加载配置失败: {}", e))?;
-        app_config.proxy.preferred_account_id = cleaned_id.clone();
-        crate::modules::config::save_app_config(&app_config)
-            .map_err(|e| format!("保存配置失败: {}", e))?;
-
-        if let Some(ref id) = cleaned_id {
-            tracing::info!(
-                "🔒 [FIX #820] Fixed account mode enabled and persisted: {}",
-                id
-            );
-        } else {
-            tracing::info!("🔄 [FIX #820] Round-robin mode enabled and persisted");
-        }
-
+            .set_preferred_account_persisted(account_id)
+            .await?;
         Ok(())
     } else {
         Err("服务未运行".to_string())

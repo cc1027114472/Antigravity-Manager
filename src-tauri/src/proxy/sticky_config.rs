@@ -35,3 +35,24 @@ impl Default for StickySessionConfig {
         }
     }
 }
+
+/// 串行号池开启时与 sticky / CacheFirst / PerformanceFirst 并存的提示（调度以游标为准）
+pub fn warn_serial_pool_scheduling_override(mode: SchedulingMode) {
+    match mode {
+        SchedulingMode::CacheFirst => {
+            tracing::warn!(
+                "[SerialPool] serial_pool.enabled=true: ignoring CacheFirst rate-limit wait; advancing cursor instead"
+            );
+        }
+        SchedulingMode::PerformanceFirst => {
+            tracing::warn!(
+                "[SerialPool] serial_pool.enabled=true: ignoring PerformanceFirst round-robin; using global preferred cursor"
+            );
+        }
+        SchedulingMode::Balance => {
+            tracing::info!(
+                "[SerialPool] serial_pool.enabled=true: sticky bindings defer to preferred cursor"
+            );
+        }
+    }
+}

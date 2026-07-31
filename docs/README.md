@@ -5,6 +5,7 @@ This folder contains developer-focused documentation (architecture, implementati
 ## Proxy
 - [`docs/proxy/auth.md`](proxy/auth.md) — proxy authorization modes, expected client behavior, and implementation pointers.
 - [`docs/proxy/accounts.md`](proxy/accounts.md) — account lifecycle in the proxy pool (including auto-disable on `invalid_grant`) and UI behavior.
+- [`docs/MANAGER_改造开发文档.md`](MANAGER_改造开发文档.md) — 改造路线图：一期 sprint 看板、串行全局单游标、**§8 OAuth/CLIENT_ID/风控 curl 实操**、二期 UI。
 
 ## z.ai (GLM) integration
 - [`docs/zai/implementation.md`](zai/implementation.md) — end-to-end “what’s implemented” and how to validate it.

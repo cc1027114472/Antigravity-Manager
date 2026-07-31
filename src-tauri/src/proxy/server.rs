@@ -5,7 +5,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json, Response},
-    routing::{any, delete, get, post},
+    routing::{any, delete, get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -621,6 +621,14 @@ impl AxumServer {
             .route(
                 "/proxy/preferred-account",
                 get(admin_get_preferred_account).post(admin_set_preferred_account),
+            )
+            .route(
+                "/proxy/serial-pool",
+                get(admin_get_serial_pool).put(admin_put_serial_pool),
+            )
+            .route(
+                "/proxy/serial-pool/advance",
+                post(admin_advance_serial_pool),
             )
             .route("/accounts/oauth/prepare", post(admin_prepare_oauth_url))
             .route("/accounts/oauth/start", post(admin_start_oauth_login))
@@ -1469,6 +1477,20 @@ async fn admin_save_config(
         *pool = new_config.clone().proxy.proxy_pool;
     }
 
+    // 串行号池 + 调度 + preferred 热更新
+    state
+        .token_manager
+        .update_sticky_config(new_config.proxy.scheduling.clone())
+        .await;
+    state
+        .token_manager
+        .update_serial_pool_config(new_config.proxy.serial_pool.clone())
+        .await;
+    let _ = state
+        .token_manager
+        .set_preferred_account_persisted(new_config.proxy.preferred_account_id.clone())
+        .await;
+
     Ok(StatusCode::OK)
 }
 
@@ -1690,12 +1712,135 @@ struct SetPreferredAccountRequest {
 async fn admin_set_preferred_account(
     State(state): State<AppState>,
     Json(payload): Json<SetPreferredAccountRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     state
         .token_manager
-        .set_preferred_account(payload.account_id)
+        .set_preferred_account_persisted(payload.account_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+    Ok(StatusCode::OK)
+}
+
+async fn admin_get_serial_pool(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let cfg = state.token_manager.get_serial_pool_config().await;
+    let current = state.token_manager.get_preferred_account().await;
+    let last_reason = state.token_manager.get_last_advance_reason().await;
+    let queue: Vec<String> = crate::modules::account::list_accounts()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+    Ok(Json(serde_json::json!({
+        "enabled": cfg.enabled,
+        "current_account_id": current,
+        "last_advance_reason": last_reason,
+        "require_proxy_binding": cfg.require_proxy_binding,
+        "advance_on": cfg.advance_on,
+        "advance_debounce_ms": cfg.advance_debounce_ms,
+        "order": cfg.order,
+        "queue": queue,
+        "queue_len": queue.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PutSerialPoolRequest {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    advance_on: Option<Vec<String>>,
+    #[serde(default)]
+    consecutive_failure_threshold: Option<u32>,
+    #[serde(default)]
+    advance_debounce_ms: Option<u64>,
+    #[serde(default)]
+    require_proxy_binding: Option<bool>,
+    #[serde(default)]
+    order: Option<String>,
+}
+
+async fn admin_put_serial_pool(
+    State(state): State<AppState>,
+    Json(payload): Json<PutSerialPoolRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let mut app_config = crate::modules::config::load_app_config().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+    let sp = &mut app_config.proxy.serial_pool;
+    if let Some(v) = payload.enabled {
+        sp.enabled = v;
+    }
+    if let Some(v) = payload.advance_on {
+        sp.advance_on = v;
+    }
+    if let Some(v) = payload.consecutive_failure_threshold {
+        sp.consecutive_failure_threshold = v;
+    }
+    if let Some(v) = payload.advance_debounce_ms {
+        sp.advance_debounce_ms = v;
+    }
+    if let Some(v) = payload.require_proxy_binding {
+        sp.require_proxy_binding = v;
+    }
+    if let Some(v) = payload.order {
+        sp.order = v;
+    }
+    let cfg_clone = sp.clone();
+    crate::modules::config::save_app_config(&app_config).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+    state
+        .token_manager
+        .update_serial_pool_config(cfg_clone)
         .await;
-    StatusCode::OK
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdvanceSerialPoolRequest {
+    #[serde(default = "default_manual_reason")]
+    reason: String,
+}
+
+fn default_manual_reason() -> String {
+    "manual".to_string()
+}
+
+async fn admin_advance_serial_pool(
+    State(state): State<AppState>,
+    Json(payload): Json<AdvanceSerialPoolRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let next = state
+        .token_manager
+        .advance_serial_account(&payload.reason, None)
+        .await
+        .map_err(|e| {
+            let status = if e.contains("exhausted") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(ErrorResponse { error: e }))
+        })?;
+    Ok(Json(serde_json::json!({
+        "account_id": next,
+        "reason": payload.reason,
+    })))
 }
 
 async fn admin_fetch_zai_models(

@@ -1,8 +1,9 @@
-# API Reference (v4.3.0)
+# API Reference (v4.3.0+)
 
 本文档详细介绍了 **Antigravity Tools** 暴露的 HTTP API 接口。
 
-> **注意**: 在 v4.0.1 版本中，所有的服务（包括 AI 反代和系统管理）均已整合至统一端口 **8045**。原有的 19527 端口已废弃。
+> **注意**: 在 v4.0.1 版本中，所有的服务（包括 AI 反代和系统管理）均已整合至统一端口 **8045**。原有的 19527 端口已废弃。  
+> **契约真源**: 路由以 [`src-tauri/src/proxy/server.rs`](../src-tauri/src/proxy/server.rs) 为准；本文可能滞后。
 
 ## 1. 概览 (Overview)
 
@@ -15,9 +16,9 @@ Antigravity Gateway 是一个双重角色的服务器：
 | 接口类型 | 路径前缀 | 鉴权方式 | Header 示例 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
 | **AI Protocol** | `/v1/*`, `/v1beta/*` | API Key | `Authorization: Bearer <API_KEY>` | 用于 AI 客户端调用 |
-| **Admin API** | `/api/*` | Admin Token | `x-admin-token: <TOKEN>` | 用于管理后台或脚本控制 |
+| **Admin API** | `/api/*` | Admin Token | `Authorization: Bearer <TOKEN>`（或与实例配置一致的 admin / API Key） | 用于管理后台或脚本控制 |
 
-> **提示**: 默认情况下，`Admin Token` 与 `API Key` 是同一个值（即您在 `.env` 或 Docker 环境变量中设置的 `API_KEY`）。
+> **提示**: 默认情况下，管理密码未单独设置时回退使用 `API Key`（Docker：`API_KEY` / `WEB_PASSWORD`）。
 
 ---
 
@@ -51,6 +52,38 @@ Antigravity Gateway 是一个双重角色的服务器：
 | **POST** | `/proxy/stop` | 停止反代服务 |
 | **POST** | `/proxy/mapping` | 更新模型映射规则 |
 | **GET** | `/health` | 系统健康检查 |
+
+### 2.2.1 固定账号 / Preferred（游标）
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| **GET** | `/proxy/preferred-account` | 返回当前 preferred 账号 id（`null` 表示未固定） |
+| **POST** | `/proxy/preferred-account` | Body: `{"accountId":"<uuid>"\|null}`；**内存 + 写盘** |
+
+串行号池开启时，preferred 即全局游标，可被自动 / 手动 advance 覆盖。
+
+### 2.2.2 代理池绑定
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| **GET** | `/proxy/pool/bindings` | 全部 `account_id → proxy_id` |
+| **POST** | `/proxy/pool/bind` | 绑定账号到代理 |
+| **POST** | `/proxy/pool/unbind` | 解绑 |
+| **GET** | `/proxy/pool/config` | 代理池配置 |
+
+### 2.2.3 串行号池（`serial_pool`，默认关闭）
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| **GET** | `/proxy/serial-pool` | 状态：`enabled`、`current_account_id`、`last_advance_reason`、`require_proxy_binding`、`queue` 等 |
+| **PUT** | `/proxy/serial-pool` | 更新配置子集（`enabled` / `advance_on` / `advance_debounce_ms` / `require_proxy_binding` 等）并热应用 + 写盘 |
+| **POST** | `/proxy/serial-pool/advance` | Body: `{"reason":"manual"}`；强制推进到下一可用号；池耗尽返回 **503** |
+
+行为摘要（`enabled=true`）：
+
+- **全局单游标**：所有并发请求钉在同一 preferred 账号。
+- 对本请求模型限流 / 配额保护后按 `advance_on` 推进；`invalid_grant` 禁用当前游标后推进。
+- 出口 IP 随 `account_bindings` 随账号切换，不单独改 sticky。
 
 ### 2.3 监控与统计 (Monitoring & Stats)
 #### 流量日志

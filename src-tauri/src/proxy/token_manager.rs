@@ -6,8 +6,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::proxy::config::SerialPoolConfig;
 use crate::proxy::rate_limit::RateLimitTracker;
 use crate::proxy::sticky_config::StickySessionConfig;
+
+#[derive(Debug, Clone)]
+struct LastAdvanceRecord {
+    from_id: Option<String>,
+    reason: String,
+    at: std::time::Instant,
+    to_id: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnDiskAccountState {
@@ -59,6 +68,15 @@ pub struct TokenManager {
     load_code_assist_inflight:
         Arc<DashMap<String, tokio::sync::watch::Receiver<Option<Result<String, String>>>>>,
 
+    /// 串行号池配置（默认关闭）
+    serial_pool: Arc<tokio::sync::RwLock<SerialPoolConfig>>,
+    /// advance 互斥锁
+    advance_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 上次推进记录（防抖）
+    last_advance: Arc<tokio::sync::RwLock<Option<LastAdvanceRecord>>>,
+    /// 最近一次推进原因（供管理 API）
+    last_advance_reason: Arc<tokio::sync::RwLock<Option<String>>>,
+
     /// 支持优雅关闭时主动 abort 后台任务
     auto_cleanup_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     cancel_token: CancellationToken,
@@ -82,6 +100,10 @@ impl TokenManager {
             )),
             refresh_locks: Arc::new(DashMap::new()),
             load_code_assist_inflight: Arc::new(DashMap::new()), // 初始化 inflight 表
+            serial_pool: Arc::new(tokio::sync::RwLock::new(SerialPoolConfig::default())),
+            advance_lock: Arc::new(tokio::sync::Mutex::new(())),
+            last_advance: Arc::new(tokio::sync::RwLock::new(None)),
+            last_advance_reason: Arc::new(tokio::sync::RwLock::new(None)),
             auto_cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cancel_token: CancellationToken::new(),
         }
@@ -1351,6 +1373,19 @@ impl TokenManager {
             .map(|cfg| cfg.quota_protection.enabled)
             .unwrap_or(false);
 
+        // ===== 串行号池：全局单游标（默认关，不影响现网）=====
+        let serial_enabled = self.serial_pool.read().await.enabled;
+        if serial_enabled {
+            return self
+                .get_token_serial(
+                    &tokens_snapshot,
+                    session_id,
+                    target_model,
+                    quota_protection_enabled,
+                )
+                .await;
+        }
+
         // ===== [FIX #820] 固定账号模式：优先使用指定账号 =====
         let preferred_id = self.preferred_account_id.read().await.clone();
         if let Some(ref pref_id) = preferred_id {
@@ -2073,6 +2108,29 @@ impl TokenManager {
         self.tokens.remove(account_id);
 
         tracing::warn!("Account disabled: {} ({:?})", account_id, path);
+
+        // 串行号池：禁用的是当前游标则推进
+        let serial_cfg = self.serial_pool.read().await.clone();
+        if serial_cfg.enabled && serial_cfg.should_advance_on("invalid_grant") {
+            let preferred = self.preferred_account_id.read().await.clone();
+            if preferred.as_deref() == Some(account_id) {
+                match self
+                    .advance_serial_account("invalid_grant", None)
+                    .await
+                {
+                    Ok(next) => tracing::info!(
+                        "[SerialPool] cursor advanced after disable {} -> {}",
+                        account_id,
+                        next
+                    ),
+                    Err(e) => tracing::warn!(
+                        "[SerialPool] advance after disable failed: {}",
+                        e
+                    ),
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2865,9 +2923,433 @@ impl TokenManager {
         *preferred = account_id;
     }
 
+    /// 内存 + 写盘统一设置 preferred（桌面 / admin / advance 共用）
+    pub async fn set_preferred_account_persisted(
+        &self,
+        account_id: Option<String>,
+    ) -> Result<(), String> {
+        let cleaned = account_id.filter(|s| !s.trim().is_empty());
+        self.set_preferred_account(cleaned.clone()).await;
+        self.persist_preferred_to_disk(cleaned).await
+    }
+
+    async fn persist_preferred_to_disk(&self, account_id: Option<String>) -> Result<(), String> {
+        let mut app_config = crate::modules::config::load_app_config()
+            .map_err(|e| format!("加载配置失败: {}", e))?;
+        app_config.proxy.preferred_account_id = account_id;
+        crate::modules::config::save_app_config(&app_config)
+            .map_err(|e| format!("保存配置失败: {}", e))?;
+        Ok(())
+    }
+
     /// 获取当前优先使用的账号ID
     pub async fn get_preferred_account(&self) -> Option<String> {
         self.preferred_account_id.read().await.clone()
+    }
+
+    pub async fn get_serial_pool_config(&self) -> SerialPoolConfig {
+        self.serial_pool.read().await.clone()
+    }
+
+    pub async fn update_serial_pool_config(&self, config: SerialPoolConfig) {
+        if config.enabled {
+            let scheduling = self.sticky_config.read().await.clone();
+            crate::proxy::sticky_config::warn_serial_pool_scheduling_override(scheduling.mode);
+        }
+        let mut lock = self.serial_pool.write().await;
+        *lock = config;
+        tracing::info!("[SerialPool] config updated: enabled={}", lock.enabled);
+    }
+
+    pub async fn get_last_advance_reason(&self) -> Option<String> {
+        self.last_advance_reason.read().await.clone()
+    }
+
+    /// 按账号索引顺序排列池内 token（account_index；不套 Ultra）
+    fn ordered_pool_tokens(&self, tokens_snapshot: &[ProxyToken]) -> Vec<ProxyToken> {
+        let index_order: Vec<String> = crate::modules::account::list_accounts()
+            .map(|accs| accs.into_iter().map(|a| a.id).collect())
+            .unwrap_or_default();
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+        for id in &index_order {
+            if let Some(t) = tokens_snapshot.iter().find(|t| &t.account_id == id) {
+                ordered.push(t.clone());
+                seen.insert(id.clone());
+            }
+        }
+        for t in tokens_snapshot {
+            if !seen.contains(&t.account_id) {
+                ordered.push(t.clone());
+            }
+        }
+        ordered
+    }
+
+    async fn is_serial_usable(
+        &self,
+        token: &ProxyToken,
+        normalized_model: Option<&str>,
+        quota_protection_enabled: bool,
+        require_proxy_binding: bool,
+        account_level_only: bool,
+    ) -> bool {
+        if token.validation_blocked {
+            let now = chrono::Utc::now().timestamp();
+            if token.validation_blocked_until == 0 || now < token.validation_blocked_until {
+                return false;
+            }
+        }
+
+        match Self::get_account_state_on_disk(&token.account_path).await {
+            OnDiskAccountState::Disabled | OnDiskAccountState::Unknown => return false,
+            OnDiskAccountState::Enabled => {}
+        }
+
+        if require_proxy_binding {
+            let has_binding = crate::proxy::proxy_pool::get_global_proxy_pool()
+                .and_then(|pool| pool.get_account_binding(&token.account_id))
+                .is_some();
+            if !has_binding {
+                return false;
+            }
+        }
+
+        if account_level_only {
+            return true;
+        }
+
+        let Some(model) = normalized_model else {
+            return true;
+        };
+
+        if self.is_rate_limited(&token.account_id, Some(model)).await {
+            return false;
+        }
+        if quota_protection_enabled && token.protected_models.contains(model) {
+            return false;
+        }
+        true
+    }
+
+    /// 串行号池推进：环形扫描下一可用号并持久化 preferred
+    pub async fn advance_serial_account(
+        &self,
+        reason: &str,
+        target_model: Option<&str>,
+    ) -> Result<String, String> {
+        let _guard = self.advance_lock.lock().await;
+        let cfg = self.serial_pool.read().await.clone();
+        let from_id = self.preferred_account_id.read().await.clone();
+
+        {
+            let last = self.last_advance.read().await;
+            if let Some(ref rec) = *last {
+                if rec.from_id == from_id
+                    && rec.reason == reason
+                    && rec.at.elapsed().as_millis() as u64 < cfg.advance_debounce_ms
+                {
+                    tracing::info!(
+                        "[SerialPool] debounce: reuse advanced account {} (reason={})",
+                        rec.to_id,
+                        reason
+                    );
+                    return Ok(rec.to_id.clone());
+                }
+            }
+        }
+
+        let tokens: Vec<ProxyToken> = self.tokens.iter().map(|e| e.value().clone()).collect();
+        if tokens.is_empty() {
+            return Err("Serial pool exhausted: no available accounts".to_string());
+        }
+
+        let ordered = self.ordered_pool_tokens(&tokens);
+        let quota_protection_enabled = crate::modules::config::load_app_config()
+            .map(|c| c.quota_protection.enabled)
+            .unwrap_or(false);
+        let normalized = target_model.map(|m| {
+            crate::proxy::common::model_mapping::normalize_to_standard_id(m)
+                .unwrap_or_else(|| m.to_string())
+        });
+        let account_level_only = target_model.is_none();
+
+        let start = from_id
+            .as_ref()
+            .and_then(|fid| ordered.iter().position(|t| &t.account_id == fid))
+            .map(|i| (i + 1) % ordered.len().max(1))
+            .unwrap_or(0);
+
+        for offset in 0..ordered.len() {
+            let candidate = &ordered[(start + offset) % ordered.len()];
+            if from_id.as_deref() == Some(candidate.account_id.as_str()) {
+                continue;
+            }
+            if !self
+                .is_serial_usable(
+                    candidate,
+                    normalized.as_deref(),
+                    quota_protection_enabled,
+                    cfg.require_proxy_binding,
+                    account_level_only,
+                )
+                .await
+            {
+                continue;
+            }
+
+            self.set_preferred_account(Some(candidate.account_id.clone()))
+                .await;
+            if let Err(e) = self
+                .persist_preferred_to_disk(Some(candidate.account_id.clone()))
+                .await
+            {
+                tracing::warn!(
+                    "[SerialPool] preferred persist after advance failed: {}",
+                    e
+                );
+            }
+            {
+                let mut reason_lock = self.last_advance_reason.write().await;
+                *reason_lock = Some(reason.to_string());
+            }
+            {
+                let mut last = self.last_advance.write().await;
+                *last = Some(LastAdvanceRecord {
+                    from_id: from_id.clone(),
+                    reason: reason.to_string(),
+                    at: std::time::Instant::now(),
+                    to_id: candidate.account_id.clone(),
+                });
+            }
+            if let Some(ref old) = from_id {
+                self.session_accounts.retain(|_, v| v != old);
+            }
+            tracing::info!(
+                "[SerialPool] advanced {} -> {} (reason={})",
+                from_id.as_deref().unwrap_or("(none)"),
+                candidate.account_id,
+                reason
+            );
+            return Ok(candidate.account_id.clone());
+        }
+
+        Err("Serial pool exhausted: no available accounts".to_string())
+    }
+
+    /// 刷新 access_token（如需要）并解析 project_id，供选号路径复用
+    async fn finalize_selected_token(
+        &self,
+        mut token: ProxyToken,
+    ) -> Result<(String, String, String, String, u64), String> {
+        let now = chrono::Utc::now().timestamp();
+        if now >= token.timestamp - 90 {
+            let refresh_mu = self
+                .refresh_locks
+                .entry(token.account_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            let _guard = refresh_mu.lock().await;
+            let latest_token_opt = self.tokens.get(&token.account_id).map(|r| r.clone());
+            if let Some(latest) = latest_token_opt {
+                if now < latest.timestamp - 90 {
+                    token = latest;
+                } else {
+                    match crate::modules::oauth::refresh_access_token(
+                        &token.refresh_token,
+                        Some(&token.account_id),
+                    )
+                    .await
+                    {
+                        Ok(token_response) => {
+                            token.access_token = token_response.access_token.clone();
+                            token.expires_in = token_response.expires_in;
+                            token.timestamp = now + token_response.expires_in;
+                            if let Some(rt) = token_response.refresh_token.clone() {
+                                token.refresh_token = rt;
+                            }
+                            if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
+                                *entry = token.clone();
+                            }
+                            let _ = self
+                                .save_refreshed_token(&token.account_id, &token_response)
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Token refresh failed for {}: {}", token.email, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        let project_id = if let Some(pid) = &token.project_id {
+            if pid.is_empty() {
+                None
+            } else {
+                Some(pid.clone())
+            }
+        } else {
+            None
+        };
+        let project_id = if let Some(pid) = project_id {
+            pid
+        } else {
+            match crate::proxy::project_resolver::fetch_project_id(&token.access_token).await {
+                Ok(pid) => {
+                    if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
+                        entry.project_id = Some(pid.clone());
+                    }
+                    let _ = self.save_project_id(&token.account_id, &pid).await;
+                    pid
+                }
+                Err(_) => "bamboo-precept-lgxtn".to_string(),
+            }
+        };
+
+        Ok((
+            token.access_token,
+            project_id,
+            token.email,
+            token.account_id,
+            0,
+        ))
+    }
+
+    /// 串行号池选号主路径（enabled=true）
+    async fn get_token_serial(
+        &self,
+        tokens_snapshot: &[ProxyToken],
+        session_id: Option<&str>,
+        target_model: &str,
+        quota_protection_enabled: bool,
+    ) -> Result<(String, String, String, String, u64), String> {
+        let cfg = self.serial_pool.read().await.clone();
+        let scheduling = self.sticky_config.read().await.clone();
+        crate::proxy::sticky_config::warn_serial_pool_scheduling_override(scheduling.mode);
+
+        let normalized_target =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+        let ordered = self.ordered_pool_tokens(tokens_snapshot);
+
+        let mut preferred_id = self.preferred_account_id.read().await.clone();
+
+        if preferred_id.is_none() {
+            let mut found = None;
+            for t in &ordered {
+                if self
+                    .is_serial_usable(
+                        t,
+                        Some(&normalized_target),
+                        quota_protection_enabled,
+                        cfg.require_proxy_binding,
+                        false,
+                    )
+                    .await
+                {
+                    found = Some(t.account_id.clone());
+                    break;
+                }
+            }
+            let Some(id) = found else {
+                return Err("Serial pool exhausted: no available accounts".to_string());
+            };
+            self.set_preferred_account(Some(id.clone())).await;
+            if let Err(e) = self.persist_preferred_to_disk(Some(id.clone())).await {
+                tracing::warn!("[SerialPool] preferred persist on init cursor failed: {}", e);
+            }
+            preferred_id = Some(id);
+        }
+
+        let pref_id = preferred_id.clone().unwrap();
+
+        if let Some(sid) = session_id {
+            if let Some(bound) = self.session_accounts.get(sid).map(|v| v.clone()) {
+                if bound != pref_id {
+                    tracing::debug!(
+                        "[SerialPool] sticky {} != cursor {}, unbinding",
+                        bound,
+                        pref_id
+                    );
+                    self.session_accounts.remove(sid);
+                }
+            }
+        }
+
+        let preferred_token = ordered.iter().find(|t| t.account_id == pref_id).cloned();
+
+        let usable = if let Some(ref token) = preferred_token {
+            self.is_serial_usable(
+                token,
+                Some(&normalized_target),
+                quota_protection_enabled,
+                cfg.require_proxy_binding,
+                false,
+            )
+            .await
+        } else {
+            false
+        };
+
+        if usable {
+            let token = preferred_token.unwrap();
+            if let Some(sid) = session_id {
+                self.session_accounts
+                    .insert(sid.to_string(), token.account_id.clone());
+            }
+            tracing::info!(
+                "[SerialPool] using cursor account {} for {}",
+                token.email,
+                normalized_target
+            );
+            return self.finalize_selected_token(token).await;
+        }
+
+        let reason = if preferred_token.is_none() {
+            "invalid_grant"
+        } else {
+            let token = preferred_token.as_ref().unwrap();
+            let rate_limited = self
+                .is_rate_limited(&token.account_id, Some(&normalized_target))
+                .await;
+            let quota_protected =
+                quota_protection_enabled && token.protected_models.contains(&normalized_target);
+            if rate_limited {
+                "rate_limit"
+            } else if quota_protected {
+                "quota_protection"
+            } else {
+                "invalid_grant"
+            }
+        };
+
+        if !cfg.should_advance_on(reason) {
+            return Err(format!(
+                "Serial cursor unavailable for model {} (reason={})",
+                normalized_target, reason
+            ));
+        }
+
+        let next_id = self
+            .advance_serial_account(reason, Some(target_model))
+            .await?;
+        let next_token = self
+            .tokens
+            .get(&next_id)
+            .map(|t| t.clone())
+            .ok_or_else(|| "Serial pool exhausted: no available accounts".to_string())?;
+
+        if let Some(sid) = session_id {
+            self.session_accounts
+                .insert(sid.to_string(), next_token.account_id.clone());
+        }
+        tracing::info!(
+            "[SerialPool] after advance using {} for {}",
+            next_token.email,
+            normalized_target
+        );
+        self.finalize_selected_token(next_token).await
     }
 
     /// 使用 Authorization Code 交换 Refresh Token (Web OAuth)
@@ -4239,5 +4721,142 @@ mod tests {
             ],
             "Sonnet should sort by quota first, then by tier as tiebreaker"
         );
+    }
+
+    #[tokio::test]
+    async fn test_serial_pool_advance_and_debounce() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-serial-pool-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, email: &str| {
+            let path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": "atk",
+                    "refresh_token": "rtk",
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": "test-project"
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "quota": {
+                    "models": [
+                        { "name": "gemini-2.0-flash", "percentage": 100 }
+                    ]
+                },
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        write_account("acc1", "a@test.com");
+        write_account("acc2", "b@test.com");
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+        manager
+            .update_serial_pool_config(SerialPoolConfig {
+                enabled: true,
+                advance_debounce_ms: 60_000,
+                ..SerialPoolConfig::default()
+            })
+            .await;
+        manager
+            .set_preferred_account(Some("acc1".to_string()))
+            .await;
+
+        let next = manager
+            .advance_serial_account("rate_limit", Some("gemini-2.0-flash"))
+            .await
+            .unwrap();
+        assert_eq!(next, "acc2");
+        assert_eq!(
+            manager.get_preferred_account().await.as_deref(),
+            Some("acc2")
+        );
+
+        // debounce: same from+reason should return same to_id without jumping further
+        manager
+            .set_preferred_account(Some("acc1".to_string()))
+            .await;
+        // Reset last_advance as if we just advanced from acc1
+        {
+            let mut last = manager.last_advance.write().await;
+            *last = Some(LastAdvanceRecord {
+                from_id: Some("acc1".to_string()),
+                reason: "rate_limit".to_string(),
+                at: std::time::Instant::now(),
+                to_id: "acc2".to_string(),
+            });
+        }
+        let debounced = manager
+            .advance_serial_account("rate_limit", Some("gemini-2.0-flash"))
+            .await
+            .unwrap();
+        assert_eq!(debounced, "acc2");
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_serial_pool_exhausted() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-serial-exhausted-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let path = accounts_dir.join("acc1.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": "acc1",
+                "email": "only@test.com",
+                "token": {
+                    "access_token": "atk",
+                    "refresh_token": "rtk",
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": "test-project"
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "quota": { "models": [{ "name": "gemini-2.0-flash", "percentage": 100 }] },
+                "created_at": now,
+                "last_used": now
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+        manager
+            .update_serial_pool_config(SerialPoolConfig {
+                enabled: true,
+                ..SerialPoolConfig::default()
+            })
+            .await;
+        manager
+            .set_preferred_account(Some("acc1".to_string()))
+            .await;
+
+        let err = manager
+            .advance_serial_account("rate_limit", Some("gemini-2.0-flash"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("exhausted"), "err={}", err);
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

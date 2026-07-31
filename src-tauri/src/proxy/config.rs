@@ -664,6 +664,51 @@ pub struct ProxyConfig {
     /// 代理池配置
     #[serde(default)]
     pub proxy_pool: ProxyPoolConfig,
+
+    /// 串行号池（默认关闭；开启后全局单游标，用尽后推进 preferred）
+    #[serde(default)]
+    pub serial_pool: SerialPoolConfig,
+}
+
+/// 串行号池配置（一期：默认关，不改变现网调度）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SerialPoolConfig {
+    /// 是否启用串行号池
+    pub enabled: bool,
+    /// 触发推进的原因：quota_protection / rate_limit / invalid_grant（consecutive_failures 一期不挂钩）
+    pub advance_on: Vec<String>,
+    /// 连续硬失败阈值（配置预留，一期不接线）
+    pub consecutive_failure_threshold: u32,
+    /// 同一 from+reason 推进防抖窗口（毫秒）
+    pub advance_debounce_ms: u64,
+    /// true 时未绑定代理的账号不可进入串行队列
+    pub require_proxy_binding: bool,
+    /// 队列顺序：account_index（不按 Ultra tier 重排）
+    pub order: String,
+}
+
+impl Default for SerialPoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            advance_on: vec![
+                "quota_protection".to_string(),
+                "rate_limit".to_string(),
+                "invalid_grant".to_string(),
+            ],
+            consecutive_failure_threshold: 3,
+            advance_debounce_ms: 3000,
+            require_proxy_binding: false,
+            order: "account_index".to_string(),
+        }
+    }
+}
+
+impl SerialPoolConfig {
+    pub fn should_advance_on(&self, reason: &str) -> bool {
+        self.advance_on.iter().any(|r| r == reason)
+    }
 }
 
 /// 上游代理配置
@@ -701,6 +746,7 @@ impl Default for ProxyConfig {
             global_system_prompt: GlobalSystemPromptConfig::default(),
             proxy_pool: ProxyPoolConfig::default(),
             image_thinking_mode: None,
+            serial_pool: SerialPoolConfig::default(),
         }
     }
 }
