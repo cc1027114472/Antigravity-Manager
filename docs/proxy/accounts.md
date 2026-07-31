@@ -22,9 +22,25 @@ If an account refresh fails with `invalid_grant` during token refresh, the proxy
 
 This prevents endless rotation attempts against a dead account.
 
-### 3) Batch quota refresh skips disabled accounts
-When refreshing quotas for all accounts, disabled ones are skipped immediately:
-- `refresh_all_quotas(...)` in [`src-tauri/src/commands/mod.rs`](../../src-tauri/src/commands/mod.rs)
+### 3) Batch quota refresh concurrency & egress
+`refresh_all_quotas_logic` in [`src-tauri/src/modules/account.rs`](../../src-tauri/src/modules/account.rs):
+- Skips accounts marked `quota.is_forbidden` (not all `disabled` flags).
+- Global concurrency max **5**.
+- **Same egress key** (bound `proxy:{id}`, else `upstream` / `direct`) runs **at most 1** refresh at a time, so multiple accounts sharing one IP do not hit Google in parallel.
+
+### 3b) Quota / token-refresh egress (account ops)
+Quota fetch and OAuth `refresh_access_token` (with `account_id`) use **account-ops egress**, not the AI traffic pool picker:
+
+1. Bound proxy for that account  
+2. Else global upstream proxy  
+3. Else direct  
+
+**Unbound accounts never scrape `select_proxy_from_pool`** (avoids sharing someone else’s / random pool IP for ops).  
+AI chat traffic still uses `get_effective_client` / pool selection as before.
+
+Prefer **one account ↔ one proxy binding** so quota refresh and AI share the same egress.
+
+See: `get_effective_standard_client_for_account_ops` / `egress_key_for_account` in [`src-tauri/src/proxy/proxy_pool.rs`](../../src-tauri/src/proxy/proxy_pool.rs).
 
 ### 4) UI surfaces disabled state and blocks actions
 The accounts UI reads `disabled` fields and shows a “Disabled” badge and tooltip, and disables “switch / refresh” controls:

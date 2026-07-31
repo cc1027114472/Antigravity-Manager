@@ -202,6 +202,79 @@ impl ProxyPoolManager {
         builder.build().unwrap_or_else(|_| Client::new())
     }
 
+    /// 账号运维面（额度/token refresh）出口：仅绑定，禁止未绑定蹭池
+    pub async fn resolve_account_ops_proxy(
+        &self,
+        account_id: &str,
+    ) -> Option<(AccountOpsRoute, PoolProxyConfig)> {
+        let config = self.config.read().await;
+        if !config.enabled || config.proxies.is_empty() {
+            return None;
+        }
+        match self.get_bound_proxy(account_id, &config).await {
+            Ok(Some(proxy)) => Some((AccountOpsRoute::Bound, proxy)),
+            _ => None,
+        }
+    }
+
+    /// 额度/OAuth refresh 等账号运维请求的 Standard Client：
+    /// `bound → upstream → direct`，**绝不** `select_proxy_from_pool`。
+    pub async fn get_effective_standard_client_for_account_ops(
+        &self,
+        account_id: &str,
+        timeout_secs: u64,
+    ) -> Client {
+        let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+
+        if let Some((route, proxy_cfg)) = self.resolve_account_ops_proxy(account_id).await {
+            tracing::info!(
+                "[Proxy] AccountOps Route: {} -> {:?} ({})",
+                account_id,
+                route,
+                proxy_cfg.entry_id
+            );
+            builder = builder.proxy(proxy_cfg.proxy);
+            return builder.build().unwrap_or_else(|_| Client::new());
+        }
+
+        if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+            let up = app_cfg.proxy.upstream_proxy;
+            if up.enabled && !up.url.is_empty() {
+                if let Ok(p) = rquest::Proxy::all(&up.url) {
+                    tracing::info!(
+                        "[Proxy] AccountOps Route: {} -> Upstream ({})",
+                        account_id,
+                        up.url
+                    );
+                    builder = builder.proxy(p);
+                    return builder.build().unwrap_or_else(|_| Client::new());
+                }
+            }
+        }
+
+        tracing::info!("[Proxy] AccountOps Route: {} -> Direct", account_id);
+        builder.build().unwrap_or_else(|_| Client::new())
+    }
+
+    /// 批量额度刷新用的出口键：同 key 串行，避免多号同 IP 并发
+    pub async fn egress_key_for_account(&self, account_id: &str) -> String {
+        let config = self.config.read().await;
+        if config.enabled {
+            if let Ok(Some(proxy)) = self.get_bound_proxy(account_id, &config).await {
+                return format!("proxy:{}", proxy.entry_id);
+            }
+        }
+        drop(config);
+
+        if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+            let up = app_cfg.proxy.upstream_proxy;
+            if up.enabled && !up.url.is_empty() {
+                return "upstream".to_string();
+            }
+        }
+        "direct".to_string()
+    }
+
     /// 为账号获取代理
     pub async fn get_proxy_for_account(
         &self,
@@ -737,6 +810,13 @@ impl ProxyPoolManager {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountOpsRoute {
+    Bound,
+    Upstream,
+    Direct,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchBindApplied {
@@ -853,5 +933,25 @@ mod tests {
         assert_eq!(snap.unhealthy_proxies.len(), 1);
         assert_eq!(snap.bindings_on_unhealthy.len(), 1);
         assert_eq!(snap.bindings_on_unhealthy[0].account_id, "bound");
+    }
+
+    #[tokio::test]
+    async fn test_account_ops_no_pool_scrape_when_unbound() {
+        let pool = test_pool(vec![proxy("pool-node", None), proxy("spare", None)]);
+        let ops = pool.resolve_account_ops_proxy("unbound-acc").await;
+        assert!(ops.is_none());
+
+        let key = pool.egress_key_for_account("unbound-acc").await;
+        assert!(key == "upstream" || key == "direct");
+
+        let ai = pool.get_proxy_for_account("unbound-acc").await.unwrap();
+        assert!(ai.is_some());
+
+        let _ = pool
+            .bind_account_to_proxy_inner("a1".into(), "pool-node".into(), false)
+            .await;
+        let ops = pool.resolve_account_ops_proxy("a1").await;
+        assert!(matches!(ops, Some((AccountOpsRoute::Bound, _))));
+        assert_eq!(pool.egress_key_for_account("a1").await, "proxy:pool-node");
     }
 }

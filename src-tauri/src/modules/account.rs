@@ -1971,6 +1971,7 @@ pub struct RefreshStats {
 
 /// Core logic to batch refresh all account quotas (decoupled from Tauri status)
 pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
+    use dashmap::DashMap;
     use futures::future::join_all;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
@@ -1979,12 +1980,13 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     let start = std::time::Instant::now();
 
     crate::modules::logger::log_info(&format!(
-        "Starting batch refresh of all account quotas (Concurrent mode, max: {})",
+        "Starting batch refresh of all account quotas (Concurrent mode, max: {}, per-egress: 1)",
         MAX_CONCURRENT
     ));
     let accounts = list_accounts()?;
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let global_sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
+    let egress_sems: Arc<DashMap<String, Arc<Semaphore>>> = Arc::new(DashMap::new());
 
     let tasks: Vec<_> = accounts
         .into_iter()
@@ -2007,10 +2009,29 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
         .map(|mut account| {
             let email = account.email.clone();
             let account_id = account.id.clone();
-            let permit = semaphore.clone();
+            let global_sem = global_sem.clone();
+            let egress_sems = egress_sems.clone();
             async move {
-                let _guard = permit.acquire().await.unwrap();
-                crate::modules::logger::log_info(&format!("  - Processing {}", email));
+                let egress_key = if let Some(pool) =
+                    crate::proxy::proxy_pool::get_global_proxy_pool()
+                {
+                    pool.egress_key_for_account(&account_id).await
+                } else {
+                    "direct".to_string()
+                };
+
+                let per_egress = egress_sems
+                    .entry(egress_key.clone())
+                    .or_insert_with(|| Arc::new(Semaphore::new(1)))
+                    .clone();
+
+                let _global = global_sem.acquire().await.unwrap();
+                let _egress = per_egress.acquire().await.unwrap();
+
+                crate::modules::logger::log_info(&format!(
+                    "  - Processing {} (egress={})",
+                    email, egress_key
+                ));
                 match fetch_quota_with_retry(&mut account).await {
                     Ok(quota) => {
                         if let Err(e) = update_account_quota(&account_id, quota) {

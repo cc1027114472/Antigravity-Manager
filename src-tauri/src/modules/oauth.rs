@@ -515,9 +515,14 @@ async fn refresh_access_token_once(
     account_id: Option<&str>,
     client_cfg: &OAuthClientConfig,
 ) -> Result<TokenResponse, (Option<reqwest::StatusCode>, String)> {
-    // [PHASE 2] 根据 account_id 使用对应的代理
+    // [PHASE 2] 根据 account_id 使用对应的代理（运维面：绑定优先，禁止未绑定蹭池）
     let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(account_id, 60).await
+        if let Some(id) = account_id {
+            pool.get_effective_standard_client_for_account_ops(id, 60)
+                .await
+        } else {
+            pool.get_effective_standard_client(None, 60).await
+        }
     } else {
         crate::utils::http::get_long_standard_client()
     };
