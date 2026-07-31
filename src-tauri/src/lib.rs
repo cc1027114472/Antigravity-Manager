@@ -609,6 +609,7 @@ pub fn run() {
             commands::proxy_pool::get_all_account_bindings,
             commands::proxy_pool::batch_bind_account_proxies,
             commands::proxy_pool::get_proxy_pool_health,
+            commands::proxy_pool::get_proxy_egress_usage,
             // Autostart commands
             commands::autostart::toggle_auto_launch,
             commands::autostart::is_auto_launch_enabled,

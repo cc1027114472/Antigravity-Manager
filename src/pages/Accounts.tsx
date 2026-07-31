@@ -86,6 +86,7 @@ function Accounts() {
   const [errorAccountId, setErrorAccountId] = useState<string | null>(null);
   const [proxyBindings, setProxyBindings] = useState<Record<string, string>>({});
   const [proxyNames, setProxyNames] = useState<Record<string, string>>({});
+  const [proxyUsageStatus, setProxyUsageStatus] = useState<Record<string, string>>({});
   const [serialCursorId, setSerialCursorId] = useState<string | null>(null);
 
   const handleWarmup = async (accountId: string) => {
@@ -256,10 +257,11 @@ function Accounts() {
   useEffect(() => {
     const loadPoolMeta = async () => {
       try {
-        const [bindings, poolCfg, serial] = await Promise.all([
+        const [bindings, poolCfg, serial, usage] = await Promise.all([
           invoke<Record<string, string>>("get_all_account_bindings").catch(() => ({})),
           invoke<{ proxies?: Array<{ id: string; name?: string }> }>("get_proxy_pool_config").catch(() => null),
           invoke<{ enabled?: boolean; current_account_id?: string | null }>("get_serial_pool").catch(() => null),
+          invoke<Record<string, string>>("get_proxy_egress_usage").catch(() => ({})),
         ]);
         setProxyBindings(bindings || {});
         const names: Record<string, string> = {};
@@ -267,6 +269,7 @@ function Accounts() {
           names[p.id] = p.name || p.id.slice(0, 8);
         }
         setProxyNames(names);
+        setProxyUsageStatus(usage || {});
         if (serial?.enabled && serial.current_account_id) {
           setSerialCursorId(serial.current_account_id);
         } else {
@@ -1148,6 +1151,7 @@ function Accounts() {
                 onViewError={(id: string) => setErrorAccountId(id)}
                 proxyBindings={proxyBindings}
                 proxyNames={proxyNames}
+                proxyUsageStatus={proxyUsageStatus}
                 serialCursorId={serialCursorId}
               />
             </div>
@@ -1176,6 +1180,9 @@ function Accounts() {
               onWarmup={handleWarmup}
               onUpdateLabel={handleUpdateLabel}
               onViewError={(id: string) => setErrorAccountId(id)}
+              proxyBindings={proxyBindings}
+              proxyNames={proxyNames}
+              proxyUsageStatus={proxyUsageStatus}
             />
           </div>
         )}

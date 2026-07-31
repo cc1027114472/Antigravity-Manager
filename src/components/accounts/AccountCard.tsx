@@ -9,6 +9,11 @@ import { MODEL_CONFIG, sortModels, getModelProtectionKey, resolveQuotaModels, en
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
 import { formatQuotaTooltip, getDisplayQuotaModels } from '../../utils/quotaDisplay';
+import {
+    proxyUsageBadgeClass,
+    proxyUsageTooltipKey,
+    type ProxyEgressUsage,
+} from '../../utils/proxyUsageStatus';
 
 interface AccountCardProps {
     account: Account;
@@ -27,6 +32,8 @@ interface AccountCardProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
+    proxyBindingLabel?: string | null;
+    proxyUsage?: ProxyEgressUsage;
 }
 
 // 使用统一的模型配置
@@ -37,7 +44,7 @@ const DEFAULT_MODELS = Object.entries(MODEL_CONFIG).map(([id, config]) => ({
     Icon: config.Icon
 }));
 
-function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError }: AccountCardProps) {
+function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError, proxyBindingLabel, proxyUsage = 'unknown' }: AccountCardProps) {
     const { t } = useTranslation();
     const { config, showAllQuotas } = useConfigStore();
     const isDisabled = Boolean(account.disabled);
@@ -165,6 +172,17 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                             {isCurrent && (
                                 <span className="px-1.5 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 text-[9px] font-bold shadow-sm border border-blue-200/50">
                                     {t('accounts.current').toUpperCase()}
+                                </span>
+                            )}
+                            {proxyBindingLabel && (
+                                <span
+                                    className={cn(
+                                        "px-1.5 py-0.5 rounded-md text-[9px] font-bold shadow-sm border max-w-[100px] truncate",
+                                        proxyUsageBadgeClass(proxyUsage),
+                                    )}
+                                    title={`${proxyBindingLabel} — ${t(proxyUsageTooltipKey(proxyUsage))}`}
+                                >
+                                    {proxyBindingLabel}
                                 </span>
                             )}
                             {isDisabled && (

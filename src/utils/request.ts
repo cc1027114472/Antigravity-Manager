@@ -168,6 +168,7 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'get_account_proxy_binding': { url: '/api/proxy/pool/binding/:accountId', method: 'GET' },
   'batch_bind_account_proxies': { url: '/api/proxy/pool/bindings/batch', method: 'POST' },
   'get_proxy_pool_health': { url: '/api/proxy/pool/health', method: 'GET' },
+  'get_proxy_egress_usage': { url: '/api/proxy/pool/egress-usage', method: 'GET' },
 };
 
 export async function request<T>(cmd: string, args?: any): Promise<T> {

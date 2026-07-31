@@ -57,6 +57,12 @@ import { categorizeModel, getModelProtectionKey } from '../../utils/modelCategor
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
 import { formatQuotaTooltip, getDisplayQuotaModels, type DisplayModelQuota } from '../../utils/quotaDisplay';
+import {
+    proxyUsageBadgeClass,
+    proxyUsageTooltipKey,
+    resolveProxyUsageStatus,
+    type ProxyEgressUsage,
+} from '../../utils/proxyUsageStatus';
 
 // ============================================================================
 // 类型定义
@@ -86,6 +92,8 @@ interface AccountTableProps {
     proxyBindings?: Record<string, string>;
     /** proxy_id → display name */
     proxyNames?: Record<string, string>;
+    /** proxy_id → ok | failed (absent = unknown) */
+    proxyUsageStatus?: Record<string, string>;
     /** serial pool cursor account id */
     serialCursorId?: string | null;
 }
@@ -109,6 +117,7 @@ interface SortableRowProps {
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
     proxyBindingLabel?: string | null;
+    proxyUsage?: ProxyEgressUsage;
     isSerialCursor?: boolean;
 }
 
@@ -129,6 +138,7 @@ interface AccountRowContentProps {
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
     proxyBindingLabel?: string | null;
+    proxyUsage?: ProxyEgressUsage;
     isSerialCursor?: boolean;
 }
 
@@ -189,6 +199,7 @@ function SortableAccountRow({
     onUpdateLabel,
     onViewError,
     proxyBindingLabel,
+    proxyUsage,
     isSerialCursor,
 }: SortableRowProps) {
     const { t } = useTranslation();
@@ -257,6 +268,7 @@ function SortableAccountRow({
                 onUpdateLabel={onUpdateLabel}
                 onViewError={onViewError}
                 proxyBindingLabel={proxyBindingLabel}
+                proxyUsage={proxyUsage}
                 isSerialCursor={isSerialCursor}
             />
         </tr>
@@ -284,6 +296,7 @@ function AccountRowContent({
     onUpdateLabel,
     onViewError,
     proxyBindingLabel,
+    proxyUsage = 'unknown',
     isSerialCursor,
 }: AccountRowContentProps) {
     const { t } = useTranslation();
@@ -403,8 +416,11 @@ function AccountRowContent({
                         )}
                         {proxyBindingLabel && (
                             <span
-                                className="px-2 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 text-[10px] font-bold shadow-sm border border-indigo-200/50 dark:border-indigo-800/50 max-w-[120px] truncate"
-                                title={proxyBindingLabel}
+                                className={cn(
+                                    "px-2 py-0.5 rounded-md text-[10px] font-bold shadow-sm border max-w-[120px] truncate",
+                                    proxyUsageBadgeClass(proxyUsage),
+                                )}
+                                title={`${proxyBindingLabel} — ${t(proxyUsageTooltipKey(proxyUsage))}`}
                             >
                                 {proxyBindingLabel}
                             </span>
@@ -720,6 +736,7 @@ function AccountTable({
     onViewError,
     proxyBindings,
     proxyNames,
+    proxyUsageStatus,
     serialCursorId,
 }: AccountTableProps) {
     const { t } = useTranslation();
@@ -824,6 +841,10 @@ function AccountTable({
                                             ? (proxyNames?.[proxyBindings[account.id]] || proxyBindings[account.id].slice(0, 8))
                                             : null
                                     }
+                                    proxyUsage={resolveProxyUsageStatus(
+                                        proxyBindings?.[account.id],
+                                        proxyUsageStatus,
+                                    )}
                                     isSerialCursor={!!serialCursorId && serialCursorId === account.id}
                                 />
                             ))}
@@ -866,6 +887,16 @@ function AccountTable({
                                         onToggleProxy={() => { }}
                                         isDisabled={Boolean(activeAccount.disabled)}
                                         onViewError={() => { }}
+                                        proxyBindingLabel={
+                                            proxyBindings?.[activeAccount.id]
+                                                ? (proxyNames?.[proxyBindings[activeAccount.id]] || proxyBindings[activeAccount.id].slice(0, 8))
+                                                : null
+                                        }
+                                        proxyUsage={resolveProxyUsageStatus(
+                                            proxyBindings?.[activeAccount.id],
+                                            proxyUsageStatus,
+                                        )}
+                                        isSerialCursor={!!serialCursorId && serialCursorId === activeAccount.id}
                                     />
                                 </tr>
                             </tbody>

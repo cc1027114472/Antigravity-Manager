@@ -629,6 +629,7 @@ impl AxumServer {
                 post(admin_batch_bind_account_proxies),
             )
             .route("/proxy/pool/health", get(admin_get_proxy_pool_health))
+            .route("/proxy/pool/egress-usage", get(admin_get_proxy_egress_usage))
             .route("/proxy/pool/bind", post(admin_bind_account_proxy))
             .route("/proxy/pool/unbind", post(admin_unbind_account_proxy))
             .route(
@@ -1604,6 +1605,12 @@ async fn admin_get_proxy_pool_health(
         .pool_health_snapshot(&account_ids)
         .await;
     Ok(Json(snap))
+}
+
+async fn admin_get_proxy_egress_usage(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    Ok(Json(state.proxy_pool_manager.get_egress_usage_snapshot()))
 }
 
 // [FIX Web Mode] Unbind account from proxy

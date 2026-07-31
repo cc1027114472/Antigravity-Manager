@@ -2,6 +2,8 @@ use crate::proxy::config::{ProxyEntry, ProxyPoolConfig, ProxySelectionStrategy};
 use dashmap::DashMap;
 use futures::{stream, StreamExt};
 use rquest::Client;
+use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +11,17 @@ use tokio::sync::RwLock;
 
 use rquest_util::Emulation;
 use std::sync::OnceLock;
+
+/// Runtime egress usage status from live upstream requests (not health probes).
+/// Missing keys are treated as `unknown` (yellow) by the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressUsageStatus {
+    /// Verified: received an HTTP response via this proxy.
+    Ok,
+    /// Transport failure (connect / DNS / timeout / proxy handshake).
+    Failed,
+}
 
 /// 全局代理池管理器单例
 pub static GLOBAL_PROXY_POOL: OnceLock<Arc<ProxyPoolManager>> = OnceLock::new();
@@ -61,6 +74,9 @@ pub struct ProxyPoolManager {
 
     /// Temporary resolve-once pin: `None` forces upstream/direct (skip pool re-pick).
     forced_egress: Arc<DashMap<String, Option<PoolProxyConfig>>>,
+
+    /// Live request outcome per pool proxy (in-memory only; resets on restart).
+    egress_usage: Arc<DashMap<String, EgressUsageStatus>>,
 }
 
 impl ProxyPoolManager {
@@ -88,7 +104,30 @@ impl ProxyPoolManager {
             account_bindings,
             round_robin_index: Arc::new(AtomicUsize::new(0)),
             forced_egress: Arc::new(DashMap::new()),
+            egress_usage: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Record live egress outcome for a pool proxy. Direct/upstream (no entry_id) is ignored.
+    pub fn record_egress_usage(&self, proxy_id: &str, status: EgressUsageStatus) {
+        if proxy_id.is_empty() {
+            return;
+        }
+        self.egress_usage
+            .insert(proxy_id.to_string(), status);
+        tracing::debug!(
+            "[ProxyPool] egress usage {:?} for proxy {}",
+            status,
+            proxy_id
+        );
+    }
+
+    /// Snapshot of known usage statuses (`ok` / `failed`). Absent ids = unknown.
+    pub fn get_egress_usage_snapshot(&self) -> HashMap<String, EgressUsageStatus> {
+        self.egress_usage
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect()
     }
 
     /// [NEW] 为指定账号获取“最终生效”的 HttpClient

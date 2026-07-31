@@ -121,3 +121,19 @@ pub async fn get_proxy_pool_health(
         Err("Service not running".to_string())
     }
 }
+
+/// Live egress usage from real upstream requests (`ok` / `failed`; absent = unknown).
+#[tauri::command]
+pub async fn get_proxy_egress_usage(
+    state: State<'_, ProxyServiceState>,
+) -> Result<HashMap<String, crate::proxy::proxy_pool::EgressUsageStatus>, String> {
+    let instance_lock = state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        Ok(instance
+            .axum_server
+            .proxy_pool_manager
+            .get_egress_usage_snapshot())
+    } else {
+        Err("Service not running".to_string())
+    }
+}

@@ -1,6 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { Account } from '../../types/account';
 import AccountCard from './AccountCard';
+import { resolveProxyUsageStatus } from '../../utils/proxyUsageStatus';
 
 interface AccountGridProps {
     accounts: Account[];
@@ -19,10 +20,13 @@ interface AccountGridProps {
     onWarmup?: (accountId: string) => void;
     onUpdateLabel?: (accountId: string, label: string) => void;
     onViewError: (accountId: string) => void;
+    proxyBindings?: Record<string, string>;
+    proxyNames?: Record<string, string>;
+    proxyUsageStatus?: Record<string, string>;
 }
 
 
-function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, currentAccountId, switchingAccountId, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError }: AccountGridProps) {
+function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, currentAccountId, switchingAccountId, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError, proxyBindings, proxyNames, proxyUsageStatus }: AccountGridProps) {
     const { t } = useTranslation();
     if (accounts.length === 0) {
         return (
@@ -35,7 +39,12 @@ function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, cur
 
     return (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {accounts.map((account) => (
+            {accounts.map((account) => {
+                const proxyId = proxyBindings?.[account.id];
+                const proxyBindingLabel = proxyId
+                    ? (proxyNames?.[proxyId] || proxyId.slice(0, 8))
+                    : null;
+                return (
                 <AccountCard
                     key={account.id}
                     account={account}
@@ -54,8 +63,11 @@ function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, cur
                     onWarmup={onWarmup ? () => onWarmup(account.id) : undefined}
                     onUpdateLabel={onUpdateLabel ? (label: string) => onUpdateLabel(account.id, label) : undefined}
                     onViewError={() => onViewError(account.id)}
+                    proxyBindingLabel={proxyBindingLabel}
+                    proxyUsage={resolveProxyUsageStatus(proxyId, proxyUsageStatus)}
                 />
-            ))}
+                );
+            })}
         </div>
     );
 }

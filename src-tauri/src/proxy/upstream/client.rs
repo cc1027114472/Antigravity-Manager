@@ -232,31 +232,38 @@ impl UpstreamClient {
             .unwrap_or_else(|| crate::constants::USER_AGENT.clone())
     }
 
-    /// Get client for a specific account (or default if no proxy bound)
-    pub async fn get_client(&self, account_id: Option<&str>) -> Client {
+    /// Get client for a specific account (or default if no proxy bound).
+    /// Returns `(client, Some(proxy_id))` when a pool proxy is used; `None` for direct/upstream default.
+    pub async fn get_client(&self, account_id: Option<&str>) -> (Client, Option<String>) {
         if let Some(pool) = &self.proxy_pool {
             if let Some(acc_id) = account_id {
                 // Try to get per-account proxy
                 match pool.get_proxy_for_account(acc_id).await {
                     Ok(Some(proxy_cfg)) => {
+                        let entry_id = proxy_cfg.entry_id.clone();
                         // Check cache
-                        if let Some(client) = self.client_cache.get(&proxy_cfg.entry_id) {
-                            return client.clone();
+                        if let Some(client) = self.client_cache.get(&entry_id) {
+                            return (client.clone(), Some(entry_id));
                         }
                         // Build new client and cache it
                         match self.build_client_with_proxy(proxy_cfg.clone()) {
                             Ok(client) => {
                                 self.client_cache
-                                    .insert(proxy_cfg.entry_id.clone(), client.clone());
+                                    .insert(entry_id.clone(), client.clone());
                                 tracing::info!(
                                     "Using ProxyPool proxy ID: {} for account: {}",
-                                    proxy_cfg.entry_id,
+                                    entry_id,
                                     acc_id
                                 );
-                                return client;
+                                return (client, Some(entry_id));
                             }
                             Err(e) => {
-                                tracing::error!("Failed to build client for proxy {}: {}, falling back to default", proxy_cfg.entry_id, e);
+                                tracing::error!("Failed to build client for proxy {}: {}, falling back to default", entry_id, e);
+                                // Building the client failed before send — treat as egress failure.
+                                pool.record_egress_usage(
+                                    &entry_id,
+                                    crate::proxy::proxy_pool::EgressUsageStatus::Failed,
+                                );
                             }
                         }
                     }
@@ -274,7 +281,29 @@ impl UpstreamClient {
             }
         }
         // Fallback to default client
-        self.default_client.read().await.clone()
+        (self.default_client.read().await.clone(), None)
+    }
+
+    /// True when the error is an egress/transport failure (not an HTTP application status).
+    fn is_egress_transport_error(err: &rquest::Error) -> bool {
+        err.is_connect()
+            || err.is_timeout()
+            || err.is_request()
+            || {
+                let s = err.to_string().to_lowercase();
+                s.contains("connect")
+                    || s.contains("connection")
+                    || s.contains("dns")
+                    || s.contains("proxy")
+                    || s.contains("timed out")
+                    || s.contains("timeout")
+            }
+    }
+
+    fn record_egress_outcome(&self, proxy_id: Option<&str>, status: crate::proxy::proxy_pool::EgressUsageStatus) {
+        if let (Some(pool), Some(id)) = (&self.proxy_pool, proxy_id) {
+            pool.record_egress_usage(id, status);
+        }
     }
 
     /// Build v1internal URL
@@ -328,7 +357,7 @@ impl UpstreamClient {
         account_id: Option<&str>, // [NEW] Account ID
     ) -> Result<UpstreamCallResult, String> {
         // [NEW] Get client based on account (cached in proxy pool manager)
-        let client = self.get_client(account_id).await;
+        let (client, egress_proxy_id) = self.get_client(account_id).await;
 
         // 构建 Headers (所有端点复用)
         let mut headers = header::HeaderMap::new();
@@ -432,6 +461,12 @@ impl UpstreamClient {
 
                 match response {
                     Ok(resp) => {
+                        // Any HTTP response means the egress path worked.
+                        self.record_egress_outcome(
+                            egress_proxy_id.as_deref(),
+                            crate::proxy::proxy_pool::EgressUsageStatus::Ok,
+                        );
+
                         let status = resp.status();
                         if status.is_success() {
                             if idx > 0 {
@@ -494,6 +529,12 @@ impl UpstreamClient {
                         });
                     }
                     Err(e) => {
+                        if Self::is_egress_transport_error(&e) {
+                            self.record_egress_outcome(
+                                egress_proxy_id.as_deref(),
+                                crate::proxy::proxy_pool::EgressUsageStatus::Failed,
+                            );
+                        }
                         let msg = format!("HTTP request failed at {}: {}", base_url, e);
                         tracing::debug!("{}", msg);
                         // [NEW] 记录网络错误的降级尝试
