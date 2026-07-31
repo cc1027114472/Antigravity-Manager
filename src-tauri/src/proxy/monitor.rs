@@ -95,6 +95,7 @@ impl ProxyMonitor {
                     model.as_deref(),
                     log.input_tokens,
                     log.output_tokens,
+                    log.cached_tokens,
                 );
             }
         }

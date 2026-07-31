@@ -836,6 +836,7 @@ impl TokenManager {
         model: Option<&str>,
         input_tokens: Option<u32>,
         output_tokens: Option<u32>,
+        cached_tokens: Option<u32>,
     ) {
         let app_config = match crate::modules::config::load_app_config() {
             Ok(c) => c,
@@ -855,16 +856,16 @@ impl TokenManager {
         };
 
         let model_raw = model.unwrap_or("unknown");
+        // Debit billing group bucket; resolve M from the mapped upstream model id.
         let std_id = crate::proxy::common::model_mapping::normalize_to_billing_group(model_raw)
             .unwrap_or_else(|| model_raw.to_string());
 
-        let total_tokens = match (input_tokens, output_tokens) {
-            (Some(i), Some(o)) => Some(i as u64 + o as u64),
-            (Some(i), None) => Some(i as u64),
-            (None, Some(o)) => Some(o as u64),
-            (None, None) => None,
-        };
-        let burn = app_config.quota_ledger.compute_burn_pct(total_tokens);
+        let burn = app_config.quota_ledger.compute_burn_pct(
+            model_raw,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        );
         if burn <= 0 {
             return;
         }

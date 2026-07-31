@@ -7,6 +7,8 @@ pub use account::{
     Account, AccountExportItem, AccountExportResponse, AccountIndex, AccountSummary, DeviceProfile,
     DeviceProfileVersion,
 };
-pub use config::{AppConfig, CircuitBreakerConfig, QuotaLedgerConfig, QuotaProtectionConfig};
+pub use config::{
+    AppConfig, CircuitBreakerConfig, FamilyMultiplier, QuotaLedgerConfig, QuotaProtectionConfig,
+};
 pub use quota::{EstimatedModelQuota, QuotaBucket, QuotaData, QuotaGroup};
 pub use token::TokenData;

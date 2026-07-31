@@ -1,6 +1,7 @@
 use crate::modules::cloudflared::CloudflaredConfig;
 use crate::proxy::ProxyConfig;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,18 +106,53 @@ impl Default for QuotaProtectionConfig {
     }
 }
 
+/// Family keyword → multiplier (first match wins; order matters).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FamilyMultiplier {
+    pub keyword: String,
+    pub multiplier: f64,
+}
+
 /// Local quota ledger: burn on success, calibrate from online fetch.
+/// Burn uses 5h Sprint Compute Units (CU) estimate; online remaining_fraction overwrites.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaLedgerConfig {
     /// When false, selection/protection use online snapshot only.
     #[serde(default = "default_ledger_enabled")]
     pub enabled: bool,
-    /// Minimum percentage burned per successful request.
+    /// Minimum percentage burned per successful request (also floor when usage present).
     #[serde(default = "default_min_burn_pct")]
     pub min_burn_pct: u32,
-    /// Tokens that equal ~1% burn (ceil(total_tokens / N)).
+    /// Legacy field kept for old config JSON; unused by CU burn.
     #[serde(default = "default_tokens_per_percent")]
     pub tokens_per_percent: u32,
+    /// Weight for non-cached input tokens.
+    #[serde(default = "default_w_in")]
+    pub w_in: f64,
+    /// Weight for cache-read tokens.
+    #[serde(default = "default_w_cache")]
+    pub w_cache: f64,
+    /// Weight for output (+ thinking folded into output).
+    #[serde(default = "default_w_out")]
+    pub w_out: f64,
+    /// Standard input-token equivalents per 1 CU (Pro anchor).
+    #[serde(default = "default_tokens_per_cu")]
+    pub tokens_per_cu: f64,
+    /// 5h sprint capacity in CU (100% of local ledger bucket).
+    #[serde(default = "default_sprint_capacity_cu")]
+    pub sprint_capacity_cu: f64,
+    /// Reserved 7d marathon capacity; not enforced locally.
+    #[serde(default = "default_marathon_capacity_cu")]
+    pub marathon_capacity_cu: f64,
+    /// When true, billable_in = max(0, input - cache).
+    #[serde(default = "default_cache_is_subset_of_input")]
+    pub cache_is_subset_of_input: bool,
+    /// Exact model id → multiplier (lookup after normalize).
+    #[serde(default = "default_model_multipliers")]
+    pub model_multipliers: HashMap<String, f64>,
+    /// Keyword family multipliers; first contains() hit wins.
+    #[serde(default = "default_family_multipliers")]
+    pub family_multipliers: Vec<FamilyMultiplier>,
 }
 
 fn default_ledger_enabled() -> bool {
@@ -131,28 +167,182 @@ fn default_tokens_per_percent() -> u32 {
     20_000
 }
 
+fn default_w_in() -> f64 {
+    1.0
+}
+
+fn default_w_cache() -> f64 {
+    0.15
+}
+
+fn default_w_out() -> f64 {
+    3.5
+}
+
+fn default_tokens_per_cu() -> f64 {
+    1000.0
+}
+
+fn default_sprint_capacity_cu() -> f64 {
+    250.0
+}
+
+fn default_marathon_capacity_cu() -> f64 {
+    2800.0
+}
+
+fn default_cache_is_subset_of_input() -> bool {
+    true
+}
+
+fn default_model_multipliers() -> HashMap<String, f64> {
+    let mut m = HashMap::new();
+    m.insert("gemini-3-flash".into(), 0.25);
+    m.insert("gemini-2.5-flash".into(), 0.25);
+    m.insert("gemini-2.5-flash-lite".into(), 0.1);
+    m.insert("gemini-3.5-flash".into(), 0.25);
+    m.insert("gemini-3.6-flash".into(), 0.15);
+    m.insert("gemini-3.1-pro-high".into(), 1.0);
+    m.insert("gemini-3.1-pro-low".into(), 1.0);
+    m.insert("gemini-3.1-pro-preview".into(), 1.0);
+    m.insert("gemini-3.1-pro".into(), 1.0);
+    m.insert("gemini-3-pro".into(), 1.0);
+    m.insert("gemini-pro-agent".into(), 1.0);
+    m.insert("gemini-3-pro-image".into(), 2.0);
+    m.insert("claude-sonnet-4-6".into(), 3.0);
+    m.insert("claude-sonnet-4-6-thinking".into(), 3.0);
+    m.insert("claude-opus-4-6-thinking".into(), 8.0);
+    m.insert("gpt-oss-120b".into(), 1.5);
+    m.insert("default_fallback".into(), 3.0);
+    m
+}
+
+fn default_family_multipliers() -> Vec<FamilyMultiplier> {
+    vec![
+        FamilyMultiplier {
+            keyword: "flash-lite".into(),
+            multiplier: 0.1,
+        },
+        FamilyMultiplier {
+            keyword: "flash".into(),
+            multiplier: 0.25,
+        },
+        FamilyMultiplier {
+            keyword: "image".into(),
+            multiplier: 2.0,
+        },
+        FamilyMultiplier {
+            keyword: "pro".into(),
+            multiplier: 1.0,
+        },
+        FamilyMultiplier {
+            keyword: "sonnet".into(),
+            multiplier: 3.0,
+        },
+        FamilyMultiplier {
+            keyword: "opus".into(),
+            multiplier: 8.0,
+        },
+    ]
+}
+
 impl QuotaLedgerConfig {
     pub fn new() -> Self {
         Self {
             enabled: true,
             min_burn_pct: 1,
             tokens_per_percent: 20_000,
+            w_in: default_w_in(),
+            w_cache: default_w_cache(),
+            w_out: default_w_out(),
+            tokens_per_cu: default_tokens_per_cu(),
+            sprint_capacity_cu: default_sprint_capacity_cu(),
+            marathon_capacity_cu: default_marathon_capacity_cu(),
+            cache_is_subset_of_input: default_cache_is_subset_of_input(),
+            model_multipliers: default_model_multipliers(),
+            family_multipliers: default_family_multipliers(),
         }
     }
 
-    /// Burn percent for one successful request.
-    /// With usage: max(min_burn, ceil(tokens / tokens_per_percent)).
-    /// Without usage: min_burn only.
-    pub fn compute_burn_pct(&self, total_tokens: Option<u64>) -> i32 {
-        let min_burn = self.min_burn_pct.max(1) as i32;
-        match total_tokens {
-            Some(tokens) if tokens > 0 => {
-                let per = self.tokens_per_percent.max(1) as u64;
-                let from_tokens = ((tokens + per - 1) / per) as i32;
-                min_burn.max(from_tokens)
+    /// Lowercase and strip common vendor prefixes before multiplier lookup.
+    pub fn normalize_model_name_for_multiplier(model: &str) -> String {
+        let mut s = model.trim().to_lowercase();
+        for prefix in ["antigravity/", "models/", "google/", "anthropic/", "openai/"] {
+            if let Some(rest) = s.strip_prefix(prefix) {
+                s = rest.to_string();
             }
-            _ => min_burn,
         }
+        s
+    }
+
+    /// Exact model id → family keyword (first hit) → default_fallback (3.0).
+    pub fn resolve_model_multiplier(&self, model: &str) -> f64 {
+        let key = Self::normalize_model_name_for_multiplier(model);
+        if let Some(m) = self.model_multipliers.get(&key) {
+            return *m;
+        }
+        for fam in &self.family_multipliers {
+            if !fam.keyword.is_empty() && key.contains(&fam.keyword.to_lowercase()) {
+                return fam.multiplier;
+            }
+        }
+        self.model_multipliers
+            .get("default_fallback")
+            .copied()
+            .unwrap_or(3.0)
+    }
+
+    /// Weighted CU burn → integer % of sprint capacity.
+    ///
+    /// ```text
+    /// billable_in = max(0, input - cache)  when cache_is_subset_of_input
+    /// ΔCU = (billable_in×w_in + cache×w_cache + output×w_out) / tokens_per_cu × M
+    /// burn% = max(min_burn, ceil(ΔCU / sprint_capacity × 100))  when any usage
+    /// no usage → min_burn
+    /// ```
+    pub fn compute_burn_pct(
+        &self,
+        model: &str,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+        cached_tokens: Option<u32>,
+    ) -> i32 {
+        let min_burn = self.min_burn_pct.max(1) as i32;
+        let input = input_tokens.unwrap_or(0) as f64;
+        let output = output_tokens.unwrap_or(0) as f64;
+        let cache = cached_tokens.unwrap_or(0) as f64;
+        let has_usage = input_tokens.is_some() || output_tokens.is_some() || cached_tokens.is_some();
+        let any_tokens = input > 0.0 || output > 0.0 || cache > 0.0;
+
+        if !has_usage || !any_tokens {
+            return min_burn;
+        }
+
+        let billable_in = if self.cache_is_subset_of_input {
+            (input - cache).max(0.0)
+        } else {
+            input
+        };
+
+        let tokens_per_cu = if self.tokens_per_cu > 0.0 {
+            self.tokens_per_cu
+        } else {
+            1000.0
+        };
+        let sprint = if self.sprint_capacity_cu > 0.0 {
+            self.sprint_capacity_cu
+        } else {
+            250.0
+        };
+        let m = self.resolve_model_multiplier(model);
+        let weighted =
+            billable_in * self.w_in + cache * self.w_cache + output * self.w_out;
+        let delta_cu = (weighted / tokens_per_cu) * m;
+        if delta_cu <= 0.0 {
+            return min_burn;
+        }
+        let from_cu = (delta_cu / sprint * 100.0).ceil() as i32;
+        min_burn.max(from_cu.max(1))
     }
 }
 

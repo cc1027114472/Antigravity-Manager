@@ -42,19 +42,33 @@ See: `get_proxy_for_account` / `get_effective_standard_client` / `resolve_and_pi
 **Sticky same IP across separate requests** still prefers **one account ↔ one proxy binding**. Unbound + RoundRobin/Random may pick different pool nodes on different tasks; within one batch task the pin keeps them aligned.
 
 ### 3c) Local quota ledger (estimate + calibrate)
-Selection and `quota_protection` prefer **local estimated remaining %** per standard model id (`Account.estimated_quotas`), not the last online snapshot alone.
+Selection and `quota_protection` prefer **local estimated remaining %** per billing group (`Account.estimated_quotas`), not the last online snapshot alone.
 
 | Role | Source |
 |------|--------|
 | Real-time intercept / sort | Local ledger (`estimated_quotas` → in-memory `ProxyToken.model_quotas`) |
-| Calibration | Online `fetch_quota` via `update_account_quota` (overwrites estimates) |
+| Calibration | Online `fetch_quota` via `update_account_quota` (overwrites estimates; prefers official **5h** `remaining_fraction`) |
 | Hard backstop | Google 429 (non-grace): immediate rotate; set `proxy_disabled`, remove from pool, advance serial cursor; rate-limit lock without blocking on realtime quota fetch |
 
-Burn on successful proxy responses (`ProxyMonitor::log_request` → `TokenManager::burn_estimated_quota`):
+Burn on successful proxy responses (`ProxyMonitor::log_request` → `TokenManager::burn_estimated_quota`) uses a **5h Sprint CU** estimate:
 
-- `burn = max(min_burn_pct, ceil(tokens / tokens_per_percent))` (no usage → `min_burn_pct` only)
-- Config: `AppConfig.quota_ledger` (`enabled`, `min_burn_pct` default 1, `tokens_per_percent` default 20000)
-- Threshold compare uses `<=` so reserve at exactly the threshold is protected
+```
+billable_in = max(0, input − cache)   # cache is subset of prompt
+ΔCU = (billable_in×w_in + cache×w_cache + output×w_out) / tokens_per_cu × M(model)
+burn% = max(min_burn_pct, ceil(ΔCU / sprint_capacity_cu × 100))
+# no usage → min_burn_pct only
+```
+
+Defaults (`AppConfig.quota_ledger`):
+- `w_in=1.0`, `w_cache=0.15`, `w_out=3.5` (thinking folded into output)
+- `tokens_per_cu=1000`, `sprint_capacity_cu=250`
+- `marathon_capacity_cu=2800` reserved in config only — **not enforced** locally
+- `min_burn_pct=1`
+- `M(model)`: exact `model_multipliers` → ordered `family_multipliers` (`flash-lite`→`flash`→`image`→`pro`→`sonnet`→`opus`) → `default_fallback` (3.0)
+- Multiplier lookup uses **mapped upstream model** id; debit goes to billing group `gemini` | `claude`
+- Legacy `tokens_per_percent` still deserializes but is unused
+
+Threshold compare uses `<=` so reserve at exactly the threshold is protected.
 - **Threshold-cross calibrate:** when quota protection is on and a monitored billing group first crosses from above the threshold to `<= threshold`, the proxy fetches official quota once (10‑minute cooldown per account+group), overwrites the local ledger via `update_account_quota`, then decides protection from the calibrated %. Calibrate failure falls back to protecting on the local estimate.
 
 **Serial pool vs ledger:** serial advance still keys off `protected_models` / rate limits (AI selection). The ledger only makes protection trip sooner between online refreshes. Both share the same account↔proxy binding table for egress; they are not the same feature.

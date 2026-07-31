@@ -309,27 +309,103 @@ mod tests {
 
     #[test]
     fn burn_without_usage_uses_min() {
-        let cfg = QuotaLedgerConfig {
-            enabled: true,
-            min_burn_pct: 1,
-            tokens_per_percent: 20_000,
-        };
-        assert_eq!(cfg.compute_burn_pct(None), 1);
-        assert_eq!(cfg.compute_burn_pct(Some(0)), 1);
+        let cfg = QuotaLedgerConfig::default();
+        assert_eq!(cfg.compute_burn_pct("gemini-3.1-pro", None, None, None), 1);
+        assert_eq!(
+            cfg.compute_burn_pct("gemini-3.1-pro", Some(0), Some(0), Some(0)),
+            1
+        );
     }
 
     #[test]
-    fn burn_with_usage_takes_max() {
-        let cfg = QuotaLedgerConfig {
-            enabled: true,
-            min_burn_pct: 1,
-            tokens_per_percent: 20_000,
-        };
-        assert_eq!(cfg.compute_burn_pct(Some(100)), 1);
-        assert_eq!(cfg.compute_burn_pct(Some(20_000)), 1);
-        assert_eq!(cfg.compute_burn_pct(Some(20_001)), 2);
-        assert_eq!(cfg.compute_burn_pct(Some(40_000)), 2);
-        assert_eq!(cfg.compute_burn_pct(Some(40_001)), 3);
+    fn burn_pro_input_1000_is_one_pct() {
+        let cfg = QuotaLedgerConfig::default();
+        // ΔCU = 1000/1000 × 1.0 = 1 → ceil(1/250*100) = 1
+        assert_eq!(
+            cfg.compute_burn_pct("gemini-3.1-pro", Some(1000), Some(0), Some(0)),
+            1
+        );
+    }
+
+    #[test]
+    fn burn_cache_subset_not_double_counted() {
+        let cfg = QuotaLedgerConfig::default();
+        // billable_in=600, cache=400 → (600*1 + 400*0.15)/1000 = 0.66 CU → 1%
+        let with_cache =
+            cfg.compute_burn_pct("gemini-3.1-pro", Some(1000), Some(0), Some(400));
+        assert_eq!(with_cache, 1);
+
+        // Same tokens all as non-cached input would be 1 CU → 1%
+        // Larger burn when cache is NOT subtracted (verify subset path is cheaper than full input)
+        let mut no_subset = QuotaLedgerConfig::default();
+        no_subset.cache_is_subset_of_input = false;
+        let double =
+            no_subset.compute_burn_pct("gemini-3.1-pro", Some(1000), Some(0), Some(400));
+        // (1000*1 + 400*0.15)/1000 = 1.06 CU → ceil(1.06/250*100)=1 still
+        // Use bigger numbers to see difference:
+        let subset_big =
+            cfg.compute_burn_pct("gemini-3.1-pro", Some(50_000), Some(0), Some(40_000));
+        // billable=10000 + cache*0.15=6000 → 16 CU → ceil(16/250*100)=7
+        assert_eq!(subset_big, 7);
+        let full_big =
+            no_subset.compute_burn_pct("gemini-3.1-pro", Some(50_000), Some(0), Some(40_000));
+        // 50k + 6k = 56 CU → ceil(56/250*100)=23
+        assert_eq!(full_big, 23);
+        assert!(full_big > subset_big);
+    }
+
+    #[test]
+    fn burn_flash_cheaper_than_pro_opus_more() {
+        let cfg = QuotaLedgerConfig::default();
+        // in=10000, out=0 → weighted CU base = 10
+        let pro = cfg.compute_burn_pct("gemini-3.1-pro-high", Some(10_000), Some(0), None);
+        let flash = cfg.compute_burn_pct("gemini-3-flash", Some(10_000), Some(0), None);
+        let opus =
+            cfg.compute_burn_pct("claude-opus-4-6-thinking", Some(10_000), Some(0), None);
+        // Pro: 10 CU → 4%; Flash 0.25× → 2.5 CU → 1%; Opus 8× → 80 CU → 32%
+        assert_eq!(pro, 4);
+        assert_eq!(flash, 1);
+        assert_eq!(opus, 32);
+        assert!(flash < pro);
+        assert!(opus > pro);
+    }
+
+    #[test]
+    fn resolve_multiplier_exact_family_fallback() {
+        let cfg = QuotaLedgerConfig::default();
+        assert!((cfg.resolve_model_multiplier("gemini-3-flash") - 0.25).abs() < 1e-9);
+        assert!((cfg.resolve_model_multiplier("claude-sonnet-4-6-thinking") - 3.0).abs() < 1e-9);
+        // Family: sonnet via keyword when not exact... wait exact exists for thinking.
+        // Unknown model → fallback 3.0
+        assert!((cfg.resolve_model_multiplier("some-unknown-model-xyz") - 3.0).abs() < 1e-9);
+        // Family flash-lite before flash
+        assert!((cfg.resolve_model_multiplier("gemini-custom-flash-lite") - 0.1).abs() < 1e-9);
+        // Prefix strip
+        assert!(
+            (cfg.resolve_model_multiplier("antigravity/gemini-3-flash") - 0.25).abs() < 1e-9
+        );
+        // image before pro for unmatched image ids
+        assert!((cfg.resolve_model_multiplier("nano-banana-image") - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn burn_tiny_nonzero_ceils_to_min() {
+        let cfg = QuotaLedgerConfig::default();
+        // 10 input tokens Pro → 0.01 CU → ceil(0.004)=1%
+        assert_eq!(
+            cfg.compute_burn_pct("gemini-3.1-pro", Some(10), Some(0), None),
+            1
+        );
+    }
+
+    #[test]
+    fn burn_output_weighted_higher() {
+        let cfg = QuotaLedgerConfig::default();
+        // 1000 out × 3.5 / 1000 = 3.5 CU → ceil(3.5/250*100)=2
+        assert_eq!(
+            cfg.compute_burn_pct("gemini-3.1-pro", Some(0), Some(1000), None),
+            2
+        );
     }
 
     #[test]
