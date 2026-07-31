@@ -5,6 +5,7 @@ import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
 import { formatCompactDuration, getLiveLimitForModel, getLiveLimitState } from '../../utils/liveLimit';
 import { getModelProtectionKey, findQuotaModel, findImageQuotaModel } from '../../config/modelConfig';
+import { formatQuotaTooltip, getDisplayQuotaModels } from '../../utils/quotaDisplay';
 
 interface AccountRowProps {
     account: Account;
@@ -26,11 +27,12 @@ interface AccountRowProps {
 
 function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice }: AccountRowProps) {
     const { t } = useTranslation();
-    // [重构] 按优先级查找配额模型
-    const geminiProModel = findQuotaModel(account.quota?.models, 'gemini-pro');
-    const geminiFlashModel = findQuotaModel(account.quota?.models, 'gemini-flash');
+    const displayModels = getDisplayQuotaModels(account);
+    // [重构] 按优先级查找配额模型（本地账本优先）
+    const geminiProModel = findQuotaModel(displayModels, 'gemini-pro');
+    const geminiFlashModel = findQuotaModel(displayModels, 'gemini-flash');
 
-    const geminiImageModel = findImageQuotaModel(account.quota?.models);
+    const geminiImageModel = findImageQuotaModel(displayModels);
     const imageProtectionKey = getModelProtectionKey(geminiImageModel?.name || '');
     const liveImageLimit = getLiveLimitForModel(account, geminiImageModel?.name, imageProtectionKey ?? undefined);
     const liveImageState = getLiveLimitState(liveImageLimit);
@@ -44,9 +46,9 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
             `Quota snapshot can still show ${geminiImageModel?.percentage || 0}%.`,
             liveImageLimit.message ? `Message: ${liveImageLimit.message}` : null,
         ].filter(Boolean).join(' ')
-        : 'Gemini 3.1 Flash Image';
+        : formatQuotaTooltip(geminiImageModel?.percentage, geminiImageModel?.officialPercentage) || 'Gemini 3.1 Flash Image';
 
-    const claudeModel = findQuotaModel(account.quota?.models, 'claude');
+    const claudeModel = findQuotaModel(displayModels, 'claude');
     const isDisabled = Boolean(account.disabled);
 
     // 颜色映射，避免动态类名被 Tailwind purge
@@ -199,7 +201,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                 <span className={cn("w-[36px] text-right font-bold transition-colors",
                                     getQuotaColor(geminiProModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
                                         getQuotaColor(geminiProModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                )}>
+                                )} title={formatQuotaTooltip(geminiProModel?.percentage, geminiProModel?.officialPercentage)}>
                                     {geminiProModel ? `${geminiProModel.percentage}%` : '-'}
                                 </span>
                             </div>
@@ -231,7 +233,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                 <span className={cn("w-[36px] text-right font-bold transition-colors",
                                     getQuotaColor(geminiFlashModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
                                         getQuotaColor(geminiFlashModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                )}>
+                                )} title={formatQuotaTooltip(geminiFlashModel?.percentage, geminiFlashModel?.officialPercentage)}>
                                     {geminiFlashModel ? `${geminiFlashModel.percentage}%` : '-'}
                                 </span>
                             </div>
@@ -265,7 +267,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                     isImageLiveLimited ? (liveImageState.isActive ? 'text-rose-600 dark:text-rose-400' : 'text-amber-600 dark:text-amber-400') :
                                         getQuotaColor(geminiImageModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
                                         getQuotaColor(geminiImageModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                )}>
+                                )} title={isImageLiveLimited ? imageLimitTitle : formatQuotaTooltip(geminiImageModel?.percentage, geminiImageModel?.officialPercentage)}>
                                     {isImageLiveLimited ? `${liveImageLimit?.status || 'ERR'}` : (geminiImageModel ? `${geminiImageModel.percentage}%` : '-')}
                                 </span>
                             </div>
@@ -297,7 +299,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                 <span className={cn("w-[36px] text-right font-bold transition-colors",
                                     getQuotaColor(claudeModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
                                         getQuotaColor(claudeModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                )}>
+                                )} title={formatQuotaTooltip(claudeModel?.percentage, claudeModel?.officialPercentage)}>
                                     {claudeModel ? `${claudeModel.percentage}%` : '-'}
                                 </span>
                             </div>

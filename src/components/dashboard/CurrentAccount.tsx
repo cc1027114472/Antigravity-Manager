@@ -1,7 +1,12 @@
 import { CheckCircle, Mail, Diamond, Gem, Circle, Tag, Lock, Clock } from 'lucide-react';
 import { Account } from '../../types/account';
 import { formatTimeRemaining } from '../../utils/format';
-import { findQuotaModel, getModelProtectionKey, getModelDisplayName, findImageQuotaModel } from '../../config/modelConfig';
+import { getModelProtectionKey, getModelDisplayName } from '../../config/modelConfig';
+import {
+    findDisplayImageQuotaModel,
+    findDisplayQuotaModel,
+    formatQuotaTooltip,
+} from '../../utils/quotaDisplay';
 
 interface CurrentAccountProps {
     account: Account | null;
@@ -26,10 +31,10 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
         );
     }
 
-    const geminiProModel = findQuotaModel(account.quota?.models, 'gemini-pro');
-    const geminiFlashModel = findQuotaModel(account.quota?.models, 'gemini-flash');
+    const geminiProModel = findDisplayQuotaModel(account, 'gemini-pro');
+    const geminiFlashModel = findDisplayQuotaModel(account, 'gemini-flash');
 
-    const geminiImageModel = findImageQuotaModel(account.quota?.models);
+    const geminiImageModel = findDisplayImageQuotaModel(account);
     const nowSeconds = Math.floor(Date.now() / 1000);
     const imageProtectionKey = getModelProtectionKey(geminiImageModel?.name || '');
     const liveImageLimit = imageProtectionKey
@@ -37,7 +42,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
         : undefined;
     const isImageLiveLimited = Boolean(liveImageLimit && liveImageLimit.until > nowSeconds);
 
-    const claudeModel = findQuotaModel(account.quota?.models, 'claude');
+    const claudeModel = findDisplayQuotaModel(account, 'claude');
 
     return (
         <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 h-full flex flex-col">
@@ -99,9 +104,12 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                                 <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(geminiProModel.reset_time).toLocaleString()}`}>
                                     {geminiProModel.reset_time ? `R: ${formatTimeRemaining(geminiProModel.reset_time)}` : t('common.unknown')}
                                 </span>
-                                <span className={`text-xs font-bold ${geminiProModel.percentage >= 50 ? 'text-emerald-600 dark:text-emerald-400' :
+                                <span
+                                    className={`text-xs font-bold ${geminiProModel.percentage >= 50 ? 'text-emerald-600 dark:text-emerald-400' :
                                     geminiProModel.percentage >= 20 ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                    }`}>
+                                    }`}
+                                    title={formatQuotaTooltip(geminiProModel.percentage, geminiProModel.officialPercentage)}
+                                >
                                     {geminiProModel.percentage}%
                                 </span>
                             </div>
@@ -130,9 +138,12 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                                 <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(geminiImageModel.reset_time).toLocaleString()}`}>
                                     {geminiImageModel.reset_time ? `R: ${formatTimeRemaining(geminiImageModel.reset_time)}` : t('common.unknown')}
                                 </span>
-                                <span className={`text-xs font-bold ${geminiImageModel.percentage >= 50 ? 'text-emerald-600 dark:text-emerald-400' :
+                                <span
+                                    className={`text-xs font-bold ${geminiImageModel.percentage >= 50 ? 'text-emerald-600 dark:text-emerald-400' :
                                     geminiImageModel.percentage >= 20 ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                    }`}>
+                                    }`}
+                                    title={formatQuotaTooltip(geminiImageModel.percentage, geminiImageModel.officialPercentage)}
+                                >
                                     {geminiImageModel.percentage}%
                                 </span>
                             </div>
@@ -161,9 +172,12 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                                 <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(geminiFlashModel.reset_time).toLocaleString()}`}>
                                     {geminiFlashModel.reset_time ? `R: ${formatTimeRemaining(geminiFlashModel.reset_time)}` : t('common.unknown')}
                                 </span>
-                                <span className={`text-xs font-bold ${geminiFlashModel.percentage >= 50 ? 'text-emerald-600 dark:text-emerald-400' :
+                                <span
+                                    className={`text-xs font-bold ${geminiFlashModel.percentage >= 50 ? 'text-emerald-600 dark:text-emerald-400' :
                                     geminiFlashModel.percentage >= 20 ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                    }`}>
+                                    }`}
+                                    title={formatQuotaTooltip(geminiFlashModel.percentage, geminiFlashModel.officialPercentage)}
+                                >
                                     {geminiFlashModel.percentage}%
                                 </span>
                             </div>
@@ -192,9 +206,12 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                                 <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(claudeModel.reset_time).toLocaleString()}`}>
                                     {claudeModel.reset_time ? `R: ${formatTimeRemaining(claudeModel.reset_time)}` : t('common.unknown')}
                                 </span>
-                                <span className={`text-xs font-bold ${claudeModel.percentage >= 50 ? 'text-cyan-600 dark:text-cyan-400' :
+                                <span
+                                    className={`text-xs font-bold ${claudeModel.percentage >= 50 ? 'text-cyan-600 dark:text-cyan-400' :
                                     claudeModel.percentage >= 20 ? 'text-orange-600 dark:text-orange-400' : 'text-rose-600 dark:text-rose-400'
-                                    }`}>
+                                    }`}
+                                    title={formatQuotaTooltip(claudeModel.percentage, claudeModel.officialPercentage)}
+                                >
                                     {claudeModel.percentage}%
                                 </span>
                             </div>

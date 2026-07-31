@@ -63,6 +63,8 @@ Headless calibration: Rust ticker `modules/quota_calibration.rs` follows `auto_r
 
 When `quota_ledger.enabled=false`, protection/selection fall back to the online `quota` snapshot only.
 
+**UI display:** bars and ranks use local ledger via `getDisplayQuotaModels` ([`src/utils/quotaDisplay.ts`](../../src/utils/quotaDisplay.ts)); official % is tooltip/校验 only. After refresh, calibration overwrites local estimates so UI aligns with Google until the next burns.
+
 ### 4) UI surfaces disabled state and blocks actions
 The accounts UI reads `disabled` fields and shows a “Disabled” badge and tooltip, and disables “switch / refresh” controls:
 - Account type includes `disabled*` fields: [`src/types/account.ts`](../../src/types/account.ts)

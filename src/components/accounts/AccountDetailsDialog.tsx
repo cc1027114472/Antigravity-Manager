@@ -5,6 +5,7 @@ import { Account } from '../../types/account';
 import { formatDate } from '../../utils/format';
 import { useTranslation } from 'react-i18next';
 import { MODEL_CONFIG, sortModels } from '../../config/modelConfig';
+import { formatQuotaTooltip, getDisplayQuotaModels } from '../../utils/quotaDisplay';
 
 interface AccountDetailsDialogProps {
     account: Account | null;
@@ -106,8 +107,8 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             {(() => {
                                 const uniqueLabels = new Set<string>();
-                                return sortModels(
-                                    (account.quota?.models || []).map(model => {
+                                const models = sortModels(
+                                    getDisplayQuotaModels(account).map(model => {
                                         const config = MODEL_CONFIG[model.name.toLowerCase()];
                                         const label = model.display_name || (config?.i18nKey ? t(config.i18nKey) : (config?.label || model.name));
                                         return {
@@ -120,7 +121,18 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                                     if (uniqueLabels.has(m.label)) return false;
                                     uniqueLabels.add(m.label);
                                     return true;
-                                }).map(({ model, label }) => (
+                                });
+
+                                if (models.length === 0) {
+                                    return (
+                                        <div className="col-span-2 py-10 text-center text-gray-400 flex flex-col items-center">
+                                            <AlertCircle className="w-8 h-8 mb-2 opacity-20" />
+                                            <span>{t('accounts.no_data')}</span>
+                                        </div>
+                                    );
+                                }
+
+                                return models.map(({ model, label }) => (
                                     <div key={model.name} className="p-4 rounded-xl border border-gray-100 dark:border-base-200 bg-white dark:bg-base-100 hover:border-blue-100 dark:hover:border-blue-900 hover:shadow-sm transition-all group">
                                         <div className="flex justify-between items-start mb-3">
                                             <div className="flex flex-col gap-1">
@@ -144,8 +156,16 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                                                     model.percentage >= 20 ? 'bg-orange-50 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400' :
                                                         'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400'
                                                     }`}
+                                                title={formatQuotaTooltip(model.percentage, model.officialPercentage)}
                                             >
                                                 {model.percentage}%
+                                                {model.officialPercentage !== undefined
+                                                    && model.officialPercentage !== model.percentage
+                                                    && (
+                                                        <span className="ml-1 font-normal opacity-70">
+                                                            (官方 {model.officialPercentage}%)
+                                                        </span>
+                                                    )}
                                             </span>
                                         </div>
 
@@ -166,12 +186,7 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                                         </div>
                                     </div>
                                 ));
-                            })() || (
-                                    <div className="col-span-2 py-10 text-center text-gray-400 flex flex-col items-center">
-                                        <AlertCircle className="w-8 h-8 mb-2 opacity-20" />
-                                        <span>{t('accounts.no_data')}</span>
-                                    </div>
-                                )}
+                            })()}
                         </div>
                     )}
 

@@ -8,6 +8,7 @@ import { QuotaItem } from './QuotaItem';
 import { MODEL_CONFIG, sortModels, getModelProtectionKey, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
+import { formatQuotaTooltip, getDisplayQuotaModels } from '../../utils/quotaDisplay';
 
 interface AccountCardProps {
     account: Account;
@@ -73,8 +74,8 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
         // Build map of friendly labels and icons from DEFAULT_MODELS
         const iconMap = new Map(DEFAULT_MODELS.map(m => [m.id, m.Icon]));
 
-        // Get all models from account (source of truth)
-        const accountModels = account.quota?.models?.map(m => {
+        // Get all models from account (local ledger primary for %)
+        const accountModels = getDisplayQuotaModels(account).map(m => {
             // 注意：DEFAULT_MODELS 现在应该包含 shortLabel，我们需要确保它被正确映射
             // 但 DEFAULT_MODELS 是从 MODEL_CONFIG 生成的，我们需要确保它包含 shortLabel
             // 这里为了安全，直接从 MODEL_CONFIG 获取
@@ -86,7 +87,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                 Icon: iconMap.get(m.name) || Bot,
                 data: m
             };
-        }) || [];
+        });
 
         let models: typeof accountModels;
 
@@ -271,6 +272,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                 isProtected={isModelProtected(model.protectedKey)}
                                 liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                 Icon={model.Icon}
+                                quotaTitle={formatQuotaTooltip(model.data?.percentage, model.data?.officialPercentage)}
                             />
                         ))}
                     </div>

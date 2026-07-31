@@ -6,7 +6,10 @@ import { useNavigate } from 'react-router-dom';
 import AddAccountDialog from '../components/accounts/AddAccountDialog';
 import { showToast } from '../components/common/ToastContainer';
 import BestAccounts from '../components/dashboard/BestAccounts';
-import { findImageQuotaModel, findQuotaModel } from '../config/modelConfig';
+import {
+    findDisplayImageQuotaModel,
+    findDisplayQuotaModel,
+} from '../utils/quotaDisplay';
 import CurrentAccount from '../components/dashboard/CurrentAccount';
 import { exportAccounts } from '../services/accountService';
 import { useAccountStore } from '../stores/useAccountStore';
@@ -33,27 +36,27 @@ function Dashboard() {
         fetchCurrentAccount();
     }, []);
 
-    // 计算统计数据
+    // 计算统计数据（本地账本优先）
     const stats = useMemo(() => {
         const getGeminiProQuota = (a: Account) =>
-            findQuotaModel(a.quota?.models, 'gemini-pro')?.percentage || 0;
+            findDisplayQuotaModel(a, 'gemini-pro')?.percentage || 0;
 
         const geminiQuotas = accounts
             .map(a => getGeminiProQuota(a))
             .filter(q => q > 0);
 
         const geminiImageQuotas = accounts
-            .map(a => findImageQuotaModel(a.quota?.models)?.percentage || 0)
+            .map(a => findDisplayImageQuotaModel(a)?.percentage || 0)
             .filter(q => q > 0);
 
         const claudeQuotas = accounts
-            .map(a => findQuotaModel(a.quota?.models, 'claude')?.percentage || 0)
+            .map(a => findDisplayQuotaModel(a, 'claude')?.percentage || 0)
             .filter(q => q > 0);
 
         const lowQuotaCount = accounts.filter(a => {
             if (a.quota?.is_forbidden) return false;
             const gemini = getGeminiProQuota(a);
-            const claude = findQuotaModel(a.quota?.models, 'claude')?.percentage || 0;
+            const claude = findDisplayQuotaModel(a, 'claude')?.percentage || 0;
             return gemini < 20 || claude < 20;
         }).length;
 

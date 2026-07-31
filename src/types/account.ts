@@ -6,6 +6,8 @@ export interface Account {
     device_profile?: DeviceProfile;
     device_history?: DeviceProfileVersion[];
     quota?: QuotaData;
+    /** Local estimated remaining % per standard model id (selection / UI primary). */
+    estimated_quotas?: Record<string, EstimatedModelQuota>;
     disabled?: boolean;
     disabled_reason?: string;
     disabled_at?: number;
@@ -63,6 +65,16 @@ export interface ModelQuota {
     max_tokens?: number;
     max_output_tokens?: number;
     supported_mime_types?: Record<string, boolean>;
+    /** Online/official % used for tooltip calibration (display merge). */
+    officialPercentage?: number;
+}
+
+/** Local ledger entry (wire: nested camelCase from Rust). */
+export interface EstimatedModelQuota {
+    model: string;
+    percentage: number;
+    lastOnlinePct?: number;
+    lastCalibratedAt?: number;
 }
 
 /** 单个配额桶 (weekly / 5h) */

@@ -1,6 +1,6 @@
 import { TrendingUp } from 'lucide-react';
 import { Account } from '../../types/account';
-import { findQuotaModel } from '../../config/modelConfig';
+import { findDisplayQuotaModel } from '../../utils/quotaDisplay';
 
 interface BestAccountsProps {
     accounts: Account[];
@@ -12,12 +12,12 @@ import { useTranslation } from 'react-i18next';
 
 function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProps) {
     const { t } = useTranslation();
-    // 1. 获取按配额排序的列表 (排除当前账号)
+    // 1. 获取按配额排序的列表 (排除当前账号) — 本地账本优先
     const geminiSorted = accounts
         .filter(a => a.id !== currentAccountId)
         .map(a => {
-            const proQuota = findQuotaModel(a.quota?.models, 'gemini-pro')?.percentage || 0;
-            const flashQuota = findQuotaModel(a.quota?.models, 'gemini-flash')?.percentage || 0;
+            const proQuota = findDisplayQuotaModel(a, 'gemini-pro')?.percentage || 0;
+            const flashQuota = findDisplayQuotaModel(a, 'gemini-flash')?.percentage || 0;
             // 综合评分：Pro 权重更高 (70%)，Flash 权重 30%
             return {
                 ...a,
@@ -31,7 +31,7 @@ function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProp
         .filter(a => a.id !== currentAccountId)
         .map(a => ({
             ...a,
-            quotaVal: findQuotaModel(a.quota?.models, 'claude')?.percentage || 0,
+            quotaVal: findDisplayQuotaModel(a, 'claude')?.percentage || 0,
         }))
         .filter(a => a.quotaVal > 0)
         .sort((a, b) => b.quotaVal - a.quotaVal);

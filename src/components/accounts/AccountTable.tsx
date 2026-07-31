@@ -46,7 +46,7 @@ import {
     Repeat2,
     Terminal,
 } from 'lucide-react';
-import type { Account, ModelQuota } from '../../types/account';
+import type { Account } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
 
@@ -56,6 +56,7 @@ import { MODEL_CONFIG, sortModels, resolveQuotaModels, ensurePinnedImageSelector
 import { categorizeModel, getModelProtectionKey } from '../../utils/modelCategory';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
+import { formatQuotaTooltip, getDisplayQuotaModels, type DisplayModelQuota } from '../../utils/quotaDisplay';
 
 // ============================================================================
 // 类型定义
@@ -320,21 +321,22 @@ function AccountRowContent({
         config?.pinned_quota_models?.models || Object.keys(MODEL_CONFIG),
     );
 
-    // 根据 show_all 状态决定显示哪些模型
+    // 根据 show_all 状态决定显示哪些模型（本地账本优先）
     const uniqueLabels = new Set<string>();
+    const ledgerModels = getDisplayQuotaModels(account);
     const displayModels = sortModels(
         (showAllQuotas
-            ? (account.quota?.models || []).map(m => {
+            ? ledgerModels.map(m => {
                 const config = MODEL_CONFIG[m.name.toLowerCase()];
                 const label = m.display_name || (config?.i18nKey ? t(config.i18nKey) : (config?.shortLabel || config?.label || m.name));
                 return {
                     id: m.name.toLowerCase(),
                     label: label,
                     protectedKey: config?.protectedKey || m.name.toLowerCase(),
-                    data: m
+                    data: m as DisplayModelQuota
                 };
             })
-            : resolveQuotaModels(account.quota?.models, pinnedModels).map(sel => {
+            : resolveQuotaModels(ledgerModels, pinnedModels).map(sel => {
                 const selectorConfig = MODEL_CONFIG[sel.selectorId.toLowerCase()];
                 const resolvedConfig = sel.model ? MODEL_CONFIG[sel.model.name.toLowerCase()] : undefined;
                 if (!selectorConfig && !sel.model) return null;
@@ -348,9 +350,9 @@ function AccountRowContent({
                     id: sel.model?.name.toLowerCase() ?? sel.selectorId.toLowerCase(),
                     label,
                     protectedKey: getModelProtectionKey(sel.model?.name ?? sel.selectorId) ?? resolvedConfig?.protectedKey ?? selectorConfig?.protectedKey ?? sel.selectorId,
-                    data: sel.model,
+                    data: sel.model as DisplayModelQuota | undefined,
                 };
-            }).filter((item): item is { id: string; label: string; protectedKey: string; data: ModelQuota | undefined } => item !== null)
+            }).filter((item): item is { id: string; label: string; protectedKey: string; data: DisplayModelQuota | undefined } => item !== null)
     ).filter(m => {
             // 过滤特定的 Claude/Gemini 思考变体 (在列表页隐藏)
             const isHiddenThinking = m.id.includes('thinking');
@@ -552,6 +554,7 @@ function AccountRowContent({
                                     isProtected={isModelProtected(account.protected_models, model.protectedKey)}
                                     liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                     Icon={MODEL_CONFIG[model.id]?.Icon || Bot}
+                                    quotaTitle={formatQuotaTooltip(modelData?.percentage, modelData?.officialPercentage)}
                                 />
                             );
                         })}

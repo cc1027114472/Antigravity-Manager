@@ -14,9 +14,11 @@ interface QuotaItemProps {
     liveLimit?: LiveLimitStatus;
     className?: string;
     Icon?: React.ComponentType<{ size?: number; className?: string }>;
+    /** Hover text for local vs official calibration */
+    quotaTitle?: string;
 }
 
-export function QuotaItem({ label, percentage, resetTime, isProtected, liveLimit, className, Icon }: QuotaItemProps) {
+export function QuotaItem({ label, percentage, resetTime, isProtected, liveLimit, className, Icon, quotaTitle }: QuotaItemProps) {
     const { t } = useTranslation();
     const liveState = getLiveLimitState(liveLimit);
     const showLiveIssue = liveState.shouldShow;
@@ -68,7 +70,7 @@ export function QuotaItem({ label, percentage, resetTime, isProtected, liveLimit
             liveState.isActive && "border-rose-400/70 dark:border-rose-500/70 bg-rose-50/80 dark:bg-rose-950/30 ring-rose-400/30",
             className
         )}
-            title={showLiveIssue ? liveLimitTitle : label}
+            title={showLiveIssue ? liveLimitTitle : (quotaTitle || label)}
         >
             {/* Background Progress Bar */}
             <div

@@ -9,7 +9,11 @@ import { useTranslation } from 'react-i18next';
 import clsx from 'clsx';
 import { formatTimeRemaining, formatCompactNumber } from '../../utils/format';
 import { enterMiniMode, exitMiniMode } from '../../utils/windowManager';
-import { getModelDisplayName, findQuotaModel } from '../../config/modelConfig';
+import { getModelDisplayName } from '../../config/modelConfig';
+import {
+    findDisplayQuotaModel,
+    formatQuotaTooltip,
+} from '../../utils/quotaDisplay';
 import { getVersion } from '@tauri-apps/api/app';
 import { listen } from '@tauri-apps/api/event';
 
@@ -135,11 +139,11 @@ export default function MiniView() {
     };
 
 
-    // Extract specific models to match AccountRow.tsx
-    const geminiProModel = findQuotaModel(currentAccount?.quota?.models, 'gemini-pro');
-    const geminiFlashModel = findQuotaModel(currentAccount?.quota?.models, 'gemini-flash');
+    // Extract specific models to match AccountRow.tsx (local ledger primary)
+    const geminiProModel = findDisplayQuotaModel(currentAccount, 'gemini-pro');
+    const geminiFlashModel = findDisplayQuotaModel(currentAccount, 'gemini-flash');
 
-    const claudeModel = findQuotaModel(currentAccount?.quota?.models, 'claude');
+    const claudeModel = findDisplayQuotaModel(currentAccount, 'claude');
 
     // Helper to render a model row
     const renderModelRow = (model: any, displayName: string, colorClass: string) => {
@@ -158,12 +162,15 @@ export default function MiniView() {
             return 'bg-gradient-to-r from-rose-400 to-rose-500';
         };
 
+        const tip = formatQuotaTooltip(model.percentage, model.officialPercentage);
+
         return (
             <motion.div
                 layout
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 className="space-y-1.5"
+                title={tip || undefined}
             >
                 <div className="flex justify-between items-baseline">
                     <span className="text-xs font-medium text-gray-600 dark:text-gray-400">{displayName}</span>
