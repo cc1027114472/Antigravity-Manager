@@ -61,7 +61,7 @@ burn% = max(min_burn_pct, ceil(ΔCU / sprint_capacity_cu × 100))
 
 Defaults (`AppConfig.quota_ledger`):
 - `w_in=1.0`, `w_cache=0.15`, `w_out=3.5` (thinking folded into output)
-- `tokens_per_cu=1000`, `sprint_capacity_cu=250`
+- `tokens_per_cu=1000`, `sprint_capacity_cu=500`
 - `marathon_capacity_cu=2800` reserved in config only — **not enforced** locally
 - `min_burn_pct=1`
 - `M(model)`: exact `model_multipliers` → ordered `family_multipliers` (`flash-lite`→`flash`→`image`→`pro`→`sonnet`→`opus`) → `default_fallback` (3.0)

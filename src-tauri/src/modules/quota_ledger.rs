@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn burn_pro_input_1000_is_one_pct() {
         let cfg = QuotaLedgerConfig::default();
-        // ΔCU = 1000/1000 × 1.0 = 1 → ceil(1/250*100) = 1
+        // ΔCU = 1000/1000 × 1.0 = 1 → ceil(1/500*100) = 1
         assert_eq!(
             cfg.compute_burn_pct("gemini-3.1-pro", Some(1000), Some(0), Some(0)),
             1
@@ -341,16 +341,16 @@ mod tests {
         no_subset.cache_is_subset_of_input = false;
         let double =
             no_subset.compute_burn_pct("gemini-3.1-pro", Some(1000), Some(0), Some(400));
-        // (1000*1 + 400*0.15)/1000 = 1.06 CU → ceil(1.06/250*100)=1 still
+        // (1000*1 + 400*0.15)/1000 = 1.06 CU → ceil(1.06/500*100)=1 still
         // Use bigger numbers to see difference:
         let subset_big =
             cfg.compute_burn_pct("gemini-3.1-pro", Some(50_000), Some(0), Some(40_000));
-        // billable=10000 + cache*0.15=6000 → 16 CU → ceil(16/250*100)=7
-        assert_eq!(subset_big, 7);
+        // billable=10000 + cache*0.15=6000 → 16 CU → ceil(16/500*100)=4
+        assert_eq!(subset_big, 4);
         let full_big =
             no_subset.compute_burn_pct("gemini-3.1-pro", Some(50_000), Some(0), Some(40_000));
-        // 50k + 6k = 56 CU → ceil(56/250*100)=23
-        assert_eq!(full_big, 23);
+        // 50k + 6k = 56 CU → ceil(56/500*100)=12
+        assert_eq!(full_big, 12);
         assert!(full_big > subset_big);
     }
 
@@ -362,10 +362,10 @@ mod tests {
         let flash = cfg.compute_burn_pct("gemini-3-flash", Some(10_000), Some(0), None);
         let opus =
             cfg.compute_burn_pct("claude-opus-4-6-thinking", Some(10_000), Some(0), None);
-        // Pro: 10 CU → 4%; Flash 0.25× → 2.5 CU → 1%; Opus 8× → 80 CU → 32%
-        assert_eq!(pro, 4);
+        // Pro: 10 CU → 2%; Flash 0.25× → 2.5 CU → 1%; Opus 8× → 80 CU → 16%
+        assert_eq!(pro, 2);
         assert_eq!(flash, 1);
-        assert_eq!(opus, 32);
+        assert_eq!(opus, 16);
         assert!(flash < pro);
         assert!(opus > pro);
     }
@@ -401,11 +401,15 @@ mod tests {
     #[test]
     fn burn_output_weighted_higher() {
         let cfg = QuotaLedgerConfig::default();
-        // 1000 out × 3.5 / 1000 = 3.5 CU → ceil(3.5/250*100)=2
-        assert_eq!(
-            cfg.compute_burn_pct("gemini-3.1-pro", Some(0), Some(1000), None),
-            2
-        );
+        // 10_000 out × 3.5 / 1000 = 35 CU → ~ceil(35/500*100) (f64 may ceil 7.0→8)
+        // 10_000 in → 10 CU → 2%
+        let out_burn =
+            cfg.compute_burn_pct("gemini-3.1-pro", Some(0), Some(10_000), None);
+        let in_burn =
+            cfg.compute_burn_pct("gemini-3.1-pro", Some(10_000), Some(0), None);
+        assert_eq!(in_burn, 2);
+        assert!(out_burn > in_burn);
+        assert!((7..=8).contains(&out_burn));
     }
 
     #[test]

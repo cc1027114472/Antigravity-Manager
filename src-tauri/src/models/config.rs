@@ -184,7 +184,7 @@ fn default_tokens_per_cu() -> f64 {
 }
 
 fn default_sprint_capacity_cu() -> f64 {
-    250.0
+    500.0
 }
 
 fn default_marathon_capacity_cu() -> f64 {
@@ -332,7 +332,7 @@ impl QuotaLedgerConfig {
         let sprint = if self.sprint_capacity_cu > 0.0 {
             self.sprint_capacity_cu
         } else {
-            250.0
+            500.0
         };
         let m = self.resolve_model_multiplier(model);
         let weighted =
