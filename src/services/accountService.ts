@@ -221,3 +221,13 @@ export async function updateAccountLabel(accountId: string, label: string): Prom
     return await invoke('update_account_label', { accountId, label });
 }
 
+export async function updateAccountMaxConcurrency(
+    accountId: string,
+    maxConcurrency?: number | null
+): Promise<void> {
+    return await invoke('update_account_max_concurrency', {
+        accountId,
+        maxConcurrency: maxConcurrency && maxConcurrency > 0 ? maxConcurrency : null,
+    });
+}
+

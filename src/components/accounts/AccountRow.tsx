@@ -8,6 +8,7 @@ import { useConfigStore } from '../../stores/useConfigStore';
 import { QuotaItem } from './QuotaItem';
 import { Gemini, Claude } from '@lobehub/icons';
 import { MODEL_CONFIG } from '../../config/modelConfig';
+import { MaxConcurrencyInput } from './MaxConcurrencyInput';
 
 interface AccountRowProps {
     account: Account;
@@ -23,9 +24,10 @@ interface AccountRowProps {
     onExport: () => void;
     onDelete: () => void;
     onToggleProxy: () => void;
+    onUpdateMaxConcurrency?: (maxConcurrency: number | null) => void;
 }
 
-function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice }: AccountRowProps) {
+function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onUpdateMaxConcurrency }: AccountRowProps) {
     const { t } = useTranslation();
     const { config, showAllQuotas } = useConfigStore();
     const displayModels = getListQuotaDisplays(account, {
@@ -180,6 +182,12 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                     <button className="btn btn-ghost btn-xs btn-square" onClick={onExport} title={t('accounts.export')}>
                         <Download className="w-3.5 h-3.5" />
                     </button>
+                    {onUpdateMaxConcurrency && (
+                        <MaxConcurrencyInput
+                            value={account.max_concurrency}
+                            onSave={onUpdateMaxConcurrency}
+                        />
+                    )}
                     <button className="btn btn-ghost btn-xs btn-square" onClick={onToggleProxy} title={t('accounts.toggle_proxy')}>
                         {account.proxy_disabled ? <ToggleLeft className="w-3.5 h-3.5" /> : <ToggleRight className="w-3.5 h-3.5" />}
                     </button>

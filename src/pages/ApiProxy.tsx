@@ -1919,6 +1919,33 @@ print(response.choices[0].message.content)`;
                                                 </div>
                                             </div>
 
+                                            <div className="bg-slate-100 dark:bg-slate-800/80 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
+                                                <div className="flex items-center justify-between mb-2 gap-3">
+                                                    <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
+                                                        {t('proxy.config.concurrency.global_max')}
+                                                        <HelpTooltip text={t('proxy.config.concurrency.global_max_tooltip')} />
+                                                    </label>
+                                                    <input
+                                                        type="number"
+                                                        min={0}
+                                                        className="input input-bordered input-xs w-24 font-mono"
+                                                        placeholder={t('proxy.config.concurrency.unlimited')}
+                                                        value={appConfig.proxy.max_account_concurrency || ''}
+                                                        onChange={(e) => {
+                                                            const raw = e.target.value.trim();
+                                                            const n = raw === '' ? undefined : parseInt(raw, 10);
+                                                            updateProxyConfig({
+                                                                max_account_concurrency:
+                                                                    n && n > 0 ? n : undefined,
+                                                            });
+                                                        }}
+                                                    />
+                                                </div>
+                                                <p className="text-[10px] text-gray-500 dark:text-gray-400 leading-relaxed">
+                                                    {t('proxy.config.concurrency.global_max_hint')}
+                                                </p>
+                                            </div>
+
                                             <div className="p-3 bg-amber-50 dark:bg-amber-900/10 border border-amber-100 dark:border-amber-900/20 rounded-xl">
                                                 <p className="text-[10px] text-amber-700 dark:text-amber-500 leading-relaxed">
                                                     <strong>{t('common.info')}:</strong> {t('proxy.config.scheduling.subtitle')}

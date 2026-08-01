@@ -18,6 +18,8 @@ export interface ProxyConfig {
     upstream_proxy: UpstreamProxyConfig;
     zai?: ZaiConfig;
     scheduling?: StickySessionConfig;
+    /** Global max overlapping in-flight per account. Empty/0 = unlimited. */
+    max_account_concurrency?: number;
     experimental?: ExperimentalConfig;
     user_agent_override?: string;
     saved_user_agent?: string;

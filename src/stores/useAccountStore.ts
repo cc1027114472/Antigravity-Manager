@@ -31,6 +31,7 @@ interface AccountState {
     warmUpAccounts: () => Promise<string>;
     warmUpAccount: (accountId: string) => Promise<string>;
     updateAccountLabel: (accountId: string, label: string) => Promise<void>;
+    updateAccountMaxConcurrency: (accountId: string, maxConcurrency?: number | null) => Promise<void>;
 }
 
 export const useAccountStore = create<AccountState>((set, get) => ({
@@ -311,6 +312,23 @@ export const useAccountStore = create<AccountState>((set, get) => ({
             set({ accounts: updatedAccounts });
         } catch (error) {
             console.error('[AccountStore] Update label failed:', error);
+            throw error;
+        }
+    },
+
+    updateAccountMaxConcurrency: async (accountId: string, maxConcurrency?: number | null) => {
+        try {
+            await accountService.updateAccountMaxConcurrency(accountId, maxConcurrency);
+            const cleaned =
+                maxConcurrency && maxConcurrency > 0 ? maxConcurrency : undefined;
+            const { accounts } = get();
+            set({
+                accounts: accounts.map(acc =>
+                    acc.id === accountId ? { ...acc, max_concurrency: cleaned } : acc
+                ),
+            });
+        } catch (error) {
+            console.error('[AccountStore] Update max concurrency failed:', error);
             throw error;
         }
     },

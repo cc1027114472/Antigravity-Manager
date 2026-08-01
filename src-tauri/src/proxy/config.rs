@@ -652,6 +652,11 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub scheduling: crate::proxy::sticky_config::StickySessionConfig,
 
+    /// Global default max overlapping in-flight requests per account.
+    /// None/0 = unlimited. Per-account `max_concurrency` overrides when set > 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_account_concurrency: Option<u32>,
+
     /// 实验性功能配置
     #[serde(default)]
     pub experimental: ExperimentalConfig,
@@ -762,6 +767,7 @@ impl Default for ProxyConfig {
             upstream_proxy: UpstreamProxyConfig::default(),
             zai: ZaiConfig::default(),
             scheduling: crate::proxy::sticky_config::StickySessionConfig::default(),
+            max_account_concurrency: None,
             experimental: ExperimentalConfig::default(),
             security_monitor: SecurityMonitorConfig::default(),
             preferred_account_id: None, // 默认使用轮询模式

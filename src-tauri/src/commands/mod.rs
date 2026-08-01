@@ -456,6 +456,14 @@ pub async fn save_config(
             .token_manager
             .update_circuit_breaker_config(config.circuit_breaker.clone())
             .await;
+        // 热更新调度与账号并发上限
+        instance
+            .token_manager
+            .update_sticky_config(config.proxy.scheduling.clone())
+            .await;
+        instance
+            .token_manager
+            .update_global_max_concurrency(config.proxy.max_account_concurrency);
         tracing::debug!("已同步热更新反代服务配置");
     }
 
@@ -1116,6 +1124,55 @@ pub async fn update_account_label(account_id: String, label: String) -> Result<(
         } else {
             label
         }
+    ));
+
+    Ok(())
+}
+
+/// 更新账号最大并发（None/0 = 继承全局 / 无限）
+#[tauri::command]
+pub async fn update_account_max_concurrency(
+    account_id: String,
+    max_concurrency: Option<u32>,
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+) -> Result<(), String> {
+    let data_dir = modules::account::get_data_dir()?;
+    let account_path = data_dir
+        .join("accounts")
+        .join(format!("{}.json", account_id));
+
+    if !account_path.exists() {
+        return Err(format!("账号文件不存在: {}", account_id));
+    }
+
+    let content =
+        std::fs::read_to_string(&account_path).map_err(|e| format!("读取账号文件失败: {}", e))?;
+
+    let mut account_json: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("解析账号文件失败: {}", e))?;
+
+    let cleaned = max_concurrency.filter(|&n| n > 0);
+    match cleaned {
+        Some(n) => {
+            account_json["max_concurrency"] = serde_json::Value::Number(n.into());
+        }
+        None => {
+            account_json["max_concurrency"] = serde_json::Value::Null;
+        }
+    }
+
+    let json_str = serde_json::to_string_pretty(&account_json)
+        .map_err(|e| format!("序列化账号数据失败: {}", e))?;
+    std::fs::write(&account_path, json_str).map_err(|e| format!("写入账号文件失败: {}", e))?;
+
+    let instance_lock = proxy_state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        let _ = instance.token_manager.reload_account(&account_id).await;
+    }
+
+    modules::logger::log_info(&format!(
+        "账号并发上限已更新: {} -> {:?}",
+        account_id, cleaned
     ));
 
     Ok(())

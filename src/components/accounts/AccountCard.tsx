@@ -16,6 +16,7 @@ import {
     proxyUsageTooltipKey,
     type ProxyEgressUsage,
 } from '../../utils/proxyUsageStatus';
+import { MaxConcurrencyInput } from './MaxConcurrencyInput';
 
 interface AccountCardProps {
     account: Account;
@@ -33,12 +34,13 @@ interface AccountCardProps {
     onToggleProxy: () => void;
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
+    onUpdateMaxConcurrency?: (maxConcurrency: number | null) => void;
     onViewError: () => void;
     proxyBindingLabel?: string | null;
     proxyUsage?: ProxyEgressUsage;
 }
 
-function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError, proxyBindingLabel, proxyUsage = 'unknown' }: AccountCardProps) {
+function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onUpdateMaxConcurrency, onViewError, proxyBindingLabel, proxyUsage = 'unknown' }: AccountCardProps) {
     const { t } = useTranslation();
     const { config, showAllQuotas } = useConfigStore();
     const isDisabled = Boolean(account.disabled);
@@ -363,6 +365,12 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                     >
                         <Download className="w-3.5 h-3.5" />
                     </button>
+                    {onUpdateMaxConcurrency && (
+                        <MaxConcurrencyInput
+                            value={account.max_concurrency}
+                            onSave={onUpdateMaxConcurrency}
+                        />
+                    )}
                     <button
                         className={cn(
                             "p-1.5 rounded-lg transition-all",

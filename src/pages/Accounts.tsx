@@ -54,6 +54,7 @@ function Accounts() {
     warmUpAccounts,
     warmUpAccount,
     updateAccountLabel,
+    updateAccountMaxConcurrency,
   } = useAccountStore();
   const { config, showAllQuotas, toggleShowAllQuotas } = useConfigStore();
 
@@ -115,6 +116,19 @@ function Accounts() {
       showToast(t('accounts.label_updated', 'Label updated'), 'success');
     } catch (error) {
       showToast(`${t('common.error')}: ${error}`, 'error');
+    }
+  };
+
+  const handleUpdateMaxConcurrency = async (
+    accountId: string,
+    maxConcurrency: number | null,
+  ) => {
+    try {
+      await updateAccountMaxConcurrency(accountId, maxConcurrency);
+      showToast(t('accounts.concurrency.updated'), 'success');
+    } catch (error) {
+      showToast(`${t('common.error')}: ${error}`, 'error');
+      throw error;
     }
   };
 
@@ -1148,6 +1162,7 @@ function Accounts() {
                 onReorder={reorderAccounts}
                 onWarmup={handleWarmup}
                 onUpdateLabel={handleUpdateLabel}
+                onUpdateMaxConcurrency={handleUpdateMaxConcurrency}
                 onViewError={(id: string) => setErrorAccountId(id)}
                 proxyBindings={proxyBindings}
                 proxyNames={proxyNames}
@@ -1179,6 +1194,7 @@ function Accounts() {
               }
               onWarmup={handleWarmup}
               onUpdateLabel={handleUpdateLabel}
+              onUpdateMaxConcurrency={handleUpdateMaxConcurrency}
               onViewError={(id: string) => setErrorAccountId(id)}
               proxyBindings={proxyBindings}
               proxyNames={proxyNames}

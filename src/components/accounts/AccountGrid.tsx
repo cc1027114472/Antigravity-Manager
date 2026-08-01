@@ -19,6 +19,7 @@ interface AccountGridProps {
     onToggleProxy: (accountId: string) => void;
     onWarmup?: (accountId: string) => void;
     onUpdateLabel?: (accountId: string, label: string) => void;
+    onUpdateMaxConcurrency?: (accountId: string, maxConcurrency: number | null) => void;
     onViewError: (accountId: string) => void;
     proxyBindings?: Record<string, string>;
     proxyNames?: Record<string, string>;
@@ -26,7 +27,7 @@ interface AccountGridProps {
 }
 
 
-function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, currentAccountId, switchingAccountId, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError, proxyBindings, proxyNames, proxyUsageStatus }: AccountGridProps) {
+function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, currentAccountId, switchingAccountId, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onUpdateMaxConcurrency, onViewError, proxyBindings, proxyNames, proxyUsageStatus }: AccountGridProps) {
     const { t } = useTranslation();
     if (accounts.length === 0) {
         return (
@@ -62,6 +63,12 @@ function AccountGrid({ accounts, selectedIds, refreshingIds, onToggleSelect, cur
                     onToggleProxy={() => onToggleProxy(account.id)}
                     onWarmup={onWarmup ? () => onWarmup(account.id) : undefined}
                     onUpdateLabel={onUpdateLabel ? (label: string) => onUpdateLabel(account.id, label) : undefined}
+                    onUpdateMaxConcurrency={
+                        onUpdateMaxConcurrency
+                            ? (maxConcurrency: number | null) =>
+                                  onUpdateMaxConcurrency(account.id, maxConcurrency)
+                            : undefined
+                    }
                     onViewError={() => onViewError(account.id)}
                     proxyBindingLabel={proxyBindingLabel}
                     proxyUsage={resolveProxyUsageStatus(proxyId, proxyUsageStatus)}

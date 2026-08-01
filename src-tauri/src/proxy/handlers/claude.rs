@@ -873,7 +873,15 @@ pub async fn handle_messages(
             None => true,
         };
         if need_new {
-            token_manager.replace_inflight(&mut inflight_guard, &account_id);
+            if !token_manager.try_replace_inflight(&mut inflight_guard, &account_id) {
+                tracing::warn!(
+                    "[{}] Account {} at concurrency cap, rotating",
+                    trace_id,
+                    email
+                );
+                force_rotate = true;
+                continue;
+            }
         }
 
         // ===== 【优化】后台任务智能检测与降级 =====

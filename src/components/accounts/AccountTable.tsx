@@ -60,6 +60,7 @@ import {
     resolveProxyUsageStatus,
     type ProxyEgressUsage,
 } from '../../utils/proxyUsageStatus';
+import { MaxConcurrencyInput } from './MaxConcurrencyInput';
 
 // ============================================================================
 // 类型定义
@@ -82,6 +83,7 @@ interface AccountTableProps {
     onToggleProxy: (accountId: string) => void;
     onWarmup?: (accountId: string) => void;
     onUpdateLabel?: (accountId: string, label: string) => void;
+    onUpdateMaxConcurrency?: (accountId: string, maxConcurrency: number | null) => void;
     /** 拖拽排序回调，当用户完成拖拽时触发 */
     onReorder?: (accountIds: string[]) => void;
     onViewError: (accountId: string) => void;
@@ -112,6 +114,7 @@ interface SortableRowProps {
     onToggleProxy: () => void;
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
+    onUpdateMaxConcurrency?: (maxConcurrency: number | null) => void;
     onViewError: () => void;
     proxyBindingLabel?: string | null;
     proxyUsage?: ProxyEgressUsage;
@@ -133,6 +136,7 @@ interface AccountRowContentProps {
     onToggleProxy: () => void;
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
+    onUpdateMaxConcurrency?: (maxConcurrency: number | null) => void;
     onViewError: () => void;
     proxyBindingLabel?: string | null;
     proxyUsage?: ProxyEgressUsage;
@@ -178,6 +182,7 @@ function SortableAccountRow({
     onToggleProxy,
     onWarmup,
     onUpdateLabel,
+    onUpdateMaxConcurrency,
     onViewError,
     proxyBindingLabel,
     proxyUsage,
@@ -247,6 +252,7 @@ function SortableAccountRow({
                 onToggleProxy={onToggleProxy}
                 onWarmup={onWarmup}
                 onUpdateLabel={onUpdateLabel}
+                onUpdateMaxConcurrency={onUpdateMaxConcurrency}
                 onViewError={onViewError}
                 proxyBindingLabel={proxyBindingLabel}
                 proxyUsage={proxyUsage}
@@ -275,6 +281,7 @@ function AccountRowContent({
     onToggleProxy,
     onWarmup,
     onUpdateLabel,
+    onUpdateMaxConcurrency,
     onViewError,
     proxyBindingLabel,
     proxyUsage = 'unknown',
@@ -603,6 +610,12 @@ function AccountRowContent({
                     >
                         <Download className="w-3.5 h-3.5" />
                     </button>
+                    {onUpdateMaxConcurrency && (
+                        <MaxConcurrencyInput
+                            value={account.max_concurrency}
+                            onSave={onUpdateMaxConcurrency}
+                        />
+                    )}
                     <button
                         className={cn(
                             "p-1.5 rounded-lg transition-all",
@@ -658,6 +671,7 @@ function AccountTable({
     onReorder,
     onWarmup,
     onUpdateLabel,
+    onUpdateMaxConcurrency,
     onViewError,
     proxyBindings,
     proxyNames,
@@ -760,6 +774,12 @@ function AccountTable({
                                     onToggleProxy={() => onToggleProxy(account.id)}
                                     onWarmup={onWarmup ? () => onWarmup(account.id) : undefined}
                                     onUpdateLabel={onUpdateLabel ? (label: string) => onUpdateLabel(account.id, label) : undefined}
+                                    onUpdateMaxConcurrency={
+                                        onUpdateMaxConcurrency
+                                            ? (maxConcurrency: number | null) =>
+                                                  onUpdateMaxConcurrency(account.id, maxConcurrency)
+                                            : undefined
+                                    }
                                     onViewError={() => onViewError(account.id)}
                                     proxyBindingLabel={
                                         proxyBindings?.[account.id]

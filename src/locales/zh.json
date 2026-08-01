@@ -128,6 +128,12 @@
     "edit_label": "编辑标签",
     "custom_label_placeholder": "输入自定义标签",
     "label_updated": "标签已更新",
+    "concurrency": {
+      "label": "最大并发",
+      "inherit": "继承",
+      "tooltip": "本账号重叠 in-flight 上限。留空=继承全局；>0=覆盖。触达后换号不排队。",
+      "updated": "账号并发上限已更新"
+    },
     "add_account": "添加账号",
     "sync_local_ledger": "同步本地",
     "sync_local_ledger_done": "已同步本地账本",
@@ -816,6 +822,12 @@
         "clear_bindings_tooltip": "立即断开所有会话与账号的绑定关系，强制下一次请求重新分配账号。",
         "clear_rate_limits": "清除限流记录",
         "clear_rate_limits_tooltip": "立即清除所有账号的本地限流记录，强制下一次请求尝试直接调用上游。"
+      },
+      "concurrency": {
+        "global_max": "全局账号最大并发",
+        "global_max_tooltip": "每个账号同时进行中的重叠请求数上限。留空或 0 表示无限。账号管理里可按号覆盖。",
+        "global_max_hint": "与流量日志中的「并发峰值」同一语义。触达上限时自动换号，不排队。",
+        "unlimited": "无限"
       },
       "serial_pool": {
         "title": "串行号池",

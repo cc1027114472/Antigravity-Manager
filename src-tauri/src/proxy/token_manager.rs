@@ -46,6 +46,8 @@ pub struct ProxyToken {
     pub validation_url: Option<String>, // [NEW] Validation URL (#1522)
     pub model_quotas: HashMap<String, i32>, // [OPTIMIZATION] In-memory cache for model-specific quotas
     pub model_limits: HashMap<String, u64>, // [NEW] max_output_tokens per model from quota data
+    /// Per-account concurrency override (None/0 = inherit global).
+    pub max_concurrency: Option<u32>,
 }
 
 pub struct TokenManager {
@@ -73,8 +75,11 @@ pub struct TokenManager {
     /// Key: "{account_id}:{billing_group}" → last trigger unix seconds.
     threshold_calibrate_cooldown: Arc<DashMap<String, i64>>,
 
-    /// Overlapping in-flight AI requests per account (observability).
+    /// Overlapping in-flight AI requests per account (observability + optional cap).
     account_inflight: Arc<AccountInflightTracker>,
+
+    /// Global default max overlapping in-flight per account (0 = unlimited).
+    global_max_concurrency: Arc<std::sync::atomic::AtomicU32>,
 
     /// 串行号池配置（默认关闭）
     serial_pool: Arc<tokio::sync::RwLock<SerialPoolConfig>>,
@@ -110,6 +115,7 @@ impl TokenManager {
             load_code_assist_inflight: Arc::new(DashMap::new()), // 初始化 inflight 表
             threshold_calibrate_cooldown: Arc::new(DashMap::new()),
             account_inflight: Arc::new(AccountInflightTracker::new()),
+            global_max_concurrency: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             serial_pool: Arc::new(tokio::sync::RwLock::new(SerialPoolConfig::default())),
             advance_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_advance: Arc::new(tokio::sync::RwLock::new(None)),
@@ -124,13 +130,66 @@ impl TokenManager {
         self.account_inflight.begin(account_id)
     }
 
-    /// Replace an existing in-flight guard when rotating accounts.
+    /// Replace an existing in-flight guard when rotating accounts (unlimited).
     pub fn replace_inflight(
         &self,
         guard: &mut Option<AccountInflightGuard>,
         account_id: &str,
     ) {
         crate::proxy::account_inflight::replace_guard(guard, &self.account_inflight, account_id);
+    }
+
+    /// Effective max for an account (account override > global > unlimited).
+    pub fn effective_max_concurrency(&self, account_max: Option<u32>) -> Option<u32> {
+        let global = self.global_max_concurrency.load(std::sync::atomic::Ordering::Relaxed);
+        let global = if global == 0 { None } else { Some(global) };
+        crate::proxy::account_inflight::effective_max(account_max, global)
+    }
+
+    /// Look up cached account max_concurrency (if account is in the pool).
+    pub fn account_max_concurrency(&self, account_id: &str) -> Option<u32> {
+        self.tokens
+            .get(account_id)
+            .and_then(|t| t.max_concurrency.filter(|&n| n > 0))
+    }
+
+    /// True when account is at its effective concurrency cap.
+    pub fn is_concurrency_full(&self, account_id: &str) -> bool {
+        let account_max = self.account_max_concurrency(account_id);
+        let max = self.effective_max_concurrency(account_max);
+        self.account_inflight.is_at_capacity(account_id, max)
+    }
+
+    /// Try to acquire / replace in-flight slot under the account's effective max.
+    /// Returns false if at capacity (caller should rotate).
+    pub fn try_replace_inflight(
+        &self,
+        guard: &mut Option<AccountInflightGuard>,
+        account_id: &str,
+    ) -> bool {
+        let account_max = self.account_max_concurrency(account_id);
+        let max = self.effective_max_concurrency(account_max);
+        crate::proxy::account_inflight::try_replace_guard(
+            guard,
+            &self.account_inflight,
+            account_id,
+            max,
+        )
+    }
+
+    /// Update global max concurrency (0 / None = unlimited).
+    pub fn update_global_max_concurrency(&self, max: Option<u32>) {
+        let v = max.filter(|&n| n > 0).unwrap_or(0);
+        self.global_max_concurrency
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            "[Concurrency] Global max_account_concurrency set to {}",
+            if v == 0 {
+                "unlimited".to_string()
+            } else {
+                v.to_string()
+            }
+        );
     }
 
     /// Current overlapping in-flight count for an account (observability).
@@ -702,6 +761,11 @@ impl TokenManager {
                 .map(|s| s.to_string()),
             model_quotas,
             model_limits,
+            max_concurrency: account
+                .get("max_concurrency")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .filter(|&n| n > 0),
         }))
     }
 
@@ -1903,8 +1967,10 @@ impl TokenManager {
                             .await;
                         let is_quota_protected = quota_protection_enabled
                             && preferred_token.protected_models.contains(&billing_target);
+                        let is_concurrency_full =
+                            self.is_concurrency_full(&preferred_token.account_id);
 
-                        if !is_rate_limited && !is_quota_protected {
+                        if !is_rate_limited && !is_quota_protected && !is_concurrency_full {
                             tracing::info!(
                                 "🔒 [FIX #820] Using preferred account: {} (fixed mode)",
                                 preferred_token.email
@@ -2088,6 +2154,12 @@ impl TokenManager {
                                 bound_token.email, reset_sec
                             );
                             self.session_accounts.remove(sid);
+                        } else if self.is_concurrency_full(&bound_id) {
+                            tracing::debug!(
+                                "Sticky Session: Bound account {} at concurrency cap, unbinding and switching.",
+                                bound_token.email
+                            );
+                            self.session_accounts.remove(sid);
                         } else if !attempted.contains(&bound_id)
                             && !(quota_protection_enabled
                                 && bound_token.protected_models.contains(&normalized_target))
@@ -2132,6 +2204,7 @@ impl TokenManager {
                                 .await
                                 && !(quota_protection_enabled
                                     && found.protected_models.contains(&normalized_target))
+                                && !self.is_concurrency_full(&found.account_id)
                             {
                                 tracing::debug!(
                                     "60s Window: Force reusing last account: {}",
@@ -2147,6 +2220,11 @@ impl TokenManager {
                                         "60s Window: Last account {} is rate-limited, skipping",
                                         found.email
                                     );
+                                } else if self.is_concurrency_full(&found.account_id) {
+                                    tracing::debug!(
+                                        "60s Window: Last account {} at concurrency cap, skipping",
+                                        found.email
+                                    );
                                 } else {
                                     tracing::debug!("60s Window: Last account {} is quota-protected for model {} [{}], skipping", found.email, normalized_target, target_model);
                                 }
@@ -2157,12 +2235,13 @@ impl TokenManager {
 
                 // 若无锁定，则使用 P2C 选择账号 (避免热点问题)
                 if target_token.is_none() {
-                    // 先过滤出未限流的账号
+                    // 先过滤出未限流且未达并发上限的账号
                     let mut non_limited: Vec<ProxyToken> = Vec::new();
                     for t in &tokens_snapshot {
                         if !self
                             .is_rate_limited(&t.account_id, Some(&normalized_target))
                             .await
+                            && !self.is_concurrency_full(&t.account_id)
                         {
                             non_limited.push(t.clone());
                         }
@@ -2196,12 +2275,13 @@ impl TokenManager {
                 // 模式 C: P2C 选择 (替代纯轮询)
                 tracing::debug!("🔄 [Mode C] P2C selection from {} candidates", total);
 
-                // 先过滤出未限流的账号
+                // 先过滤出未限流且未达并发上限的账号
                 let mut non_limited: Vec<ProxyToken> = Vec::new();
                 for t in &tokens_snapshot {
                     if !self
                         .is_rate_limited(&t.account_id, Some(&normalized_target))
                         .await
+                        && !self.is_concurrency_full(&t.account_id)
                     {
                         non_limited.push(t.clone());
                     }
@@ -3522,6 +3602,9 @@ impl TokenManager {
         if self.is_rate_limited(&token.account_id, Some(model)).await {
             return false;
         }
+        if self.is_concurrency_full(&token.account_id) {
+            return false;
+        }
         if quota_protection_enabled
             && (token.protected_models.contains(&billing)
                 || token.protected_models.contains(model))
@@ -4492,6 +4575,7 @@ mod tests {
             validation_url: None,
             model_quotas: HashMap::new(),
             model_limits: HashMap::new(),
+            max_concurrency: None,
         }
     }
 
@@ -4836,6 +4920,7 @@ mod tests {
             validation_url: None,
             model_quotas: HashMap::new(),
             model_limits: HashMap::new(),
+            max_concurrency: None,
         }
     }
 

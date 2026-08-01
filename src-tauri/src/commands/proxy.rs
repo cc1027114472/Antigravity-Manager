@@ -163,6 +163,7 @@ pub async fn internal_start_proxy_service(
     token_manager
         .update_sticky_config(config.scheduling.clone())
         .await;
+    token_manager.update_global_max_concurrency(config.max_account_concurrency);
     token_manager
         .update_serial_pool_config(config.serial_pool.clone())
         .await;
@@ -261,6 +262,7 @@ pub async fn ensure_admin_server(
     token_manager
         .update_sticky_config(config.scheduling.clone())
         .await;
+    token_manager.update_global_max_concurrency(config.max_account_concurrency);
     token_manager
         .update_serial_pool_config(config.serial_pool.clone())
         .await;

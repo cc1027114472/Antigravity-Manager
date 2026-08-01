@@ -544,7 +544,11 @@ pub async fn handle_chat_completions(
             None => true,
         };
         if need_new {
-            token_manager.replace_inflight(&mut inflight_guard, &account_id);
+            if !token_manager.try_replace_inflight(&mut inflight_guard, &account_id) {
+                tracing::warn!("Account {} at concurrency cap, rotating", email);
+                force_rotate = true;
+                continue;
+            }
         }
 
         // 4. 转换请求 (返回内容包含 session_id, message_count, prefix_hash)
@@ -2233,7 +2237,11 @@ pub async fn handle_completions(
             None => true,
         };
         if need_new {
-            token_manager.replace_inflight(&mut inflight_guard, &account_id);
+            if !token_manager.try_replace_inflight(&mut inflight_guard, &account_id) {
+                tracing::warn!("Account {} at concurrency cap, rotating", email);
+                force_rotate = true;
+                continue;
+            }
         }
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
@@ -3327,7 +3335,14 @@ pub async fn handle_images_generations_internal(
                     None => true,
                 };
                 if need_new {
-                    token_manager.replace_inflight(&mut inflight_guard, &account_id);
+                    if !token_manager.try_replace_inflight(&mut inflight_guard, &account_id) {
+                        tracing::warn!(
+                            "[Images] Account {} at concurrency cap, rotating",
+                            email
+                        );
+                        force_rotate = true;
+                        continue;
+                    }
                 }
                 if let Ok(mut g) = attempted_account.lock() {
                     *g = Some((
@@ -3811,7 +3826,14 @@ pub async fn handle_images_edits(
                     None => true,
                 };
                 if need_new {
-                    token_manager.replace_inflight(&mut inflight_guard, &account_id);
+                    if !token_manager.try_replace_inflight(&mut inflight_guard, &account_id) {
+                        tracing::warn!(
+                            "[Images] Account {} at concurrency cap, rotating",
+                            email
+                        );
+                        force_rotate = true;
+                        continue;
+                    }
                 }
 
                 // 4.2 Construct Request Body (Need project_id)

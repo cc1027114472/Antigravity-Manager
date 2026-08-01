@@ -131,6 +131,12 @@
     "edit_label": "Edit Label",
     "custom_label_placeholder": "Enter custom label",
     "label_updated": "Label updated",
+    "concurrency": {
+      "label": "Max concurrency",
+      "inherit": "Inherit",
+      "tooltip": "Overlapping in-flight cap for this account. Empty = inherit global; >0 = override. When full, rotate (no queue).",
+      "updated": "Account concurrency limit updated"
+    },
     "add_account": "Add Account",
     "sync_local_ledger": "Sync Local Ledger",
     "sync_local_ledger_done": "Local ledger synced",
@@ -823,6 +829,12 @@
         "clear_bindings_tooltip": "Hard reset all session-account bindings, forcing accounts to be re-assigned on next request.",
         "clear_rate_limits": "Clear Rate Limit Records",
         "clear_rate_limits_tooltip": "Immediately clear local rate limit records for all accounts, forcing next requests to try upstream directly."
+      },
+      "concurrency": {
+        "global_max": "Global max concurrent per account",
+        "global_max_tooltip": "Max overlapping in-flight requests per account. Empty or 0 = unlimited. Override per account in Accounts.",
+        "global_max_hint": "Same semantics as traffic-log in-flight peak. When capped, rotate to another account (no queue).",
+        "unlimited": "Unlimited"
       },
       "serial_pool": {
         "title": "Serial Account Pool",

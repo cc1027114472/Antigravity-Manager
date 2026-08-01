@@ -83,6 +83,9 @@ pub struct Account {
     /// 用户自定义标签
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_label: Option<String>,
+    /// Per-account max overlapping in-flight requests. None/0 = inherit global / unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
 }
 
 impl Account {
@@ -114,6 +117,7 @@ impl Account {
             proxy_id: None,
             proxy_bound_at: None,
             custom_label: None,
+            max_concurrency: None,
         }
     }
 

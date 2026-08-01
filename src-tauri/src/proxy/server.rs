@@ -736,6 +736,10 @@ impl AxumServer {
                 "/accounts/:accountId/toggle-proxy",
                 post(admin_toggle_proxy_status),
             )
+            .route(
+                "/accounts/:accountId/max-concurrency",
+                post(admin_update_account_max_concurrency),
+            )
             .route("/accounts/warmup", post(admin_warm_up_all_accounts))
             .route("/accounts/:accountId/warmup", post(admin_warm_up_account))
             .route("/system/data-dir", get(admin_get_data_dir_path))
@@ -1517,6 +1521,9 @@ async fn admin_save_config(
         .token_manager
         .update_sticky_config(new_config.proxy.scheduling.clone())
         .await;
+    state
+        .token_manager
+        .update_global_max_concurrency(new_config.proxy.max_account_concurrency);
     state
         .token_manager
         .update_serial_pool_config(new_config.proxy.serial_pool.clone())
@@ -2688,6 +2695,79 @@ async fn admin_toggle_proxy_status(
     // 同步到运行中的反代服务
     let _ = state.token_manager.reload_account(&account_id).await;
 
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MaxConcurrencyRequest {
+    max_concurrency: Option<u32>,
+}
+
+async fn admin_update_account_max_concurrency(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Json(payload): Json<MaxConcurrencyRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let data_dir = crate::modules::account::get_data_dir().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+    let account_path = data_dir
+        .join("accounts")
+        .join(format!("{}.json", account_id));
+    if !account_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("账号文件不存在: {}", account_id),
+            }),
+        ));
+    }
+    let content = std::fs::read_to_string(&account_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("读取账号文件失败: {}", e),
+            }),
+        )
+    })?;
+    let mut account_json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("解析账号文件失败: {}", e),
+            }),
+        )
+    })?;
+    let cleaned = payload.max_concurrency.filter(|&n| n > 0);
+    match cleaned {
+        Some(n) => {
+            account_json["max_concurrency"] = serde_json::json!(n);
+        }
+        None => {
+            account_json["max_concurrency"] = serde_json::Value::Null;
+        }
+    }
+    let json_str = serde_json::to_string_pretty(&account_json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("序列化账号数据失败: {}", e),
+            }),
+        )
+    })?;
+    std::fs::write(&account_path, json_str).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("写入账号文件失败: {}", e),
+            }),
+        )
+    })?;
+    let _ = state.token_manager.reload_account(&account_id).await;
     Ok(StatusCode::OK)
 }
 
