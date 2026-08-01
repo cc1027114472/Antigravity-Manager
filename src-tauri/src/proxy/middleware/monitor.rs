@@ -471,6 +471,13 @@ pub async fn monitor_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // Peak overlapping concurrency for account (set by handlers before guard Drop)
+    let in_flight_peak =
+        crate::proxy::account_inflight::parse_peak_header(response.headers()).filter(|_| {
+            // Persist peak primarily for errors; successes omit to keep DB lean
+            status >= 400
+        });
+
     // Extract mapped model from X-Mapped-Model header if present
     let mapped_model = response
         .headers()
@@ -518,6 +525,7 @@ pub async fn monitor_middleware(
         cached_tokens: None,
         protocol,
         username,
+        in_flight_peak,
     };
 
     if content_type.contains("text/event-stream") {

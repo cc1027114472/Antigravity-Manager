@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::proxy::account_inflight::{AccountInflightGuard, AccountInflightTracker};
 use crate::proxy::config::SerialPoolConfig;
 use crate::proxy::rate_limit::RateLimitTracker;
 use crate::proxy::sticky_config::StickySessionConfig;
@@ -72,6 +73,9 @@ pub struct TokenManager {
     /// Key: "{account_id}:{billing_group}" → last trigger unix seconds.
     threshold_calibrate_cooldown: Arc<DashMap<String, i64>>,
 
+    /// Overlapping in-flight AI requests per account (observability).
+    account_inflight: Arc<AccountInflightTracker>,
+
     /// 串行号池配置（默认关闭）
     serial_pool: Arc<tokio::sync::RwLock<SerialPoolConfig>>,
     /// advance 互斥锁
@@ -105,6 +109,7 @@ impl TokenManager {
             refresh_locks: Arc::new(DashMap::new()),
             load_code_assist_inflight: Arc::new(DashMap::new()), // 初始化 inflight 表
             threshold_calibrate_cooldown: Arc::new(DashMap::new()),
+            account_inflight: Arc::new(AccountInflightTracker::new()),
             serial_pool: Arc::new(tokio::sync::RwLock::new(SerialPoolConfig::default())),
             advance_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_advance: Arc::new(tokio::sync::RwLock::new(None)),
@@ -112,6 +117,25 @@ impl TokenManager {
             auto_cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cancel_token: CancellationToken::new(),
         }
+    }
+
+    /// Begin overlapping in-flight tracking for an AI request on this account.
+    pub fn begin_inflight(&self, account_id: &str) -> AccountInflightGuard {
+        self.account_inflight.begin(account_id)
+    }
+
+    /// Replace an existing in-flight guard when rotating accounts.
+    pub fn replace_inflight(
+        &self,
+        guard: &mut Option<AccountInflightGuard>,
+        account_id: &str,
+    ) {
+        crate::proxy::account_inflight::replace_guard(guard, &self.account_inflight, account_id);
+    }
+
+    /// Current overlapping in-flight count for an account (observability).
+    pub fn inflight_current(&self, account_id: &str) -> usize {
+        self.account_inflight.current(account_id)
     }
 
     /// 启动限流记录自动清理后台任务（每15秒检查并清除过期记录）
@@ -3096,6 +3120,7 @@ impl TokenManager {
         retry_after_header: Option<&str>,
         error_body: &str,
         model: Option<&str>, // 🆕 新增模型参数
+        in_flight_peak: Option<u32>,
     ) {
         // [FIX #2209] 统一归一化模型名称，确保锁定 Key 与负载均衡检查 Key 一致
         let normalized_model =
@@ -3115,6 +3140,16 @@ impl TokenManager {
 
         let reason = self.classify_rate_limit_reason(error_body);
 
+        // Prefer caller peak; else sample current overlapping count at error time.
+        let peak = in_flight_peak.or_else(|| {
+            let cur = self.account_inflight.current(&account_id);
+            if cur > 0 {
+                Some(cur as u32)
+            } else {
+                None
+            }
+        });
+
         // 1) 立刻落锁，确保 handler 下一轮 force_rotate / 串行 advance 能跳过本号
         self.rate_limit_tracker.parse_from_error(
             &account_id,
@@ -3124,7 +3159,14 @@ impl TokenManager {
             model_to_track.map(|s| s.to_string()),
             &config.backoff_steps,
         );
-        self.persist_live_limit(&account_id, model_to_track, status, reason, error_body);
+        self.persist_live_limit(
+            &account_id,
+            model_to_track,
+            status,
+            reason,
+            error_body,
+            peak,
+        );
 
         // 2) 429 且非 Grace 短窗：反代禁用 + 移出内存池 + 串行游标推进
         //    短 retry（≤2s）保留账号以便原地重试；长锁/无 delay 则立刻踢出并切号。
@@ -3230,6 +3272,7 @@ impl TokenManager {
         status: u16,
         reason: crate::proxy::rate_limit::RateLimitReason,
         error_body: &str,
+        in_flight_peak: Option<u32>,
     ) {
         let Some(model_key) = model.filter(|m| !m.is_empty()) else {
             return;
@@ -3266,7 +3309,7 @@ impl TokenManager {
         }
 
         let now = chrono::Utc::now().timestamp();
-        content["live_limited_models"][model_key] = serde_json::json!({
+        let mut entry = serde_json::json!({
             "model": model_key,
             "status": status,
             "reason": format!("{:?}", reason),
@@ -3274,6 +3317,10 @@ impl TokenManager {
             "detected_at": now,
             "message": truncate_reason(error_body, 500),
         });
+        if let Some(peak) = in_flight_peak {
+            entry["in_flight_peak"] = serde_json::json!(peak);
+        }
+        content["live_limited_models"][model_key] = entry;
 
         if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&content).unwrap()) {
             tracing::debug!("Failed to persist live limit for {}: {}", account_id, e);

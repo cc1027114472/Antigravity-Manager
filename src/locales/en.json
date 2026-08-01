@@ -1205,6 +1205,7 @@
       "usage": "Tokens",
       "duration": "Duration",
       "time": "Time",
+      "in_flight_peak": "In-flight Peak",
       "empty": "No requests recorded"
     },
     "details": {
@@ -1218,6 +1219,7 @@
       "mapped_model": "Mapped Model",
       "protocol": "Protocol",
       "account_used": "Account Used",
+      "in_flight_peak": "In-flight Peak at Error",
       "id": "Request ID",
       "payload_empty": "No data"
     },

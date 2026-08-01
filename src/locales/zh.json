@@ -1198,6 +1198,7 @@
       "usage": "Token 消耗",
       "duration": "耗时",
       "time": "时间",
+      "in_flight_peak": "并发峰值",
       "empty": "暂无请求记录"
     },
     "details": {
@@ -1211,6 +1212,7 @@
       "mapped_model": "映射模型",
       "protocol": "请求协议",
       "account_used": "使用账号",
+      "in_flight_peak": "出错时并发峰值",
       "id": "请求 ID",
       "payload_empty": "无数据"
     },

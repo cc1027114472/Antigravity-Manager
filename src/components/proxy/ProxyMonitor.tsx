@@ -29,6 +29,7 @@ interface ProxyRequestLog {
     cached_tokens?: number;
     account_email?: string;
     protocol?: string;  // "openai" | "anthropic" | "gemini"
+    in_flight_peak?: number;
 }
 
 interface ProxyStats {
@@ -67,6 +68,7 @@ const LogTable: React.FC<LogTableProps> = ({
                         <th style={{ width: '220px' }}>{t('monitor.table.model')}</th>
                         <th style={{ width: '70px' }}>{t('monitor.table.protocol')}</th>
                         <th style={{ width: '140px' }}>{t('monitor.table.account')}</th>
+                        <th style={{ width: '70px' }}>{t('monitor.table.in_flight_peak')}</th>
                         <th style={{ width: '180px' }}>{t('monitor.table.path')}</th>
                         <th className="text-right" style={{ width: '90px' }}>{t('monitor.table.usage')}</th>
                         <th className="text-right" style={{ width: '80px' }}>{t('monitor.table.duration')}</th>
@@ -105,6 +107,9 @@ const LogTable: React.FC<LogTableProps> = ({
                             </td>
                             <td className="text-gray-600 dark:text-gray-400 truncate text-[10px]" style={{ width: '140px', maxWidth: '140px' }} title={log.account_email || ''}>
                                 {log.account_email ? log.account_email.replace(/(.{3}).*(@.*)/, '$1***$2') : '-'}
+                            </td>
+                            <td className="text-center text-[10px]" style={{ width: '70px' }} title={t('monitor.table.in_flight_peak')}>
+                                {log.status >= 400 && log.in_flight_peak != null ? log.in_flight_peak : '—'}
                             </td>
                             <td className="truncate" style={{ width: '180px', maxWidth: '180px' }}>{log.url}</td>
                             <td className="text-right text-[9px]" style={{ width: '90px' }}>
@@ -640,6 +645,12 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                     <div className="mt-5 pt-5 border-t border-gray-200 dark:border-base-300">
                                         <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest mb-2">{t('monitor.details.account_used')}</span>
                                         <span className="font-mono font-semibold text-gray-900 dark:text-base-content text-xs">{selectedLog.account_email}</span>
+                                    </div>
+                                )}
+                                {selectedLog.in_flight_peak != null && (
+                                    <div className="mt-5 pt-5 border-t border-gray-200 dark:border-base-300">
+                                        <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest mb-2">{t('monitor.details.in_flight_peak')}</span>
+                                        <span className="font-mono font-semibold text-gray-900 dark:text-base-content text-xs">{selectedLog.in_flight_peak}</span>
                                     </div>
                                 )}
                             </div>

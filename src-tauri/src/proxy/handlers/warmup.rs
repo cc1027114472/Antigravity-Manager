@@ -267,6 +267,7 @@ pub async fn handle_warmup(
                 cached_tokens: None,
                 protocol: Some("warmup".to_string()),
                 username: None,
+                in_flight_peak: None,
             };
             state.monitor.log_request(log).await;
 
@@ -366,6 +367,7 @@ pub async fn handle_warmup(
                 cached_tokens: None,
                 protocol: Some("warmup".to_string()),
                 username: None,
+                in_flight_peak: None,
             };
             state.monitor.log_request(log).await;
 

@@ -94,6 +94,7 @@ pub async fn handle_generate(
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
     let mut force_rotate = false;
+    let mut inflight_guard: Option<crate::proxy::account_inflight::AccountInflightGuard> = None;
 
     for attempt in 0..max_attempts {
         // 3. 模型路由解析
@@ -157,6 +158,14 @@ pub async fn handle_generate(
 
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
+
+        let need_new = match inflight_guard.as_ref() {
+            Some(g) => g.account_id() != account_id.as_str(),
+            None => true,
+        };
+        if need_new {
+            token_manager.replace_inflight(&mut inflight_guard, &account_id);
+        }
 
         // 5. 包装请求 (project injection)
         // [FIX #765] Pass session_id to wrap_request for signature injection
@@ -476,18 +485,21 @@ pub async fn handle_generate(
                 };
 
                 if client_wants_stream {
-                    let body = Body::from_stream(stream);
-                    return Ok(Response::builder()
+                    let peak =
+                        crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+                    let mut builder = axum::response::Response::builder()
                         .header("Content-Type", "text/event-stream")
                         .header("Cache-Control", "no-cache")
                         .header("Connection", "keep-alive")
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
                         .header("X-Account-Id", &account_id)
-                        .header("X-Mapped-Model", &mapped_model)
-                        .body(body)
-                        .unwrap()
-                        .into_response());
+                        .header("X-Mapped-Model", &mapped_model);
+                    if let Some(p) = peak {
+                        builder = builder.header("X-In-Flight-Peak", p.to_string());
+                    }
+                    let body = axum::body::Body::from_stream(stream);
+                    return Ok(builder.body(body).unwrap().into_response());
                 } else {
                     // Collect to JSON
                     use crate::proxy::mappers::gemini::collector::collect_stream_to_json;
@@ -498,12 +510,18 @@ pub async fn handle_generate(
                                 session_id
                             );
                             let unwrapped = unwrap_response(&gemini_resp);
+                            let peak = crate::proxy::account_inflight::sample_peak(
+                                &mut inflight_guard,
+                            );
+                            let headers = crate::proxy::account_inflight::account_headers(
+                                &email,
+                                Some(&account_id),
+                                Some(mapped_model.as_str()),
+                                peak,
+                            );
                             return Ok((
                                 StatusCode::OK,
-                                [
-                                    ("X-Account-Email", email.as_str()),
-                                    ("X-Mapped-Model", mapped_model.as_str()),
-                                ],
+                                headers,
                                 Json(unwrapped),
                             )
                                 .into_response());
@@ -564,15 +582,14 @@ pub async fn handle_generate(
             }
 
             let unwrapped = unwrap_response(&gemini_resp);
-            return Ok((
-                StatusCode::OK,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                ],
-                Json(unwrapped),
-            )
-                .into_response());
+            let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+            let headers = crate::proxy::account_inflight::account_headers(
+                &email,
+                Some(&account_id),
+                Some(mapped_model.as_str()),
+                peak,
+            );
+            return Ok((StatusCode::OK, headers, Json(unwrapped)).into_response());
         }
 
         // 处理错误并重试
@@ -678,12 +695,16 @@ pub async fn handle_generate(
             "Gemini Upstream non-retryable error {}: {}",
             status_code, error_text
         );
+        let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+        let headers = crate::proxy::account_inflight::account_headers(
+            &email,
+            Some(&account_id),
+            Some(mapped_model.as_str()),
+            peak,
+        );
         return Ok((
             status,
-            [
-                ("X-Account-Email", email.as_str()),
-                ("X-Mapped-Model", mapped_model.as_str()),
-            ],
+            headers,
             // [FIX] Return JSON error
             Json(json!({
                 "error": {
@@ -697,9 +718,12 @@ pub async fn handle_generate(
     }
 
     if let Some(email) = last_email {
+        let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+        let headers =
+            crate::proxy::account_inflight::account_headers(&email, None, None, peak);
         Ok((
             StatusCode::TOO_MANY_REQUESTS,
-            [("X-Account-Email", email)],
+            headers,
             format!("All accounts exhausted. Last error: {}", last_error),
         )
             .into_response())

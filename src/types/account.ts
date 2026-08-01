@@ -32,6 +32,8 @@ export interface LiveLimitStatus {
     until: number;
     detected_at: number;
     message?: string;
+    /** Peak overlapping in-flight requests when this limit was recorded. */
+    in_flight_peak?: number;
 }
 
 export interface TokenData {

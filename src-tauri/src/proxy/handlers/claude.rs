@@ -800,6 +800,7 @@ pub async fn handle_messages(
     let mut last_mapped_model: Option<String> = None;
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
     let mut force_rotate = false;
+    let mut inflight_guard: Option<crate::proxy::account_inflight::AccountInflightGuard> = None;
 
     for attempt in 0..max_attempts {
         // 2. 模型路由解析
@@ -866,6 +867,14 @@ pub async fn handle_messages(
 
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
+
+        let need_new = match inflight_guard.as_ref() {
+            Some(g) => g.account_id() != account_id.as_str(),
+            None => true,
+        };
+        if need_new {
+            token_manager.replace_inflight(&mut inflight_guard, &account_id);
+        }
 
         // ===== 【优化】后台任务智能检测与降级 =====
         // 使用新的检测系统，支持 5 大类关键词和多 Flash 模型策略
@@ -1107,10 +1116,13 @@ pub async fn handle_messages(
                 b
             }
             Err(e) => {
-                let headers = [
-                    ("X-Mapped-Model", request_with_mapped.model.as_str()),
-                    ("X-Account-Email", email.as_str()),
-                ];
+                let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+                let headers = crate::proxy::account_inflight::account_headers(
+                    &email,
+                    Some(&account_id),
+                    Some(request_with_mapped.model.as_str()),
+                    peak,
+                );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     headers,
@@ -1407,7 +1419,9 @@ pub async fn handle_messages(
                         // 判断客户端期望的格式
                         if client_wants_stream {
                             // 客户端本就要 Stream，直接返回 SSE
-                            return Response::builder()
+                            let peak =
+                                crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+                            let mut builder = Response::builder()
                                 .status(StatusCode::OK)
                                 .header(header::CONTENT_TYPE, "text/event-stream")
                                 .header(header::CACHE_CONTROL, "no-cache")
@@ -1419,7 +1433,11 @@ pub async fn handle_messages(
                                 .header(
                                     "X-Context-Purified",
                                     if is_purified { "true" } else { "false" },
-                                )
+                                );
+                            if let Some(p) = peak {
+                                builder = builder.header("X-In-Flight-Peak", p.to_string());
+                            }
+                            return builder
                                 .body(Body::from_stream(combined_stream))
                                 .unwrap();
                         } else {
@@ -1432,7 +1450,10 @@ pub async fn handle_messages(
                                         "[{}] ✓ Stream collected and converted to JSON",
                                         trace_id
                                     );
-                                    return Response::builder()
+                                    let peak = crate::proxy::account_inflight::sample_peak(
+                                        &mut inflight_guard,
+                                    );
+                                    let mut builder = Response::builder()
                                         .status(StatusCode::OK)
                                         .header(header::CONTENT_TYPE, "application/json")
                                         .header("X-Account-Email", &email)
@@ -1441,7 +1462,11 @@ pub async fn handle_messages(
                                         .header(
                                             "X-Context-Purified",
                                             if is_purified { "true" } else { "false" },
-                                        )
+                                        );
+                                    if let Some(p) = peak {
+                                        builder = builder.header("X-In-Flight-Peak", p.to_string());
+                                    }
+                                    return builder
                                         .body(Body::from(
                                             serde_json::to_string(&full_response).unwrap(),
                                         ))
@@ -1554,15 +1579,14 @@ pub async fn handle_messages(
                     cache_info
                 );
 
-                return (
-                    StatusCode::OK,
-                    [
-                        ("X-Account-Email", email.as_str()),
-                        ("X-Mapped-Model", request_with_mapped.model.as_str()),
-                    ],
-                    Json(claude_response),
-                )
-                    .into_response();
+                let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+                let headers = crate::proxy::account_inflight::account_headers(
+                    &email,
+                    Some(&account_id),
+                    Some(request_with_mapped.model.as_str()),
+                    peak,
+                );
+                return (StatusCode::OK, headers, Json(claude_response)).into_response();
             }
         }
 
@@ -1613,6 +1637,7 @@ pub async fn handle_messages(
             || status_code == 500
             || status_code == 404
         {
+            let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
             token_manager
                 .mark_rate_limited_async(
                     &email,
@@ -1620,6 +1645,7 @@ pub async fn handle_messages(
                     retry_after.as_deref(),
                     &error_text,
                     Some(&request_with_mapped.model),
+                    peak,
                 )
                 .await;
         }
@@ -1806,9 +1832,16 @@ pub async fn handle_messages(
                     || error_text.contains("exceeds")
                     || error_text.contains("limit"))
             {
+                let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+                let headers = crate::proxy::account_inflight::account_headers(
+                    &email,
+                    Some(&account_id),
+                    None,
+                    peak,
+                );
                 return (
                     StatusCode::BAD_REQUEST,
-                    [("X-Account-Email", email.as_str())],
+                    headers,
                     Json(json!({
                         "id": "err_prompt_too_long",
                         "type": "error",
@@ -1826,30 +1859,26 @@ pub async fn handle_messages(
                 "[{}] Non-retryable error {}: {}",
                 trace_id, status_code, error_text
             );
-            return (
-                status,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", request_with_mapped.model.as_str()),
-                ],
-                error_text,
-            )
-                .into_response();
+            let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+            let headers = crate::proxy::account_inflight::account_headers(
+                &email,
+                Some(&account_id),
+                Some(request_with_mapped.model.as_str()),
+                peak,
+            );
+            return (status, headers, error_text).into_response();
         }
     }
 
     if let Some(email) = last_email {
         // [FIX] Include X-Mapped-Model in exhaustion error
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Account-Email",
-            header::HeaderValue::from_str(&email).unwrap(),
+        let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+        let headers = crate::proxy::account_inflight::account_headers(
+            &email,
+            None,
+            last_mapped_model.as_deref(),
+            peak,
         );
-        if let Some(model) = last_mapped_model {
-            if let Ok(v) = header::HeaderValue::from_str(&model) {
-                headers.insert("X-Mapped-Model", v);
-            }
-        }
 
         let error_type = match last_status.as_u16() {
             400 => "invalid_request_error",

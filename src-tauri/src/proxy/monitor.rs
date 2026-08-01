@@ -26,6 +26,9 @@ pub struct ProxyRequestLog {
     pub cached_tokens: Option<u32>,
     pub protocol: Option<String>, // 协议类型: "openai", "anthropic", "gemini"
     pub username: Option<String>, // User token username
+    /// Peak overlapping in-flight requests for the account during this request (errors).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight_peak: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -191,6 +194,7 @@ impl ProxyMonitor {
                 cached_tokens: log.cached_tokens,
                 protocol: log.protocol.clone(),
                 username: log.username.clone(),
+                in_flight_peak: log.in_flight_peak,
             };
             let _ = app.emit("proxy://request", &log_summary);
         }

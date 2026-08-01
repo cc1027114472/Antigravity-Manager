@@ -479,6 +479,7 @@ pub async fn handle_chat_completions(
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
+    let mut inflight_guard: Option<crate::proxy::account_inflight::AccountInflightGuard> = None;
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
@@ -537,6 +538,14 @@ pub async fn handle_chat_completions(
 
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
+
+        let need_new = match inflight_guard.as_ref() {
+            Some(g) => g.account_id() != account_id.as_str(),
+            None => true,
+        };
+        if need_new {
+            token_manager.replace_inflight(&mut inflight_guard, &account_id);
+        }
 
         // 4. 转换请求 (返回内容包含 session_id, message_count, prefix_hash)
         let (gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
@@ -834,18 +843,21 @@ pub async fn handle_chat_completions(
                         });
                     }
                     // 客户端请求流式，返回 SSE
-                    let body = Body::from_stream(combined_stream);
-                    return Ok(Response::builder()
+                    let peak =
+                        crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+                    let mut builder = Response::builder()
                         .header("Content-Type", "text/event-stream")
                         .header("Cache-Control", "no-cache")
                         .header("Connection", "keep-alive")
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
                         .header("X-Account-Id", &account_id)
-                        .header("X-Mapped-Model", &mapped_model)
-                        .body(body)
-                        .unwrap()
-                        .into_response());
+                        .header("X-Mapped-Model", &mapped_model);
+                    if let Some(p) = peak {
+                        builder = builder.header("X-In-Flight-Peak", p.to_string());
+                    }
+                    let body = Body::from_stream(combined_stream);
+                    return Ok(builder.body(body).unwrap().into_response());
                 } else {
                     // 客户端请求非流式，但内部强制转为流式
                     // 收集流数据并聚合为 JSON
@@ -878,10 +890,14 @@ pub async fn handle_chat_completions(
                             }
                             return Ok((
                                 StatusCode::OK,
-                                [
-                                    ("X-Account-Email", email.as_str()),
-                                    ("X-Mapped-Model", mapped_model.as_str()),
-                                ],
+                                crate::proxy::account_inflight::account_headers(
+                                    &email,
+                                    Some(&account_id),
+                                    Some(mapped_model.as_str()),
+                                    crate::proxy::account_inflight::sample_peak(
+                                        &mut inflight_guard,
+                                    ),
+                                ),
                                 Json(full_response),
                             )
                                 .into_response());
@@ -955,10 +971,12 @@ pub async fn handle_chat_completions(
             }
             return Ok((
                 StatusCode::OK,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                ],
+                crate::proxy::account_inflight::account_headers(
+                    &email,
+                    Some(&account_id),
+                    Some(mapped_model.as_str()),
+                    crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+                ),
                 Json(openai_response),
             )
                 .into_response());
@@ -1012,6 +1030,7 @@ pub async fn handle_chat_completions(
         // 3. 标记限流状态(用于 UI 显示)
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
             // [FIX] Use async version with model parameter for fine-grained rate limiting
+            let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
             token_manager
                 .mark_rate_limited_async(
                     &email,
@@ -1019,6 +1038,7 @@ pub async fn handle_chat_completions(
                     _retry_after.as_deref(),
                     &error_text,
                     Some(&mapped_model),
+                    peak,
                 )
                 .await;
         }
@@ -1191,10 +1211,12 @@ pub async fn handle_chat_completions(
         );
         return Ok((
             status,
-            [
-                ("X-Account-Email", email.as_str()),
-                ("X-Mapped-Model", mapped_model.as_str()),
-            ],
+            crate::proxy::account_inflight::account_headers(
+                &email,
+                Some(&account_id),
+                Some(mapped_model.as_str()),
+                crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+            ),
             // [FIX] Return JSON error for better client compatibility
             Json(json!({
                 "error": {
@@ -1211,7 +1233,12 @@ pub async fn handle_chat_completions(
     if let Some(email) = last_email {
         Ok((
             StatusCode::TOO_MANY_REQUESTS,
-            [("X-Account-Email", email), ("X-Mapped-Model", mapped_model)],
+            crate::proxy::account_inflight::account_headers(
+                &email,
+                None,
+                Some(mapped_model.as_str()),
+                crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+            ),
             format!("All accounts exhausted. Last error: {}", last_error),
         )
             .into_response())
@@ -2130,6 +2157,7 @@ pub async fn handle_completions(
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
+    let mut inflight_guard: Option<crate::proxy::account_inflight::AccountInflightGuard> = None;
 
     if debug_logger::is_enabled(&debug_cfg) {
         let payload = json!({
@@ -2199,6 +2227,14 @@ pub async fn handle_completions(
         last_email = Some(email.clone());
 
         info!("✓ Using account: {} (type: {})", email, config.request_type);
+
+        let need_new = match inflight_guard.as_ref() {
+            Some(g) => g.account_id() != account_id.as_str(),
+            None => true,
+        };
+        if need_new {
+            token_manager.replace_inflight(&mut inflight_guard, &account_id);
+        }
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
         let (gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
@@ -2445,13 +2481,19 @@ pub async fn handle_completions(
                             crate::proxy::http_session_store::save_session(rid, entry).await;
                         });
                     }
-                    return Response::builder()
+                    let peak =
+                        crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+                    let mut builder = Response::builder()
                         .header("Content-Type", "text/event-stream")
                         .header("Cache-Control", "no-cache")
                         .header("Connection", "keep-alive")
                         .header("X-Account-Email", &email)
                         .header("X-Account-Id", &account_id)
-                        .header("X-Mapped-Model", &mapped_model)
+                        .header("X-Mapped-Model", &mapped_model);
+                    if let Some(p) = peak {
+                        builder = builder.header("X-In-Flight-Peak", p.to_string());
+                    }
+                    return builder
                         .body(Body::from_stream(combined_stream))
                         .unwrap()
                         .into_response();
@@ -2626,10 +2668,14 @@ pub async fn handle_completions(
 
                                 return (
                                     StatusCode::OK,
-                                    [
-                                        ("X-Account-Email", email.as_str()),
-                                        ("X-Mapped-Model", mapped_model.as_str()),
-                                    ],
+                                    crate::proxy::account_inflight::account_headers(
+                                        &email,
+                                        Some(&account_id),
+                                        Some(mapped_model.as_str()),
+                                        crate::proxy::account_inflight::sample_peak(
+                                            &mut inflight_guard,
+                                        ),
+                                    ),
                                     Json(resp),
                                 )
                                     .into_response();
@@ -2690,10 +2736,14 @@ pub async fn handle_completions(
 
                             return (
                                 StatusCode::OK,
-                                [
-                                    ("X-Account-Email", email.as_str()),
-                                    ("X-Mapped-Model", mapped_model.as_str()),
-                                ],
+                                crate::proxy::account_inflight::account_headers(
+                                    &email,
+                                    Some(&account_id),
+                                    Some(mapped_model.as_str()),
+                                    crate::proxy::account_inflight::sample_peak(
+                                        &mut inflight_guard,
+                                    ),
+                                ),
                                 Json(legacy_resp),
                             )
                                 .into_response();
@@ -2803,10 +2853,12 @@ pub async fn handle_completions(
 
                 return (
                     StatusCode::OK,
-                    [
-                        ("X-Account-Email", email.as_str()),
-                        ("X-Mapped-Model", mapped_model.as_str()),
-                    ],
+                    crate::proxy::account_inflight::account_headers(
+                        &email,
+                        Some(&account_id),
+                        Some(mapped_model.as_str()),
+                        crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+                    ),
                     Json(resp),
                 )
                     .into_response();
@@ -2855,10 +2907,12 @@ pub async fn handle_completions(
 
             return (
                 StatusCode::OK,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                ],
+                crate::proxy::account_inflight::account_headers(
+                    &email,
+                    Some(&account_id),
+                    Some(mapped_model.as_str()),
+                    crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+                ),
                 Json(legacy_resp),
             )
                 .into_response();
@@ -2885,6 +2939,7 @@ pub async fn handle_completions(
 
         // 3. 标记限流状态(用于 UI 显示)
         if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
+            let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
             token_manager
                 .mark_rate_limited_async(
                     &email,
@@ -2892,6 +2947,7 @@ pub async fn handle_completions(
                     retry_after.as_deref(),
                     &error_text,
                     Some(&mapped_model),
+                    peak,
                 )
                 .await;
         }
@@ -2916,10 +2972,12 @@ pub async fn handle_completions(
             // 不可重试
             return (
                 status,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                ],
+                crate::proxy::account_inflight::account_headers(
+                    &email,
+                    Some(&account_id),
+                    Some(mapped_model.as_str()),
+                    crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+                ),
                 error_text,
             )
                 .into_response();
@@ -2930,7 +2988,12 @@ pub async fn handle_completions(
     if let Some(email) = last_email {
         (
             StatusCode::TOO_MANY_REQUESTS,
-            [("X-Account-Email", email), ("X-Mapped-Model", mapped_model)],
+            crate::proxy::account_inflight::account_headers(
+                &email,
+                None,
+                Some(mapped_model.as_str()),
+                crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+            ),
             format!("All accounts exhausted. Last error: {}", last_error),
         )
             .into_response()
@@ -3022,7 +3085,7 @@ async fn intercept_chat_to_image(
     });
 
     match handle_images_generations_internal(state, img_req).await {
-        Ok((email, img_res)) => {
+        Ok((email, img_res, peak)) => {
             // Extract URL
             let mut img_markdown = String::new();
             if let Some(data) = img_res.get("data").and_then(|v| v.as_array()) {
@@ -3075,12 +3138,14 @@ async fn intercept_chat_to_image(
                 );
 
                 let body = Body::from(sse_data);
-                Ok(Response::builder()
+                let mut builder = Response::builder()
                     .header("Content-Type", "text/event-stream")
                     .header("Cache-Control", "no-cache")
-                    .header("X-Account-Email", email)
-                    .body(body)
-                    .unwrap())
+                    .header("X-Account-Email", email);
+                if let Some(p) = peak {
+                    builder = builder.header("X-In-Flight-Peak", p.to_string());
+                }
+                Ok(builder.body(body).unwrap())
             } else {
                 let resp = json!({
                     "id": format!("chatcmpl-img-{}", uuid::Uuid::new_v4()),
@@ -3100,13 +3165,18 @@ async fn intercept_chat_to_image(
 
                 Ok((
                     StatusCode::OK,
-                    [("X-Account-Email", email.as_str())],
+                    crate::proxy::account_inflight::account_headers(
+                        &email,
+                        None,
+                        None,
+                        peak,
+                    ),
                     Json(resp),
                 )
                     .into_response())
             }
         }
-        Err((status, msg, _email)) => Err((status, msg)),
+        Err((status, msg, _email, _peak)) => Err((status, msg)),
     }
 }
 
@@ -3115,17 +3185,27 @@ pub async fn handle_images_generations(
     Json(body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     match handle_images_generations_internal(state, body).await {
-        Ok((email_header, openai_response)) => Ok((
+        Ok((email_header, openai_response, peak)) => Ok((
             StatusCode::OK,
-            [("X-Account-Email", email_header.as_str())],
+            crate::proxy::account_inflight::account_headers(
+                &email_header,
+                None,
+                None,
+                peak,
+            ),
             Json(openai_response),
         )
             .into_response()),
         // Attach the attempted account to error responses too, so the traffic log shows
         // which account the failed (e.g. 502/503) image request used.
-        Err((status, msg, email_opt)) => {
+        Err((status, msg, email_opt, peak)) => {
             let email = email_opt.unwrap_or_default();
-            Ok((status, [("X-Account-Email", email)], msg).into_response())
+            Ok((
+                status,
+                crate::proxy::account_inflight::account_headers(&email, None, None, peak),
+                msg,
+            )
+                .into_response())
         }
     }
 }
@@ -3133,11 +3213,12 @@ pub async fn handle_images_generations(
 pub async fn handle_images_generations_internal(
     state: AppState,
     body: Value,
-) -> Result<(String, Value), (StatusCode, String, Option<String>)> {
+) -> Result<(String, Value, Option<u32>), (StatusCode, String, Option<String>, Option<u32>)> {
     // 1. 解析请求参数
     let prompt = body.get("prompt").and_then(|v| v.as_str()).ok_or((
         StatusCode::BAD_REQUEST,
         "Missing 'prompt' field".to_string(),
+        None,
         None,
     ))?;
 
@@ -3207,7 +3288,8 @@ pub async fn handle_images_generations_internal(
 
     // Track the last account actually attempted, so error responses (502/503) can be
     // attributed to an account in the traffic log instead of showing "(none)".
-    let attempted_account = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let attempted_account =
+        std::sync::Arc::new(std::sync::Mutex::new(None::<(String, Option<u32>)>));
 
     for _ in 0..n {
         let upstream = upstream.clone();
@@ -3222,6 +3304,8 @@ pub async fn handle_images_generations_internal(
         tasks.push(tokio::spawn(async move {
             let mut last_error = String::new();
             let mut force_rotate = false;
+            let mut inflight_guard: Option<crate::proxy::account_inflight::AccountInflightGuard> =
+                None;
 
             for attempt in 0..max_attempts {
                 let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
@@ -3238,8 +3322,18 @@ pub async fn handle_images_generations_internal(
                         break;
                     }
                 };
+                let need_new = match inflight_guard.as_ref() {
+                    Some(g) => g.account_id() != account_id.as_str(),
+                    None => true,
+                };
+                if need_new {
+                    token_manager.replace_inflight(&mut inflight_guard, &account_id);
+                }
                 if let Ok(mut g) = attempted_account.lock() {
-                    *g = Some(email.clone());
+                    *g = Some((
+                        email.clone(),
+                        crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+                    ));
                 }
 
                 // [FIX] Resolve to the account-specific dynamic image model, exactly like the
@@ -3306,6 +3400,9 @@ pub async fn handle_images_generations_internal(
                                         None,
                                         &err_text,
                                         Some(model_to_use.as_str()),
+                                        crate::proxy::account_inflight::sample_peak(
+                                            &mut inflight_guard,
+                                        ),
                                     )
                                     .await;
                                 force_rotate = true;
@@ -3336,7 +3433,12 @@ pub async fn handle_images_generations_internal(
                             .await;
 
                         match response.json::<Value>().await {
-                            Ok(json) => return Ok((json, email)),
+                            Ok(json) => {
+                                let peak = crate::proxy::account_inflight::sample_peak(
+                                    &mut inflight_guard,
+                                );
+                                return Ok((json, email, peak));
+                            }
                             Err(e) => return Err(format!("Parse error: {}", e)),
                         }
                     }
@@ -3356,14 +3458,16 @@ pub async fn handle_images_generations_internal(
     let mut images: Vec<Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut used_email: Option<String> = None;
+    let mut used_peak: Option<u32> = None;
 
     for (idx, task) in tasks.into_iter().enumerate() {
         match task.await {
             Ok(result) => match result {
-                Ok((gemini_resp, email_used)) => {
+                Ok((gemini_resp, email_used, peak)) => {
                     // Capture the email from the first successful task for logging
                     if used_email.is_none() {
                         used_email = Some(email_used);
+                        used_peak = peak;
                     }
                     let raw = gemini_resp.get("response").unwrap_or(&gemini_resp);
                     if let Some(parts) = raw
@@ -3426,10 +3530,19 @@ pub async fn handle_images_generations_internal(
             StatusCode::BAD_GATEWAY
         };
 
-        let attempted = used_email
-            .clone()
-            .or_else(|| attempted_account.lock().ok().and_then(|g| g.clone()));
-        return Err((status, error_msg, attempted));
+        let attempted = used_email.clone().or_else(|| {
+            attempted_account
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|(email, _)| email.clone()))
+        });
+        let attempted_peak = used_peak.or_else(|| {
+            attempted_account
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().and_then(|(_, peak)| *peak))
+        });
+        return Err((status, error_msg, attempted, attempted_peak));
     }
 
     // 部分成功时记录警告
@@ -3460,7 +3573,7 @@ pub async fn handle_images_generations_internal(
     });
 
     let email_header = used_email.unwrap_or_default();
-    Ok((email_header, openai_response))
+    Ok((email_header, openai_response, used_peak))
 }
 
 pub async fn handle_images_edits(
@@ -3674,6 +3787,8 @@ pub async fn handle_images_edits(
             let mut last_error = String::new();
 
             let mut force_rotate = false;
+            let mut inflight_guard: Option<crate::proxy::account_inflight::AccountInflightGuard> =
+                None;
 
             for attempt in 0..max_attempts {
                 // 4.1 获取 Token
@@ -3691,6 +3806,13 @@ pub async fn handle_images_edits(
                         break;
                     }
                 };
+                let need_new = match inflight_guard.as_ref() {
+                    Some(g) => g.account_id() != account_id.as_str(),
+                    None => true,
+                };
+                if need_new {
+                    token_manager.replace_inflight(&mut inflight_guard, &account_id);
+                }
 
                 // 4.2 Construct Request Body (Need project_id)
                 let gemini_body = json!({
@@ -3747,6 +3869,9 @@ pub async fn handle_images_edits(
                                     email,
                                     status_code
                                 );
+                                let peak = crate::proxy::account_inflight::sample_peak(
+                                    &mut inflight_guard,
+                                );
                                 token_manager
                                     .mark_rate_limited_async(
                                         &email,
@@ -3754,8 +3879,10 @@ pub async fn handle_images_edits(
                                         None,
                                         &err_text,
                                         Some(&model_to_use),
+                                        peak,
                                     )
                                     .await;
+                                force_rotate = true;
                                 continue; // Retry loop
                             }
                             return Err(last_error);
@@ -3766,7 +3893,12 @@ pub async fn handle_images_edits(
                             .await;
 
                         match response.json::<Value>().await {
-                            Ok(json) => return Ok((json, response_format.clone(), email)),
+                            Ok(json) => {
+                                let peak = crate::proxy::account_inflight::sample_peak(
+                                    &mut inflight_guard,
+                                );
+                                return Ok((json, response_format.clone(), email, peak));
+                            }
                             Err(e) => return Err(format!("Parse error: {}", e)),
                         }
                     }
@@ -3784,13 +3916,15 @@ pub async fn handle_images_edits(
     let mut images: Vec<Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut used_email: Option<String> = None;
+    let mut used_peak: Option<u32> = None;
 
     for (idx, task) in tasks.into_iter().enumerate() {
         match task.await {
             Ok(result) => match result {
-                Ok((gemini_resp, response_format, email_used)) => {
+                Ok((gemini_resp, response_format, email_used, peak)) => {
                     if used_email.is_none() {
                         used_email = Some(email_used);
+                        used_peak = peak;
                     }
                     let raw = gemini_resp.get("response").unwrap_or(&gemini_resp);
                     if let Some(parts) = raw
@@ -3885,10 +4019,12 @@ pub async fn handle_images_edits(
     let email_header = used_email.unwrap_or_default();
     Ok((
         StatusCode::OK,
-        [
-            ("X-Mapped-Model", clean_model_name.as_str()),
-            ("X-Account-Email", email_header.as_str()),
-        ],
+        crate::proxy::account_inflight::account_headers(
+            &email_header,
+            None,
+            Some(&clean_model_name),
+            used_peak,
+        ),
         Json(openai_response),
     )
         .into_response())

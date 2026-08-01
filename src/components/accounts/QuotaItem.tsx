@@ -31,6 +31,9 @@ export function QuotaItem({ label, percentage, resetTime, isProtected, liveLimit
             `Reason: ${liveLimit.reason}.`,
             `Quota snapshot can still show ${percentage}%.`,
             liveLimit.message ? `Message: ${liveLimit.message}` : null,
+            liveLimit.in_flight_peak != null
+                ? t('monitor.details.in_flight_peak') + `: ${liveLimit.in_flight_peak}`
+                : null,
         ].filter(Boolean).join(' ')
         : label;
     const getBgColorClass = (p: number) => {

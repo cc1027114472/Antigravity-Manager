@@ -14,6 +14,9 @@ pub struct LiveLimitStatus {
     pub detected_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Peak overlapping in-flight requests on this account when the error was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight_peak: Option<u32>,
 }
 
 /// 账号数据结构
