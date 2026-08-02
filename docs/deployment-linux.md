@@ -2,6 +2,8 @@
 
 This project can run on a Linux server in headless mode. The server builds the existing Docker image locally, so Node, Rust, and the native build dependencies remain inside Docker rather than being installed directly on the host.
 
+The server Compose build uses the host network only during image construction so Docker can use the host's working DNS configuration. The running application remains restricted to `127.0.0.1:8045`.
+
 ## Prerequisites
 
 - Ubuntu/Debian Linux with Docker Engine and the Docker Compose plugin.

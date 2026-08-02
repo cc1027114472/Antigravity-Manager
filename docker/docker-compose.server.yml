@@ -3,6 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      network: host
       args:
         USE_MIRROR: ${USE_MIRROR:-auto}
     image: antigravity-manager:server
