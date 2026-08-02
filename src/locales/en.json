@@ -294,8 +294,8 @@
         "error_token": "Please enter Refresh Token",
         "batch_progress": "Importing {{current}}/{{total}} accounts...",
         "batch_success": "Successfully imported {{count}} accounts",
-        "batch_partial": "Import finished: {{success}} success, {{fail}} failed",
-        "batch_fail": "Import failed"
+        "batch_partial": "Import finished: {{success}} success, {{fail}} failed. Reason: {{error}}",
+        "batch_fail": "Import failed: {{error}}"
       },
       "import": {
         "scheme_a": "Plan A: From IDE DB",

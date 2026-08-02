@@ -250,8 +250,8 @@
         "error_token": "請填寫 Refresh Token",
         "batch_progress": "正在匯入第 {{current}}/{{total}} 個帳戶...",
         "batch_success": "成功匯入 {{count}} 個帳戶",
-        "batch_partial": "匯入完成: {{success}} 個成功, {{fail}} 個失敗",
-        "batch_fail": "匯入失敗"
+        "batch_partial": "匯入完成: {{success}} 個成功, {{fail}} 個失敗。原因: {{error}}",
+        "batch_fail": "匯入失敗: {{error}}"
       },
       "import": {
         "scheme_a": "方案 A: 從當前 IDE 資料庫",

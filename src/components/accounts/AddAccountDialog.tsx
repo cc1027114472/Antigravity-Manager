@@ -238,6 +238,18 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         // 3. 批量添加
         let successCount = 0;
         let failCount = 0;
+        const failErrors: string[] = [];
+
+        const formatAddError = (error: unknown): string => {
+            if (typeof error === 'string') return error;
+            if (error instanceof Error) return error.message || String(error);
+            if (error && typeof error === 'object') {
+                const obj = error as Record<string, unknown>;
+                if (typeof obj.message === 'string' && obj.message) return obj.message;
+                if (typeof obj.error === 'string' && obj.error) return obj.error;
+            }
+            return String(error);
+        };
 
         for (let i = 0; i < tokens.length; i++) {
             const currentToken = tokens[i];
@@ -247,12 +259,20 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                 await onAdd("", currentToken);
                 successCount++;
             } catch (error) {
+                const detail = formatAddError(error);
                 console.error(`Failed to add token ${i + 1}:`, error);
                 failCount++;
+                failErrors.push(
+                    tokens.length > 1 ? `#${i + 1}: ${detail}` : detail
+                );
             }
             // 稍微延迟一下,避免太快
             await new Promise(r => setTimeout(r, 100));
         }
+
+        const errorSummary = failErrors.join(' | ') || 'unknown';
+        const withErrorDetail = (translated: string) =>
+            translated.includes(errorSummary) ? translated : `${translated}: ${errorSummary}`;
 
         // 4. 结果反馈
         if (successCount === tokens.length) {
@@ -264,13 +284,17 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
             }, 1500);
         } else if (successCount > 0) {
             // 部分成功
-            setStatus('success'); // 还是用绿色,但提示部分失败
-            setMessage(t('accounts.add.token.batch_partial', { success: successCount, fail: failCount }));
+            setStatus('error');
+            setMessage(withErrorDetail(t('accounts.add.token.batch_partial', {
+                success: successCount,
+                fail: failCount,
+                error: errorSummary,
+            })));
             // 不自动关闭,让用户看到结果
         } else {
             // 全部失败
             setStatus('error');
-            setMessage(t('accounts.add.token.batch_fail'));
+            setMessage(withErrorDetail(t('accounts.add.token.batch_fail', { error: errorSummary })));
         }
     };
 
@@ -455,9 +479,9 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         };
 
         return (
-            <div className={`alert ${styles[status]} mb-4 text-sm py-2 shadow-sm`}>
+            <div className={`alert ${styles[status]} mb-4 text-sm py-2 shadow-sm items-start`}>
                 {icons[status]}
-                <span>{message}</span>
+                <span className="whitespace-pre-wrap break-all max-h-40 overflow-y-auto">{message}</span>
             </div>
         );
     };

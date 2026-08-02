@@ -293,8 +293,8 @@
         "error_token": "请填写 Refresh Token",
         "batch_progress": "正在导入第 {{current}}/{{total}} 个账户...",
         "batch_success": "成功导入 {{count}} 个账户",
-        "batch_partial": "导入完成: {{success}} 个成功, {{fail}} 个失败",
-        "batch_fail": "导入失败"
+        "batch_partial": "导入完成: {{success}} 个成功, {{fail}} 个失败。原因: {{error}}",
+        "batch_fail": "导入失败: {{error}}"
       },
       "import": {
         "scheme_a": "方案 A: 自动扫描本地已登录账号",
