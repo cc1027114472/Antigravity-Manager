@@ -1,0 +1,22 @@
+services:
+  antigravity-manager:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        USE_MIRROR: ${USE_MIRROR:-auto}
+    image: antigravity-manager:server
+    container_name: antigravity-manager
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8045:8045"
+    volumes:
+      - /opt/antigravity-manager/data:/root/.antigravity_tools
+    environment:
+      API_KEY: ${API_KEY:?API_KEY must be set in .env}
+      WEB_PASSWORD: ${WEB_PASSWORD:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ABV_MAX_BODY_SIZE: ${ABV_MAX_BODY_SIZE:-104857600}
+      ABV_PUBLIC_URL: ${ABV_PUBLIC_URL:-}
+      ABV_BIND_LOCAL_ONLY: "false"
