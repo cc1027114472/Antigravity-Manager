@@ -18,7 +18,8 @@ COPY tsconfig.json tsconfig.node.json vite.config.ts tailwind.config.js postcss.
 COPY public ./public
 COPY src ./src
 COPY src-tauri/icons ./src-tauri/icons
-RUN npm run build
+# The frontend bundle needs more than Node's default heap limit on small servers.
+RUN NODE_OPTIONS=--max-old-space-size=1536 npm run build
 
 # --- Backend Build Stage ---
 FROM rust:1-slim-bookworm AS backend-builder
