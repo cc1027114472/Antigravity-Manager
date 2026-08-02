@@ -193,6 +193,70 @@ test('split display: without ledger, Gemini slots share official 5h %', () => {
     assertEq(claude?.percentage, 21);
 });
 
+test('split display: weekly exhausted (0%) overrides 5h snapshot', () => {
+    const account = baseAccount({
+        quota: {
+            models: [],
+            last_updated: 1,
+            quota_groups: [
+                {
+                    display_name: 'Gemini Models',
+                    buckets: [
+                        {
+                            bucket_id: 'gemini-weekly',
+                            window: 'weekly',
+                            remaining_fraction: 0,
+                            reset_time: 'reset-weekly',
+                        },
+                        {
+                            bucket_id: 'gemini-5h',
+                            window: '5h',
+                            remaining_fraction: 1,
+                            reset_time: 'reset-5h',
+                        },
+                    ],
+                },
+            ],
+        },
+    });
+    const rows = getSplitQuotaDisplays(account);
+    const gemini = rows.find((r) => r.id === 'gemini-pro');
+    assertEq(gemini?.percentage, 0);
+    assertEq(gemini?.reset_time, 'reset-weekly');
+});
+
+test('split display: weekly healthy still prefers 5h', () => {
+    const account = baseAccount({
+        quota: {
+            models: [],
+            last_updated: 1,
+            quota_groups: [
+                {
+                    display_name: 'Gemini Models',
+                    buckets: [
+                        {
+                            bucket_id: 'gemini-weekly',
+                            window: 'weekly',
+                            remaining_fraction: 0.5,
+                            reset_time: 'reset-weekly',
+                        },
+                        {
+                            bucket_id: 'gemini-5h',
+                            window: '5h',
+                            remaining_fraction: 0.8,
+                            reset_time: 'reset-5h',
+                        },
+                    ],
+                },
+            ],
+        },
+    });
+    const rows = getSplitQuotaDisplays(account);
+    const gemini = rows.find((r) => r.id === 'gemini-pro');
+    assertEq(gemini?.percentage, 80);
+    assertEq(gemini?.reset_time, 'reset-5h');
+});
+
 test('list display: showAll=false defaults to four split slots', () => {
     const account = baseAccount({
         estimated_quotas: {

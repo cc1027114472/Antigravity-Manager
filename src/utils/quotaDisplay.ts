@@ -77,17 +77,22 @@ function fractionToPct(fraction: number): number {
     return Math.round(Math.min(100, Math.max(0, fraction * 100)));
 }
 
-/** Prefer 5h bucket from official quota_groups. */
+/**
+ * Prefer 5h bucket from official quota_groups.
+ * When weekly remaining is exhausted (≤0%), prefer weekly so list shows the binding reset.
+ */
 export function officialBillingPercentages(
     groups: QuotaGroup[] | undefined | null,
 ): Partial<Record<BillingGroup, { percentage: number; reset_time?: string }>> {
     if (!groups?.length) return {};
     const fiveH: Partial<Record<BillingGroup, { percentage: number; reset_time?: string }>> = {};
+    const weekly: Partial<Record<BillingGroup, { percentage: number; reset_time?: string }>> = {};
     const fallback: Partial<Record<BillingGroup, { percentage: number; reset_time?: string }>> = {};
 
     for (const group of groups) {
         for (const bucket of group.buckets ?? []) {
             const id = (bucket.bucket_id || '').toLowerCase();
+            const window = (bucket.window || '').toLowerCase();
             let billing: BillingGroup | null = null;
             if (id.startsWith('gemini') || id.includes('gemini')) billing = 'gemini';
             else if (id.startsWith('3p') || id.includes('3p') || id.includes('claude')) billing = 'claude';
@@ -101,13 +106,28 @@ export function officialBillingPercentages(
                 percentage: fractionToPct(bucket.remaining_fraction),
                 reset_time: bucket.reset_time,
             };
-            const is5h =
-                (bucket.window || '').toLowerCase() === '5h' || id.includes('5h');
+            const is5h = window === '5h' || id.includes('5h');
+            const isWeekly = window === 'weekly' || id.includes('weekly');
             if (is5h) fiveH[billing] = entry;
+            else if (isWeekly) weekly[billing] = entry;
             else if (!fallback[billing]) fallback[billing] = entry;
         }
     }
-    return { ...fallback, ...fiveH };
+
+    const out: Partial<Record<BillingGroup, { percentage: number; reset_time?: string }>> = {
+        ...fallback,
+        ...fiveH,
+    };
+    for (const [billing, entry] of Object.entries(weekly) as Array<
+        [BillingGroup, { percentage: number; reset_time?: string }]
+    >) {
+        if (entry.percentage <= 0) {
+            out[billing] = entry;
+        } else if (!out[billing]) {
+            out[billing] = entry;
+        }
+    }
+    return out;
 }
 
 function onlineBillingMins(
