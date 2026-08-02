@@ -46,6 +46,39 @@ pub struct PoolProxyConfig {
     pub entry_id: String,
 }
 
+/// Actual HTTP egress used for a request (pool node / app upstream / direct).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressRoute {
+    /// Bound or pool-selected proxy node
+    Pool { entry_id: String },
+    /// App-config global upstream proxy
+    Upstream,
+    /// No proxy
+    Direct,
+}
+
+impl EgressRoute {
+    /// Chinese prefix for error messages shown in the UI.
+    pub fn error_prefix(&self) -> String {
+        match self {
+            EgressRoute::Pool { entry_id } => format!("[代理池:{}]", entry_id),
+            EgressRoute::Upstream => "[上游代理]".to_string(),
+            EgressRoute::Direct => "[直连]".to_string(),
+        }
+    }
+
+    /// Resolve upstream vs direct from app config (when no pool proxy was selected).
+    pub fn from_app_upstream_fallback() -> Self {
+        if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+            let up = app_cfg.proxy.upstream_proxy;
+            if up.enabled && !up.url.is_empty() {
+                return EgressRoute::Upstream;
+            }
+        }
+        EgressRoute::Direct
+    }
+}
+
 /// Pins a resolved egress for one account so nested ops (token/quota/project)
 /// reuse the same proxy without re-running pool selection (e.g. RoundRobin).
 pub struct AccountEgressGuard {
@@ -202,6 +235,17 @@ impl ProxyPoolManager {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> Client {
+        self.get_effective_standard_client_with_route(account_id, timeout_secs)
+            .await
+            .0
+    }
+
+    /// Same egress selection as `get_effective_standard_client`, plus the resolved route label.
+    pub async fn get_effective_standard_client_with_route(
+        &self,
+        account_id: Option<&str>,
+        timeout_secs: u64,
+    ) -> (Client, EgressRoute) {
         let mut builder = Client::builder()
             // 无 Emulation 设置，走纯正的基础 TLS 指纹
             .timeout(Duration::from_secs(timeout_secs));
@@ -231,10 +275,13 @@ impl ProxyPoolManager {
             }
         };
 
-        if let Some(proxy_cfg) = proxy_opt {
+        let route = if let Some(proxy_cfg) = proxy_opt {
+            let entry_id = proxy_cfg.entry_id.clone();
             builder = builder.proxy(proxy_cfg.proxy);
+            EgressRoute::Pool { entry_id }
         } else {
             // Fallback 到应用配置的单上游代理
+            let mut resolved = EgressRoute::Direct;
             if let Ok(app_cfg) = crate::modules::config::load_app_config() {
                 let up = app_cfg.proxy.upstream_proxy;
                 if up.enabled && !up.url.is_empty() {
@@ -245,6 +292,7 @@ impl ProxyPoolManager {
                             up.url
                         );
                         builder = builder.proxy(p);
+                        resolved = EgressRoute::Upstream;
                     }
                 } else {
                     tracing::info!(
@@ -253,9 +301,11 @@ impl ProxyPoolManager {
                     );
                 }
             }
-        }
+            resolved
+        };
 
-        builder.build().unwrap_or_else(|_| Client::new())
+        let client = builder.build().unwrap_or_else(|_| Client::new());
+        (client, route)
     }
 
     fn fallback_egress_key() -> String {
@@ -999,5 +1049,32 @@ mod tests {
             second.as_ref().map(|p| p.entry_id.as_str())
         );
         assert_eq!(key, format!("proxy:{}", first.as_ref().unwrap().entry_id));
+    }
+
+    #[test]
+    fn test_egress_route_error_prefix() {
+        assert_eq!(
+            EgressRoute::Pool {
+                entry_id: "node-1".into()
+            }
+            .error_prefix(),
+            "[代理池:node-1]"
+        );
+        assert_eq!(EgressRoute::Upstream.error_prefix(), "[上游代理]");
+        assert_eq!(EgressRoute::Direct.error_prefix(), "[直连]");
+    }
+
+    #[tokio::test]
+    async fn test_standard_client_with_route_returns_pool() {
+        let pool = test_pool(vec![proxy("pool-node", None)]);
+        let (_client, route) = pool
+            .get_effective_standard_client_with_route(Some("unbound-acc"), 15)
+            .await;
+        match route {
+            EgressRoute::Pool { entry_id } => {
+                assert_eq!(entry_id, "pool-node");
+            }
+            other => panic!("expected Pool route, got {:?}", other),
+        }
     }
 }

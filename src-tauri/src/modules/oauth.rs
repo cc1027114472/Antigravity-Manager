@@ -372,11 +372,15 @@ async fn exchange_code_once(
     client_cfg: &OAuthClientConfig,
 ) -> Result<TokenResponse, (Option<reqwest::StatusCode>, String)> {
     // [PHASE 2] 对于登录行为，尚未有 account_id，使用全局池阶梯逻辑
-    let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(None, 60).await
+    let (client, egress) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+        pool.get_effective_standard_client_with_route(None, 60).await
     } else {
-        crate::utils::http::get_long_standard_client()
+        (
+            crate::utils::http::get_long_standard_client(),
+            crate::proxy::proxy_pool::EgressRoute::from_app_upstream_fallback(),
+        )
     };
+    let prefix = egress.error_prefix();
 
     let params = [
         ("client_id", client_cfg.client_id.as_str()),
@@ -402,12 +406,15 @@ async fn exchange_code_once(
                 (
                     None,
                     format!(
-                        "Token exchange request failed: {}. 请检查你的网络代理设置，确保可以稳定连接 Google 服务。",
-                        e
+                        "{} Token exchange request failed: {}. 请检查你的网络代理设置，确保可以稳定连接 Google 服务。",
+                        prefix, e
                     ),
                 )
             } else {
-                (None, format!("Token exchange request failed: {}", e))
+                (
+                    None,
+                    format!("{} Token exchange request failed: {}", prefix, e),
+                )
             }
         })?;
 
@@ -415,7 +422,12 @@ async fn exchange_code_once(
         let mut token_res = response
             .json::<TokenResponse>()
             .await
-            .map_err(|e| (None, format!("Token parsing failed: {}", e)))?;
+            .map_err(|e| {
+                (
+                    None,
+                    format!("{} Token parsing failed: {}", prefix, e),
+                )
+            })?;
         token_res.oauth_client_key = Some(client_cfg.key.clone());
 
         // Add detailed logs
@@ -446,7 +458,7 @@ async fn exchange_code_once(
         let error_text = response.text().await.unwrap_or_default();
         Err((
             Some(status),
-            format!("Token exchange failed: {}", error_text),
+            format!("{} Token exchange failed: {}", prefix, error_text),
         ))
     }
 }
@@ -516,11 +528,16 @@ async fn refresh_access_token_once(
     client_cfg: &OAuthClientConfig,
 ) -> Result<TokenResponse, (Option<reqwest::StatusCode>, String)> {
     // [PHASE 2] 根据 account_id 使用与 AI 反代相同的代理选择（bound → pool → upstream → direct）
-    let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(account_id, 60).await
+    let (client, egress) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+        pool.get_effective_standard_client_with_route(account_id, 60)
+            .await
     } else {
-        crate::utils::http::get_long_standard_client()
+        (
+            crate::utils::http::get_long_standard_client(),
+            crate::proxy::proxy_pool::EgressRoute::from_app_upstream_fallback(),
+        )
     };
+    let prefix = egress.error_prefix();
 
     let params = [
         ("client_id", client_cfg.client_id.as_str()),
@@ -531,9 +548,15 @@ async fn refresh_access_token_once(
 
     // [FIX #1583] 提供更详细的日志，帮助诊断 Docker 环境下的代理问题
     if let Some(id) = account_id {
-        crate::modules::logger::log_info(&format!("Refreshing Token for account: {}...", id));
+        crate::modules::logger::log_info(&format!(
+            "Refreshing Token for account: {} via {}...",
+            id, prefix
+        ));
     } else {
-        crate::modules::logger::log_info("Refreshing Token for generic request (no account_id)...");
+        crate::modules::logger::log_info(&format!(
+            "Refreshing Token for generic request via {}...",
+            prefix
+        ));
     }
 
     tracing::debug!(
@@ -555,12 +578,15 @@ async fn refresh_access_token_once(
                 (
                     None,
                     format!(
-                        "Refresh request failed: {}. 无法连接 Google 授权服务器，请检查代理设置。",
-                        e
+                        "{} Refresh request failed: {}. 无法连接 Google 授权服务器，请检查代理设置。",
+                        prefix, e
                     ),
                 )
             } else {
-                (None, format!("Refresh request failed: {}", e))
+                (
+                    None,
+                    format!("{} Refresh request failed: {}", prefix, e),
+                )
             }
         })?;
 
@@ -568,7 +594,12 @@ async fn refresh_access_token_once(
         let mut token_data = response
             .json::<TokenResponse>()
             .await
-            .map_err(|e| (None, format!("Refresh data parsing failed: {}", e)))?;
+            .map_err(|e| {
+                (
+                    None,
+                    format!("{} Refresh data parsing failed: {}", prefix, e),
+                )
+            })?;
         token_data.oauth_client_key = Some(client_cfg.key.clone());
 
         crate::modules::logger::log_info(&format!(
@@ -579,7 +610,10 @@ async fn refresh_access_token_once(
     } else {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        Err((Some(status), format!("Refresh failed: {}", error_text)))
+        Err((
+            Some(status),
+            format!("{} Refresh failed: {}", prefix, error_text),
+        ))
     }
 }
 
