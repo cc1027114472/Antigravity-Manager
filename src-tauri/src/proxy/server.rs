@@ -591,6 +591,10 @@ impl AxumServer {
             .route("/accounts/import/db", post(admin_import_from_db))
             .route("/accounts/import/db-custom", post(admin_import_custom_db))
             .route("/accounts/sync/db", post(admin_sync_account_from_db))
+            .route(
+                "/sync/batch-import-with-proxies",
+                post(admin_sync_batch_import_with_proxies),
+            )
             .route("/stats/summary", get(admin_get_token_stats_summary))
             .route("/stats/hourly", get(admin_get_token_stats_hourly))
             .route("/stats/daily", get(admin_get_token_stats_daily))
@@ -4152,4 +4156,375 @@ async fn admin_get_droid_config_content(
                 Json(ErrorResponse { error: e }),
             )
         })
+}
+
+// ============================================================================
+// 批量导入与代理去重绑定接口 (Task 1)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportProxyPayload {
+    pub protocol: String, // socks5, http, https
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub name: Option<String>,
+    pub country: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportItem {
+    pub email: Option<String>,
+    pub refresh_token: String,
+    pub proxy: Option<BatchImportProxyPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportWithProxiesRequest {
+    pub items: Vec<BatchImportItem>,
+    #[serde(default = "default_true")]
+    pub auto_enable_proxy_pool: bool,
+    #[serde(default = "default_true")]
+    pub overwrite_existing_bindings: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportSummary {
+    pub total: usize,
+    pub accounts: AccountImportStats,
+    pub proxies: ProxyImportStats,
+    pub bindings: BindingImportStats,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountImportStats {
+    pub added: usize,
+    pub updated: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyImportStats {
+    pub new_created: usize,
+    pub reused_existing: usize,
+    pub unbound_direct: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindingImportStats {
+    pub success_count: usize,
+    pub skipped_direct: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportDetailItem {
+    pub email: String,
+    pub account_id: Option<String>,
+    pub proxy_id: Option<String>,
+    pub status: String, // "bound", "direct_warning", "failed"
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportWithProxiesResponse {
+    pub success: bool,
+    pub summary: BatchImportSummary,
+    pub details: Vec<BatchImportDetailItem>,
+    pub errors: Vec<String>,
+}
+
+async fn admin_sync_batch_import_with_proxies(
+    State(state): State<AppState>,
+    Json(payload): Json<BatchImportWithProxiesRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let total = payload.items.len();
+    let mut account_stats = AccountImportStats {
+        added: 0,
+        updated: 0,
+        failed: 0,
+    };
+    let mut proxy_stats = ProxyImportStats {
+        new_created: 0,
+        reused_existing: 0,
+        unbound_direct: 0,
+    };
+    let mut binding_stats = BindingImportStats {
+        success_count: 0,
+        skipped_direct: 0,
+    };
+    let mut details = Vec::new();
+    let mut errors = Vec::new();
+
+    // a & b: Collect existing proxies and deduplicate / resolve proxy_id
+    let existing_proxies = {
+        let pool = state.proxy_pool_state.read().await;
+        pool.proxies.clone()
+    };
+
+    let normalize_url = |protocol: &str, host: &str, port: u16| -> String {
+        format!(
+            "{}://{}:{}",
+            protocol.trim().to_lowercase(),
+            host.trim().to_lowercase(),
+            port
+        )
+    };
+
+    let normalize_user = |u: &Option<String>| -> Option<String> {
+        u.as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+
+    let mut new_proxies: Vec<crate::proxy::config::ProxyEntry> = Vec::new();
+    // Key: (normalized_url, normalized_username) -> (proxy_id, is_newly_created)
+    let mut proxy_id_map: std::collections::HashMap<(String, Option<String>), (String, bool)> =
+        std::collections::HashMap::new();
+
+    for ep in &existing_proxies {
+        let ep_url = ep.url.trim().trim_end_matches('/').to_lowercase();
+        let ep_user = ep
+            .auth
+            .as_ref()
+            .map(|a| a.username.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        proxy_id_map
+            .entry((ep_url, ep_user))
+            .or_insert((ep.id.clone(), false));
+    }
+
+    let mut items_proxy_ids: Vec<Option<String>> = Vec::with_capacity(total);
+
+    for item in &payload.items {
+        if let Some(p) = &item.proxy {
+            let norm_url = normalize_url(&p.protocol, &p.host, p.port);
+            let norm_user = normalize_user(&p.username);
+            let key = (norm_url.clone(), norm_user.clone());
+
+            if let Some((existing_id, _is_new)) = proxy_id_map.get(&key) {
+                proxy_stats.reused_existing += 1;
+                items_proxy_ids.push(Some(existing_id.clone()));
+            } else {
+                let proxy_id = uuid::Uuid::new_v4().to_string();
+                let name = p.name.clone().unwrap_or_else(|| {
+                    if let Some(c) = &p.country {
+                        if !c.trim().is_empty() {
+                            format!("{}-{}", c.trim(), p.host.trim())
+                        } else {
+                            format!("{}:{}", p.protocol.trim().to_lowercase(), p.port)
+                        }
+                    } else {
+                        format!("{}:{}", p.protocol.trim().to_lowercase(), p.port)
+                    }
+                });
+
+                let auth = match (&p.username, &p.password) {
+                    (Some(u), Some(pwd)) if !u.trim().is_empty() => {
+                        Some(crate::proxy::config::ProxyAuth {
+                            username: u.trim().to_string(),
+                            password: pwd.clone(),
+                        })
+                    }
+                    (Some(u), None) if !u.trim().is_empty() => {
+                        Some(crate::proxy::config::ProxyAuth {
+                            username: u.trim().to_string(),
+                            password: String::new(),
+                        })
+                    }
+                    _ => None,
+                };
+
+                let mut tags = Vec::new();
+                if let Some(c) = &p.country {
+                    if !c.trim().is_empty() {
+                        tags.push(c.trim().to_string());
+                    }
+                }
+
+                let new_entry = crate::proxy::config::ProxyEntry {
+                    id: proxy_id.clone(),
+                    name,
+                    url: norm_url.clone(),
+                    auth,
+                    enabled: true,
+                    priority: 0,
+                    tags,
+                    max_accounts: None,
+                    health_check_url: None,
+                    last_check_time: None,
+                    is_healthy: true,
+                    latency: None,
+                };
+
+                new_proxies.push(new_entry);
+                proxy_id_map.insert(key, (proxy_id.clone(), true));
+                proxy_stats.new_created += 1;
+                items_proxy_ids.push(Some(proxy_id));
+            }
+        } else {
+            proxy_stats.unbound_direct += 1;
+            items_proxy_ids.push(None);
+        }
+    }
+
+    // c. Append new proxies to state.proxy_pool_state and save config
+    let need_enable =
+        payload.auto_enable_proxy_pool && !state.proxy_pool_state.read().await.enabled;
+    if !new_proxies.is_empty() || need_enable {
+        let mut pool_cfg = state.proxy_pool_state.write().await;
+        if !new_proxies.is_empty() {
+            pool_cfg.proxies.extend(new_proxies);
+        }
+        if payload.auto_enable_proxy_pool {
+            pool_cfg.enabled = true;
+        }
+        if let Ok(mut app_config) = crate::modules::config::load_app_config() {
+            app_config.proxy.proxy_pool = pool_cfg.clone();
+            if let Err(e) = crate::modules::config::save_app_config(&app_config) {
+                tracing::error!(
+                    "[BatchImport] Failed to save app config with updated proxy pool: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    let mut existing_emails: std::collections::HashSet<String> = state
+        .account_service
+        .list_accounts()
+        .map(|accs| accs.into_iter().map(|a| a.email).collect())
+        .unwrap_or_default();
+
+    // d. Iterate through payload.items
+    for (idx, item) in payload.items.into_iter().enumerate() {
+        let resolved_proxy_id = &items_proxy_ids[idx];
+
+        match state.account_service.add_account(&item.refresh_token).await {
+            Ok(account) => {
+                let was_existing = existing_emails.contains(&account.email);
+                if was_existing {
+                    account_stats.updated += 1;
+                } else {
+                    account_stats.added += 1;
+                    existing_emails.insert(account.email.clone());
+                }
+
+                if let Some(proxy_id) = resolved_proxy_id {
+                    let should_bind = if payload.overwrite_existing_bindings {
+                        true
+                    } else {
+                        state
+                            .proxy_pool_manager
+                            .get_account_binding(&account.id)
+                            .is_none()
+                    };
+
+                    if should_bind {
+                        match state
+                            .proxy_pool_manager
+                            .bind_account_to_proxy(account.id.clone(), proxy_id.clone())
+                            .await
+                        {
+                            Ok(()) => {
+                                binding_stats.success_count += 1;
+                                details.push(BatchImportDetailItem {
+                                    email: account.email.clone(),
+                                    account_id: Some(account.id.clone()),
+                                    proxy_id: Some(proxy_id.clone()),
+                                    status: "bound".to_string(),
+                                    error: None,
+                                });
+                            }
+                            Err(e) => {
+                                let err_msg =
+                                    format!("Failed to bind proxy for {}: {}", account.email, e);
+                                errors.push(err_msg.clone());
+                                details.push(BatchImportDetailItem {
+                                    email: account.email.clone(),
+                                    account_id: Some(account.id.clone()),
+                                    proxy_id: Some(proxy_id.clone()),
+                                    status: "failed".to_string(),
+                                    error: Some(err_msg),
+                                });
+                            }
+                        }
+                    } else {
+                        binding_stats.success_count += 1;
+                        let existing_bound_id =
+                            state.proxy_pool_manager.get_account_binding(&account.id);
+                        details.push(BatchImportDetailItem {
+                            email: account.email.clone(),
+                            account_id: Some(account.id.clone()),
+                            proxy_id: existing_bound_id,
+                            status: "bound".to_string(),
+                            error: None,
+                        });
+                    }
+                } else {
+                    // No proxy provided: unbind and mark as direct_warning
+                    state
+                        .proxy_pool_manager
+                        .unbind_account_proxy(account.id.clone())
+                        .await;
+                    binding_stats.skipped_direct += 1;
+                    details.push(BatchImportDetailItem {
+                        email: account.email.clone(),
+                        account_id: Some(account.id.clone()),
+                        proxy_id: None,
+                        status: "direct_warning".to_string(),
+                        error: None,
+                    });
+                }
+            }
+            Err(e) => {
+                account_stats.failed += 1;
+                let email_str = item.email.unwrap_or_else(|| "unknown".to_string());
+                let err_msg = format!("Account import failed ({}): {}", email_str, e);
+                errors.push(err_msg.clone());
+                details.push(BatchImportDetailItem {
+                    email: email_str,
+                    account_id: None,
+                    proxy_id: resolved_proxy_id.clone(),
+                    status: "failed".to_string(),
+                    error: Some(err_msg),
+                });
+            }
+        }
+    }
+
+    // e. Reload accounts in TokenManager and clear client cache
+    if let Err(e) = state.token_manager.load_accounts().await {
+        tracing::error!(
+            "[BatchImport] Failed to reload accounts in TokenManager: {}",
+            e
+        );
+    }
+    state.upstream.clear_client_cache();
+
+    // f. Construct response
+    let response = BatchImportWithProxiesResponse {
+        success: account_stats.failed == 0 && errors.is_empty(),
+        summary: BatchImportSummary {
+            total,
+            accounts: account_stats,
+            proxies: proxy_stats,
+            bindings: binding_stats,
+        },
+        details,
+        errors,
+    };
+
+    Ok(Json(response))
 }
