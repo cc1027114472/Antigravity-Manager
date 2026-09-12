@@ -144,9 +144,11 @@ async fn auth_middleware_internal(
 
     // 认证逻辑
     let authorized = if force_strict {
-        // 管理接口：优先使用独立的 admin_password，如果没有则回退使用 api_key
+        // 管理接口：支持独立的 admin_password 或全局 api_key
         match &security.admin_password {
-            Some(pwd) if !pwd.is_empty() => api_key.map(|k| k == pwd).unwrap_or(false),
+            Some(pwd) if !pwd.is_empty() => {
+                api_key.map(|k| k == pwd || k == security.api_key).unwrap_or(false)
+            }
             _ => {
                 // 回退使用 api_key
                 api_key.map(|k| k == security.api_key).unwrap_or(false)
