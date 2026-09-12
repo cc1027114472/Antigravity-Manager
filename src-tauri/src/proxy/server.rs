@@ -4182,6 +4182,10 @@ pub struct BatchImportItem {
     pub proxy: Option<BatchImportProxyPayload>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchImportWithProxiesRequest {
