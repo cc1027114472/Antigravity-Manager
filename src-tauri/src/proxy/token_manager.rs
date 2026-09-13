@@ -51,7 +51,7 @@ pub struct ProxyToken {
 }
 
 pub struct TokenManager {
-    tokens: Arc<DashMap<String, ProxyToken>>, // account_id -> ProxyToken
+    pub(crate) tokens: Arc<DashMap<String, ProxyToken>>, // account_id -> ProxyToken
     current_index: Arc<AtomicUsize>,
     last_used_account: Arc<tokio::sync::Mutex<Option<(String, std::time::Instant)>>>,
     data_dir: PathBuf,
@@ -93,6 +93,8 @@ pub struct TokenManager {
     /// 支持优雅关闭时主动 abort 后台任务
     auto_cleanup_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     cancel_token: CancellationToken,
+
+    pub auto_recovery: Arc<tokio::sync::RwLock<Option<Arc<crate::proxy::AutoRecoveryScheduler>>>>,
 }
 
 impl TokenManager {
@@ -122,7 +124,25 @@ impl TokenManager {
             last_advance_reason: Arc::new(tokio::sync::RwLock::new(None)),
             auto_cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cancel_token: CancellationToken::new(),
+            auto_recovery: Arc::new(tokio::sync::RwLock::new(None)),
         }
+    }
+
+    pub async fn set_auto_recovery_scheduler(
+        &self,
+        scheduler: Arc<crate::proxy::AutoRecoveryScheduler>,
+    ) {
+        let mut guard = self.auto_recovery.write().await;
+        *guard = Some(scheduler);
+    }
+
+    pub fn account_id_to_email(&self, account_id: &str) -> Option<String> {
+        if let Some(entry) = self.tokens.get(account_id) {
+            return Some(entry.email.clone());
+        }
+        crate::modules::account::load_account(account_id)
+            .ok()
+            .map(|a| a.email)
     }
 
     /// Begin overlapping in-flight tracking for an AI request on this account.
@@ -3292,13 +3312,50 @@ impl TokenManager {
     }
 
     /// 429：写入反代禁用，移出选号池，必要时推进串行游标
-    async fn disable_proxy_on_429(
+    pub async fn disable_proxy_on_429(
         &self,
         account_id: &str,
         model: Option<&str>,
         reason: crate::proxy::rate_limit::RateLimitReason,
         error_body: &str,
     ) {
+        let recovery_opt = self.auto_recovery.read().await.clone();
+        let email = self
+            .account_id_to_email(account_id)
+            .unwrap_or_else(|| account_id.to_string());
+        if let Some(ref recovery) = recovery_opt {
+            tracing::info!(
+                "[AutoRecovery] Executing Step 0 probe for account {} ({}) after 429...",
+                email,
+                account_id
+            );
+            match recovery.probe_account(account_id, &email).await {
+                Ok(true) => {
+                    tracing::info!(
+                        "🎉 [AutoRecovery] Step 0 probe SUCCEEDED for {} ({})! False 429 avoided, account remains active in pool.",
+                        email,
+                        account_id
+                    );
+                    self.clear_rate_limit(account_id);
+                    self.clear_persisted_live_limit(account_id, model).await;
+                    return;
+                }
+                Ok(false) => {
+                    tracing::info!(
+                        "[AutoRecovery] Step 0 probe failed for {}. Confirming real 429; disabling proxy and enqueuing for backoff auto-recovery.",
+                        email
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[AutoRecovery] Step 0 probe error for {}: {}. Proceeding with proxy-disable.",
+                        email,
+                        e
+                    );
+                }
+            }
+        }
+
         let reason_text = format!(
             "429 {:?}{}: {}",
             reason,
@@ -3340,6 +3397,14 @@ impl TokenManager {
                     ),
                 }
             }
+        }
+
+        if let Some(ref recovery) = recovery_opt {
+            recovery.enqueue_task(account_id, &email, &reason_text);
+            tracing::info!(
+                "[AutoRecovery] Account {} enqueued for backoff auto-recovery (Step 1 scheduled in 60s)",
+                email
+            );
         }
 
         crate::modules::log_bridge::emit_accounts_refreshed();

@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 use crate::proxy::auto_recovery::{get_backoff_delay, AutoRecoveryScheduler};
+use crate::proxy::token_manager::ProxyToken;
 
 #[test]
 fn test_backoff_ladder_intervals() {
@@ -193,4 +194,57 @@ async fn test_start_loop_cancels_cleanly() {
     let join_res = tokio::time::timeout(Duration::from_secs(2), handle).await;
     assert!(join_res.is_ok(), "Loop task should terminate after cancellation");
     assert!(join_res.unwrap().is_ok(), "Task join should succeed");
+}
+
+#[tokio::test]
+async fn test_token_manager_set_auto_recovery_scheduler() {
+    let temp_dir = std::env::temp_dir().join("test_tm_auto_recovery");
+    let token_manager = crate::proxy::TokenManager::new(temp_dir.clone());
+
+    // Initially auto_recovery is None
+    assert!(token_manager.auto_recovery.read().await.is_none());
+
+    // account_id_to_email for non-existent account returns None
+    assert_eq!(token_manager.account_id_to_email("non_existent_account"), None);
+
+    // Insert a token into token_manager
+    let proxy_token = ProxyToken {
+        account_id: "acc_tm_1".to_string(),
+        access_token: "test_token".to_string(),
+        refresh_token: "test_refresh".to_string(),
+        expires_in: 3600,
+        timestamp: 1000,
+        email: "tm_user@example.com".to_string(),
+        account_path: temp_dir.join("acc_tm_1.json"),
+        project_id: Some("proj_1".to_string()),
+        subscription_tier: Some("PRO".to_string()),
+        remaining_quota: Some(100),
+        protected_models: std::collections::HashSet::new(),
+        health_score: 1.0,
+        reset_time: None,
+        validation_blocked: false,
+        validation_blocked_until: 0,
+        validation_url: None,
+        model_quotas: std::collections::HashMap::new(),
+        model_limits: std::collections::HashMap::new(),
+        max_concurrency: None,
+    };
+    token_manager
+        .tokens
+        .insert("acc_tm_1".to_string(), proxy_token);
+
+    // account_id_to_email returns the email from tokens map
+    assert_eq!(
+        token_manager.account_id_to_email("acc_tm_1"),
+        Some("tm_user@example.com".to_string())
+    );
+
+    // Set auto recovery scheduler
+    let scheduler = std::sync::Arc::new(AutoRecoveryScheduler::new(temp_dir));
+    token_manager
+        .set_auto_recovery_scheduler(scheduler.clone())
+        .await;
+
+    // Verify auto_recovery is now Some
+    assert!(token_manager.auto_recovery.read().await.is_some());
 }
