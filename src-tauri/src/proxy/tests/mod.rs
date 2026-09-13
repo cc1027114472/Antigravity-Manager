@@ -1,3 +1,4 @@
+pub mod auto_recovery_tests;
 pub mod comprehensive;
 pub mod quota_protection;
 pub mod rate_limit_404_tests;

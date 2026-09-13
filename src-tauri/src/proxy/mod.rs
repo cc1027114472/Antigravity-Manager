@@ -10,6 +10,7 @@ pub mod token_manager;
 
 // 新架构模块
 pub mod audio; // 音频处理模块
+pub mod auto_recovery; // 429 自动探测自愈调度器
 pub mod cache_manager; // Context Cache 管理 (前缀哈希 → cache_id 映射)
 pub mod cli_sync; // CLI 配置同步 (v3.3.35)
 pub mod common; // 公共工具
@@ -32,6 +33,7 @@ pub mod upstream; // 上游客户端
 pub mod zai_vision_mcp; // Built-in Vision MCP server state
 pub mod zai_vision_tools; // Built-in Vision MCP tools (z.ai vision API) // 调试日志
 
+pub use auto_recovery::AutoRecoveryScheduler;
 pub use config::update_global_system_prompt_config;
 pub use config::update_image_thinking_mode;
 pub use config::update_thinking_budget_config;
