@@ -37,7 +37,7 @@
 - Modify: `src-tauri/src/proxy/mod.rs`
 - Test: `src-tauri/src/proxy/tests/auto_recovery_tests.rs`
 
-- [ ] **Step 1: 编写测试用例验证任务去重与退避阶梯计算**
+- [x] **Step 1: 编写测试用例验证任务去重与退避阶梯计算**
 
 ```rust
 // src-tauri/src/proxy/tests/auto_recovery_tests.rs
@@ -58,12 +58,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 运行测试确保编译失败（缺少定义）**
+- [x] **Step 2: 运行测试确保编译失败（缺少定义）**
 
 Run: `cargo test --package antigravity-manager --lib proxy::tests::auto_recovery_tests`
 Expected: FAIL due to unresolved import `auto_recovery`
 
-- [ ] **Step 3: 实现 `auto_recovery.rs` 的核心数据结构**
+- [x] **Step 3: 实现 `auto_recovery.rs` 的核心数据结构**
 
 在 `src-tauri/src/proxy/auto_recovery.rs` 中定义：
 * `get_backoff_delay(attempt: u8) -> std::time::Duration`
@@ -76,12 +76,12 @@ Expected: FAIL due to unresolved import `auto_recovery`
 * 在 `src-tauri/src/proxy/mod.rs` 中添加 `pub mod auto_recovery;`
 * 在 `src-tauri/src/proxy/tests/mod.rs` 中添加 `pub mod auto_recovery_tests;`
 
-- [ ] **Step 4: 运行测试验证基础阶梯与队列**
+- [x] **Step 4: 运行测试验证基础阶梯与队列**
 
 Run: `cargo test --package antigravity-manager --lib proxy::tests::auto_recovery_tests`
 Expected: PASS
 
-- [ ] **Step 5: 提交代码**
+- [x] **Step 5: 提交代码**
 
 ```bash
 git add src-tauri/src/proxy/auto_recovery.rs src-tauri/src/proxy/mod.rs src-tauri/src/proxy/tests/auto_recovery_tests.rs src-tauri/src/proxy/tests/mod.rs
@@ -96,11 +96,11 @@ git commit -m "feat(proxy): add auto-recovery data structures and backoff ladder
 - Modify: `src-tauri/src/proxy/auto_recovery.rs`
 - Test: `src-tauri/src/proxy/tests/auto_recovery_tests.rs`
 
-- [ ] **Step 1: 编写探针构建与校验的测试用例**
+- [x] **Step 1: 编写探针构建与校验的测试用例**
 
 在 `src-tauri/src/proxy/tests/auto_recovery_tests.rs` 中添加针对探针 payload 结构与超时的验证。
 
-- [ ] **Step 2: 实现探针执行方法 `probe_account`**
+- [x] **Step 2: 实现探针执行方法 `probe_account`**
 
 在 `AutoRecoveryScheduler` 中实现异步方法：
 ```rust
@@ -116,12 +116,12 @@ pub async fn probe_account(
 }
 ```
 
-- [ ] **Step 3: 运行测试验证**
+- [x] **Step 3: 运行测试验证**
 
 Run: `cargo test --package antigravity-manager --lib proxy::tests::auto_recovery_tests`
 Expected: PASS
 
-- [ ] **Step 4: 提交代码**
+- [x] **Step 4: 提交代码**
 
 ```bash
 git add src-tauri/src/proxy/auto_recovery.rs src-tauri/src/proxy/tests/auto_recovery_tests.rs
@@ -136,7 +136,7 @@ git commit -m "feat(proxy): implement gemini-2.5-flash probe request in auto_rec
 - Modify: `src-tauri/src/proxy/auto_recovery.rs`
 - Test: `src-tauri/src/proxy/tests/auto_recovery_tests.rs`
 
-- [ ] **Step 1: 编写状态翻转与自愈联动的集成测试**
+- [x] **Step 1: 编写状态翻转与自愈联动的集成测试**
 
 测试自愈成功后账号在文件和内存中的状态：
 * `account.proxy_disabled == false`
@@ -144,7 +144,7 @@ git commit -m "feat(proxy): implement gemini-2.5-flash probe request in auto_rec
 * `RateLimitTracker` 中无残留限流记录
 * 任务从 `AutoRecoveryScheduler` 中移除。
 
-- [ ] **Step 2: 实现 `recover_account` 与轮询 `start_loop`**
+- [x] **Step 2: 实现 `recover_account` 与轮询 `start_loop`**
 
 在 `AutoRecoveryScheduler` 中实现：
 * `recover_account(&self, account_id: &str, email: &str, attempt: u8) -> Result<(), String>`:
@@ -159,12 +159,12 @@ git commit -m "feat(proxy): implement gemini-2.5-flash probe request in auto_rec
   * 并行探测到期账号；
   * 成功调 `recover_account`，失败按阶梯累加 `attempt`，满 4 次则移除。
 
-- [ ] **Step 3: 运行测试验证**
+- [x] **Step 3: 运行测试验证**
 
 Run: `cargo test --package antigravity-manager --lib proxy::tests::auto_recovery_tests`
 Expected: PASS
 
-- [ ] **Step 4: 提交代码**
+- [x] **Step 4: 提交代码**
 
 ```bash
 git add src-tauri/src/proxy/auto_recovery.rs src-tauri/src/proxy/tests/auto_recovery_tests.rs
@@ -180,13 +180,13 @@ git commit -m "feat(proxy): implement recovery actions and backoff loop"
 - Modify: `src-tauri/src/proxy/auto_recovery.rs`
 - Test: `src-tauri/src/proxy/tests/auto_recovery_tests.rs`
 
-- [ ] **Step 1: 编写 Step 0 即时探测成功与失败的测试**
+- [x] **Step 1: 编写 Step 0 即时探测成功与失败的测试**
 
 验证：
 * Step 0 探测成功时：不落盘禁用，直接清除限流标记；
 * Step 0 探测失败时：落盘禁用，并以 Step 1 (1分钟后) 入队调度器。
 
-- [ ] **Step 2: 修改 `disable_proxy_on_429` 接入 Step 0 与调度器**
+- [x] **Step 2: 修改 `disable_proxy_on_429` 接入 Step 0 与调度器**
 
 在 `TokenManager` 中：
 * 注入 `auto_recovery: Arc<tokio::sync::RwLock<Option<Arc<AutoRecoveryScheduler>>>>`；
@@ -194,12 +194,12 @@ git commit -m "feat(proxy): implement recovery actions and backoff loop"
   * 若成功：取消本次禁用，记录日志并返回；
   * 若失败：执行写盘 `toggle_proxy_status(account_id, false, ...)`，并调用 `scheduler.enqueue_task(...)`。
 
-- [ ] **Step 3: 运行单元测试**
+- [x] **Step 3: 运行单元测试**
 
 Run: `cargo test --package antigravity-manager --lib proxy::tests::auto_recovery_tests`
 Expected: PASS
 
-- [ ] **Step 4: 提交代码**
+- [x] **Step 4: 提交代码**
 
 ```bash
 git add src-tauri/src/proxy/token_manager.rs src-tauri/src/proxy/auto_recovery.rs src-tauri/src/proxy/tests/auto_recovery_tests.rs
@@ -215,7 +215,7 @@ git commit -m "feat(proxy): hook Step 0 instant probe and backoff enqueue into d
 - Modify: `src-tauri/src/proxy/auto_recovery.rs`
 - Modify: `src-tauri/src/commands/proxy.rs`
 
-- [ ] **Step 1: 实现启动扫描纳管 `scan_and_enqueue_disabled`**
+- [x] **Step 1: 实现启动扫描纳管 `scan_and_enqueue_disabled`**
 
 在 `AutoRecoveryScheduler` 中实现：
 * 扫描 `data_dir/accounts/*.json`；
@@ -223,7 +223,7 @@ git commit -m "feat(proxy): hook Step 0 instant probe and backoff enqueue into d
 * 自动以 `attempt = 1, next_probe_at = now + 60s` 注册进队列；
 * 日志记录纳管账号总数。
 
-- [ ] **Step 2: 在 `server.rs` 与 `AppState` 中挂载并启动后台任务**
+- [x] **Step 2: 在 `server.rs` 与 `AppState` 中挂载并启动后台任务**
 
 * 在 `AppState` 中新增 `pub auto_recovery: Arc<AutoRecoveryScheduler>`；
 * 服务启动时：
@@ -232,12 +232,12 @@ git commit -m "feat(proxy): hook Step 0 instant probe and backoff enqueue into d
   3. 将调度器注入 `token_manager`。
 * 服务停止时：通过 `cancel_token` 安全取消后台协程。
 
-- [ ] **Step 3: 运行全量 proxy 测试**
+- [x] **Step 3: 运行全量 proxy 测试**
 
 Run: `cargo test --package antigravity-manager --lib proxy::tests`
 Expected: All tests PASS
 
-- [ ] **Step 4: 提交代码**
+- [x] **Step 4: 提交代码**
 
 ```bash
 git add src-tauri/src/proxy/server.rs src-tauri/src/proxy/auto_recovery.rs src-tauri/src/commands/proxy.rs
@@ -251,17 +251,17 @@ git commit -m "feat(proxy): bind auto-recovery scheduler to server lifecycle and
 **Files:**
 - Verify: 全局编译与全量测试
 
-- [ ] **Step 1: 执行 cargo check 验证无警告与类型错误**
+- [x] **Step 1: 执行 cargo check 验证无警告与类型错误**
 
 Run: `cargo check`
 Expected: Finished dev profile, no errors
 
-- [ ] **Step 2: 执行全量自动化测试**
+- [x] **Step 2: 执行全量自动化测试**
 
 Run: `cargo test --package antigravity-manager --lib`
 Expected: All tests PASS
 
-- [ ] **Step 3: 提交最终文档与代码**
+- [x] **Step 3: 提交最终文档与代码**
 
 ```bash
 git add docs/superpowers/plans/2026-08-02-proxy-429-auto-recovery.md
