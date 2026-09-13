@@ -162,3 +162,35 @@ async fn test_probe_account_uninitialized_dependencies() {
     assert!(result.is_err());
     assert_eq!(result.unwrap_err(), "Dependencies not initialized");
 }
+
+#[tokio::test]
+async fn test_recover_account_removes_task() {
+    let temp_dir = std::env::temp_dir().join("test_auto_recovery_recover");
+    let scheduler = AutoRecoveryScheduler::new(temp_dir);
+
+    scheduler.enqueue_task("acc_test_rec", "rec@example.com", "HTTP 429 Too Many Requests");
+    assert_eq!(scheduler.task_count(), 1);
+    assert!(scheduler.get_task("acc_test_rec").is_some());
+
+    // Calling recover_account removes the task from the scheduler
+    let _ = scheduler.recover_account("acc_test_rec", "rec@example.com", 1).await;
+
+    assert_eq!(scheduler.task_count(), 0);
+    assert!(scheduler.get_task("acc_test_rec").is_none());
+}
+
+#[tokio::test]
+async fn test_start_loop_cancels_cleanly() {
+    let temp_dir = std::env::temp_dir().join("test_auto_recovery_loop");
+    let scheduler = std::sync::Arc::new(AutoRecoveryScheduler::new(temp_dir));
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    let handle = scheduler.start_loop(cancel_token.clone());
+    // Cancel immediately
+    cancel_token.cancel();
+
+    // Await handle with a timeout to verify it terminates cleanly
+    let join_res = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    assert!(join_res.is_ok(), "Loop task should terminate after cancellation");
+    assert!(join_res.unwrap().is_ok(), "Task join should succeed");
+}

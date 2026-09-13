@@ -258,4 +258,87 @@ impl AutoRecoveryScheduler {
     pub fn task_count(&self) -> usize {
         self.tasks.len()
     }
+
+    /// Recover an account after a successful probe:
+    /// 1. Remove task from scheduler.
+    /// 2. Toggle account proxy status to enabled on disk.
+    /// 3. Clear rate limit, clear persisted live limit, and reload account into token pool.
+    /// 4. Broadcast UI update via log bridge.
+    /// 5. Log success message.
+    pub async fn recover_account(
+        &self,
+        account_id: &str,
+        email: &str,
+        attempt: u8,
+    ) -> Result<(), String> {
+        self.remove_task(account_id);
+        crate::modules::account::toggle_proxy_status(account_id, true, None)?;
+
+        let token_mgr_opt = {
+            let tm_guard = self.token_manager.read().await;
+            tm_guard.as_ref().map(Arc::clone)
+        };
+
+        if let Some(token_mgr) = token_mgr_opt {
+            token_mgr.clear_rate_limit(account_id);
+            token_mgr.clear_persisted_live_limit(account_id, None).await;
+            let _ = token_mgr.reload_account(account_id).await;
+        }
+
+        crate::modules::log_bridge::emit_accounts_refreshed();
+        tracing::info!(
+            "🎉 [AutoRecovery] Account {} ({}) successfully recovered via probe (attempt: {}), re-enabled for proxy",
+            email,
+            account_id,
+            attempt
+        );
+        Ok(())
+    }
+
+    /// Start the background auto-recovery loop that polls for due tasks every 10 seconds.
+    pub fn start_loop(
+        self: Arc<Self>,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let scheduler = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        tracing::info!("[AutoRecovery] Loop cancelled");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let due_tasks = scheduler.get_due_tasks();
+                        for task in due_tasks {
+                            let s = scheduler.clone();
+                            tokio::spawn(async move {
+                                match s.probe_account(&task.account_id, &task.email).await {
+                                    Ok(true) => {
+                                        if let Err(e) = s.recover_account(&task.account_id, &task.email, task.attempt).await {
+                                            tracing::warn!("[AutoRecovery] Failed to recover account {}: {}", task.email, e);
+                                        }
+                                    }
+                                    Ok(false) | Err(_) => {
+                                        if let Some(next_task) = s.advance_task(&task.account_id) {
+                                            tracing::info!(
+                                                "[AutoRecovery] Probe failed for {}, advanced to attempt {} (next in {:?})",
+                                                task.email, next_task.attempt, next_task.next_probe_at.saturating_duration_since(std::time::Instant::now())
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                "🚫 [AutoRecovery] All 4 probe attempts exhausted for account {}. Ceasing auto-recovery, remaining proxy-disabled.",
+                                                task.email
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        })
+    }
 }
