@@ -31,11 +31,53 @@ pub struct RecoveryTask {
     pub initial_reason: String,
 }
 
+/// Build standard lightweight probe payload targeting gemini-2.5-flash.
+pub fn build_probe_payload(project_id: &str) -> serde_json::Value {
+    let session_id = format!(
+        "probe_{}_{}",
+        chrono::Utc::now().timestamp_millis(),
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    let base_request = serde_json::json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{
+            "role": "user",
+            "parts": [{
+                "text": "ping"
+            }]
+        }],
+        "generationConfig": {
+            "maxOutputTokens": 1,
+            "temperature": 0
+        },
+        "session_id": session_id
+    });
+    crate::proxy::mappers::gemini::wrapper::wrap_request(
+        &base_request,
+        project_id,
+        "gemini-2.5-flash",
+        None,
+        Some(&session_id),
+        None,
+    )
+}
+
 /// Scheduler for tracking and driving 429 auto-recovery tasks.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AutoRecoveryScheduler {
     pub tasks: Arc<DashMap<String, RecoveryTask>>,
     pub data_dir: PathBuf,
+    pub token_manager: Arc<tokio::sync::RwLock<Option<Arc<crate::proxy::TokenManager>>>>,
+    pub upstream: Arc<tokio::sync::RwLock<Option<Arc<crate::proxy::upstream::client::UpstreamClient>>>>,
+}
+
+impl std::fmt::Debug for AutoRecoveryScheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutoRecoveryScheduler")
+            .field("tasks", &self.tasks)
+            .field("data_dir", &self.data_dir)
+            .finish()
+    }
 }
 
 impl AutoRecoveryScheduler {
@@ -43,6 +85,105 @@ impl AutoRecoveryScheduler {
         Self {
             tasks: Arc::new(DashMap::new()),
             data_dir,
+            token_manager: Arc::new(tokio::sync::RwLock::new(None)),
+            upstream: Arc::new(tokio::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Set shared runtime dependencies (TokenManager and UpstreamClient).
+    pub async fn set_dependencies(
+        &self,
+        token_manager: Arc<crate::proxy::TokenManager>,
+        upstream: Arc<crate::proxy::upstream::client::UpstreamClient>,
+    ) {
+        let mut tm = self.token_manager.write().await;
+        *tm = Some(token_manager);
+        let mut up = self.upstream.write().await;
+        *up = Some(upstream);
+    }
+
+    /// Build standard lightweight probe payload targeting gemini-2.5-flash.
+    pub fn build_probe_payload(project_id: &str) -> serde_json::Value {
+        build_probe_payload(project_id)
+    }
+
+    /// Probe an account to determine if its 429/quota block has cleared.
+    pub async fn probe_account(&self, account_id: &str, email: &str) -> Result<bool, String> {
+        let (token_mgr, upstream) = {
+            let tm_guard = self.token_manager.read().await;
+            let up_guard = self.upstream.read().await;
+            match (tm_guard.as_ref(), up_guard.as_ref()) {
+                (Some(tm), Some(up)) => (Arc::clone(tm), Arc::clone(up)),
+                _ => return Err("Dependencies not initialized".to_string()),
+            }
+        };
+
+        // 1. Get token & project_id via token_mgr.get_token_by_email(email)
+        let (access_token, mut project_id, _, _, _) = match token_mgr.get_token_by_email(email).await {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::warn!(
+                    "[AutoRecovery] Failed to get token for account {} ({}): {}",
+                    account_id,
+                    email,
+                    e
+                );
+                return Ok(false);
+            }
+        };
+
+        if project_id.is_empty() {
+            project_id = "bamboo-precept-lgxtn".to_string();
+        }
+
+        // 2. Build lightweight probe payload
+        let probe_payload = Self::build_probe_payload(&project_id);
+
+        // 3. Send via upstream.call_v1_internal with 5-second timeout
+        let call_res = tokio::time::timeout(
+            Duration::from_secs(5),
+            upstream.call_v1_internal("generateContent", &access_token, probe_payload, None, Some(account_id)),
+        )
+        .await;
+
+        match call_res {
+            Ok(Ok(upstream_res)) => {
+                let status = upstream_res.response.status();
+                if status.is_success() {
+                    tracing::info!(
+                        "[AutoRecovery] Probe succeeded for account {} ({}) with status {}",
+                        account_id,
+                        email,
+                        status
+                    );
+                    Ok(true)
+                } else {
+                    tracing::info!(
+                        "[AutoRecovery] Probe non-success for account {} ({}): status {}",
+                        account_id,
+                        email,
+                        status
+                    );
+                    Ok(false)
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "[AutoRecovery] Probe call error for account {} ({}): {}",
+                    account_id,
+                    email,
+                    e
+                );
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "[AutoRecovery] Probe timed out after 5s for account {} ({})",
+                    account_id,
+                    email
+                );
+                Ok(false)
+            }
         }
     }
 

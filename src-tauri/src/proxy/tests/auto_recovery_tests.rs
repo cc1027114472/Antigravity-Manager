@@ -92,3 +92,73 @@ fn test_get_due_tasks() {
     assert_eq!(due_tasks.len(), 1);
     assert_eq!(due_tasks[0].account_id, "acc_due");
 }
+
+#[test]
+fn test_build_probe_payload() {
+    let payload = AutoRecoveryScheduler::build_probe_payload("test-project-123");
+
+    // Verify root fields
+    assert_eq!(
+        payload.get("project").and_then(|v| v.as_str()),
+        Some("test-project-123")
+    );
+    assert_eq!(
+        payload.get("model").and_then(|v| v.as_str()),
+        Some("gemini-2.5-flash")
+    );
+
+    // Verify inner request fields
+    let req = payload.get("request").expect("payload must have request field");
+
+    // Contents structure
+    let contents = req
+        .get("contents")
+        .and_then(|v| v.as_array())
+        .expect("request must have contents array");
+    assert_eq!(contents.len(), 1);
+    assert_eq!(
+        contents[0].get("role").and_then(|v| v.as_str()),
+        Some("user")
+    );
+    let parts = contents[0]
+        .get("parts")
+        .and_then(|v| v.as_array())
+        .expect("contents must have parts array");
+    assert_eq!(parts[0].get("text").and_then(|v| v.as_str()), Some("ping"));
+
+    // Generation config: maxOutputTokens: 1, temperature: 0
+    let gen_config = req
+        .get("generationConfig")
+        .expect("request must have generationConfig");
+    assert_eq!(
+        gen_config.get("maxOutputTokens").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    assert_eq!(
+        gen_config.get("temperature").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+
+    // Session ID starts with "probe_"
+    let session_id = req
+        .get("session_id")
+        .or_else(|| req.get("sessionId"))
+        .and_then(|v| v.as_str())
+        .expect("request must have session_id or sessionId");
+    assert!(
+        session_id.starts_with("probe_"),
+        "session_id should start with probe_, got: {}",
+        session_id
+    );
+}
+
+#[tokio::test]
+async fn test_probe_account_uninitialized_dependencies() {
+    let temp_dir = std::env::temp_dir().join("test_auto_recovery_uninit");
+    let scheduler = AutoRecoveryScheduler::new(temp_dir);
+
+    // Dependencies are not initialized, should return Err("Dependencies not initialized")
+    let result = scheduler.probe_account("acc_test", "test@example.com").await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), "Dependencies not initialized");
+}
