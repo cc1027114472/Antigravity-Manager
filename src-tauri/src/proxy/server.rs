@@ -116,6 +116,7 @@ pub fn take_pending_delete_accounts() -> Vec<String> {
 #[derive(Clone)]
 pub struct AppState {
     pub token_manager: Arc<TokenManager>,
+    pub auto_recovery: Arc<crate::proxy::AutoRecoveryScheduler>,
     pub custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     #[allow(dead_code)]
     pub request_timeout: u64, // API 请求超时(秒)
@@ -410,25 +411,36 @@ impl AxumServer {
 
         register_shared_token_manager(token_manager.clone());
 
+        let upstream = {
+            let u = Arc::new(crate::proxy::upstream::client::UpstreamClient::new(
+                Some(upstream_proxy.clone()),
+                Some(proxy_pool_manager.clone()),
+            ));
+            // 初始化 User-Agent 覆盖
+            if user_agent_override.is_some() {
+                u.set_user_agent_override(user_agent_override).await;
+            }
+            u
+        };
+
+        let data_dir = crate::modules::account::get_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let auto_recovery = Arc::new(crate::proxy::AutoRecoveryScheduler::new(data_dir));
+        auto_recovery.set_dependencies(token_manager.clone(), upstream.clone()).await;
+        token_manager.set_auto_recovery_scheduler(auto_recovery.clone()).await;
+        auto_recovery.scan_and_enqueue_disabled();
+        let recovery_cancel = tokio_util::sync::CancellationToken::new();
+        let _recovery_handle = auto_recovery.clone().start_loop(recovery_cancel);
+
         let state = AppState {
             token_manager: token_manager.clone(),
+            auto_recovery: auto_recovery.clone(),
             custom_mapping: custom_mapping_state.clone(),
             request_timeout: 300, // 5分钟超时
             thought_signature_map: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             upstream_proxy: proxy_state.clone(),
-            upstream: {
-                let u = Arc::new(crate::proxy::upstream::client::UpstreamClient::new(
-                    Some(upstream_proxy.clone()),
-                    Some(proxy_pool_manager.clone()),
-                ));
-                // 初始化 User-Agent 覆盖
-                if user_agent_override.is_some() {
-                    u.set_user_agent_override(user_agent_override).await;
-                }
-                u
-            },
+            upstream: upstream.clone(),
             zai: zai_state.clone(),
             provider_rr: provider_rr.clone(),
             zai_vision_mcp: zai_vision_mcp_state,

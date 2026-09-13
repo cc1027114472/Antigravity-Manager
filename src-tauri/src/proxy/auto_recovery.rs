@@ -259,6 +259,89 @@ impl AutoRecoveryScheduler {
         self.tasks.len()
     }
 
+    /// Scan accounts directory for disabled accounts due to 429/quota limits and enqueue them.
+    pub fn scan_and_enqueue_disabled(&self) -> usize {
+        let accounts_dir = self.data_dir.join("accounts");
+        if !accounts_dir.exists() {
+            return 0;
+        }
+
+        let read_dir = match std::fs::read_dir(&accounts_dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                tracing::warn!(
+                    "[AutoRecovery] Failed to read accounts directory {:?}: {}",
+                    accounts_dir,
+                    e
+                );
+                return 0;
+            }
+        };
+
+        let mut count = 0;
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let json: serde_json::Value = match serde_json::from_str(&content) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let proxy_disabled = json
+                    .get("proxy_disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !proxy_disabled {
+                    continue;
+                }
+
+                let reason = json
+                    .get("proxy_disabled_reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let reason_lower = reason.to_lowercase();
+                let is_429 = reason_lower.contains("429")
+                    || reason_lower.contains("quotaexhausted")
+                    || reason_lower.contains("ratelimitexceeded")
+                    || reason_lower.contains("resource_exhausted");
+                let is_excluded = reason_lower.contains("manual")
+                    || reason_lower.contains("forbidden")
+                    || reason_lower.contains("invalid_grant");
+                if is_429 && !is_excluded {
+                    let account_id = json
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_default()
+                                .to_string()
+                        });
+                    let email = json
+                        .get("email")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&account_id)
+                        .to_string();
+                    if !account_id.is_empty() {
+                        self.enqueue_task(&account_id, &email, reason);
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "[AutoRecovery] Boot scan completed: enqueued {} account(s) for backoff auto-recovery",
+            count
+        );
+        count
+    }
+
     /// Recover an account after a successful probe:
     /// 1. Remove task from scheduler.
     /// 2. Toggle account proxy status to enabled on disk.

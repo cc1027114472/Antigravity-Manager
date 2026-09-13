@@ -248,3 +248,75 @@ async fn test_token_manager_set_auto_recovery_scheduler() {
     // Verify auto_recovery is now Some
     assert!(token_manager.auto_recovery.read().await.is_some());
 }
+
+#[test]
+fn test_scan_and_enqueue_disabled() {
+    let temp_dir = std::env::temp_dir().join(format!("test_scan_disabled_{}", uuid::Uuid::new_v4()));
+    let accounts_dir = temp_dir.join("accounts");
+    std::fs::create_dir_all(&accounts_dir).expect("failed to create accounts dir");
+
+    // acc1: proxy_disabled: true, reason: 429 QuotaExhausted: rate limit reached -> SHOULD be enqueued
+    let acc1_json = serde_json::json!({
+        "id": "acc1",
+        "email": "acc1@example.com",
+        "proxy_disabled": true,
+        "proxy_disabled_reason": "429 QuotaExhausted: rate limit reached"
+    });
+    std::fs::write(
+        accounts_dir.join("acc1.json"),
+        serde_json::to_string_pretty(&acc1_json).unwrap(),
+    ).unwrap();
+
+    // acc2: proxy_disabled: true, reason: manual disable by user -> SHOULD NOT be enqueued
+    let acc2_json = serde_json::json!({
+        "id": "acc2",
+        "email": "acc2@example.com",
+        "proxy_disabled": true,
+        "proxy_disabled_reason": "manual disable by user"
+    });
+    std::fs::write(
+        accounts_dir.join("acc2.json"),
+        serde_json::to_string_pretty(&acc2_json).unwrap(),
+    ).unwrap();
+
+    // acc3: proxy_disabled: true, reason: Forbidden (403): denied -> SHOULD NOT be enqueued
+    let acc3_json = serde_json::json!({
+        "id": "acc3",
+        "email": "acc3@example.com",
+        "proxy_disabled": true,
+        "proxy_disabled_reason": "Forbidden (403): denied"
+    });
+    std::fs::write(
+        accounts_dir.join("acc3.json"),
+        serde_json::to_string_pretty(&acc3_json).unwrap(),
+    ).unwrap();
+
+    // acc4: proxy_disabled: false -> SHOULD NOT be enqueued
+    let acc4_json = serde_json::json!({
+        "id": "acc4",
+        "email": "acc4@example.com",
+        "proxy_disabled": false,
+        "proxy_disabled_reason": "429 QuotaExhausted"
+    });
+    std::fs::write(
+        accounts_dir.join("acc4.json"),
+        serde_json::to_string_pretty(&acc4_json).unwrap(),
+    ).unwrap();
+
+    let scheduler = AutoRecoveryScheduler::new(temp_dir.clone());
+    let count = scheduler.scan_and_enqueue_disabled();
+
+    assert_eq!(count, 1);
+    assert!(scheduler.get_task("acc1").is_some());
+    assert!(scheduler.get_task("acc2").is_none());
+    assert!(scheduler.get_task("acc3").is_none());
+    assert!(scheduler.get_task("acc4").is_none());
+
+    let task = scheduler.get_task("acc1").unwrap();
+    assert_eq!(task.account_id, "acc1");
+    assert_eq!(task.email, "acc1@example.com");
+    assert_eq!(task.initial_reason, "429 QuotaExhausted: rate limit reached");
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
