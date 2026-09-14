@@ -286,6 +286,11 @@ pub async fn handle_generate(
         // [NEW] 提取实际请求的上游端点 URL，用于日志记录和排查
         let upstream_url = response.url().to_string();
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
 
         // [NEW] 提取官方 TraceID
         let cloud_code_trace_id = response
@@ -627,6 +632,26 @@ pub async fn handle_generate(
                 &payload,
             )
             .await;
+        }
+
+        // 标记限流状态(用于 UI 显示与 429 自动禁用/退避自愈)
+        if status_code == 429
+            || status_code == 529
+            || status_code == 503
+            || status_code == 500
+            || status_code == 404
+        {
+            let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+            token_manager
+                .mark_rate_limited_async(
+                    &email,
+                    status_code,
+                    retry_after.as_deref(),
+                    &error_text,
+                    Some(&mapped_model),
+                    peak,
+                )
+                .await;
         }
 
         // 确定重试策略
