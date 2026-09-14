@@ -3311,7 +3311,7 @@ impl TokenManager {
         }
     }
 
-    /// 429：写入反代禁用，移出选号池，必要时推进串行游标
+    /// 429：写入反代禁用，移出选号池，必要时推进串行游标，并加入自愈退避队列
     pub async fn disable_proxy_on_429(
         &self,
         account_id: &str,
@@ -3319,43 +3319,6 @@ impl TokenManager {
         reason: crate::proxy::rate_limit::RateLimitReason,
         error_body: &str,
     ) {
-        let recovery_opt = self.auto_recovery.read().await.clone();
-        let email = self
-            .account_id_to_email(account_id)
-            .unwrap_or_else(|| account_id.to_string());
-        if let Some(ref recovery) = recovery_opt {
-            tracing::info!(
-                "[AutoRecovery] Executing Step 0 probe for account {} ({}) after 429...",
-                email,
-                account_id
-            );
-            match recovery.probe_account(account_id, &email).await {
-                Ok(true) => {
-                    tracing::info!(
-                        "🎉 [AutoRecovery] Step 0 probe SUCCEEDED for {} ({})! False 429 avoided, account remains active in pool.",
-                        email,
-                        account_id
-                    );
-                    self.clear_rate_limit(account_id);
-                    self.clear_persisted_live_limit(account_id, model).await;
-                    return;
-                }
-                Ok(false) => {
-                    tracing::info!(
-                        "[AutoRecovery] Step 0 probe failed for {}. Confirming real 429; disabling proxy and enqueuing for backoff auto-recovery.",
-                        email
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[AutoRecovery] Step 0 probe error for {}: {}. Proceeding with proxy-disable.",
-                        email,
-                        e
-                    );
-                }
-            }
-        }
-
         let reason_text = format!(
             "429 {:?}{}: {}",
             reason,
@@ -3399,11 +3362,16 @@ impl TokenManager {
             }
         }
 
+        let recovery_opt = self.auto_recovery.read().await.clone();
         if let Some(ref recovery) = recovery_opt {
+            let email = self
+                .account_id_to_email(account_id)
+                .unwrap_or_else(|| account_id.to_string());
             recovery.enqueue_task(account_id, &email, &reason_text);
             tracing::info!(
-                "[AutoRecovery] Account {} enqueued for backoff auto-recovery (Step 1 scheduled in 60s)",
-                email
+                "[AutoRecovery] Account {} ({}) enqueued for backoff auto-recovery (Step 1 scheduled in 60s)",
+                email,
+                account_id
             );
         }
 
