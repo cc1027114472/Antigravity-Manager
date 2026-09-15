@@ -86,6 +86,39 @@ impl AccountService {
         Ok(account)
     }
 
+    /// 免校验直接添加/更新账号（适用于指纹浏览器批量推送等无法直连 Google 探测的场景）
+    pub fn add_account_direct(
+        &self,
+        email: &str,
+        refresh_token: &str,
+    ) -> Result<Account, String> {
+        let clean_email = email.trim();
+        if clean_email.is_empty() {
+            return Err("Email cannot be empty for direct import".to_string());
+        }
+        if refresh_token.trim().is_empty() {
+            return Err("Refresh token cannot be empty".to_string());
+        }
+
+        let token = TokenData::new(
+            "".to_string(), // access_token 为空，等待首次调度时异步刷新
+            refresh_token.trim().to_string(),
+            0, // expires_in = 0 标记需要刷新
+            Some(clean_email.to_string()),
+            None,
+            None,
+            false,
+            None,
+        );
+
+        let account = modules::upsert_account(clean_email.to_string(), None, token)?;
+        modules::logger::log_info(&format!(
+            "[Service] Directly imported account without OAuth probe: {}",
+            account.email
+        ));
+        Ok(account)
+    }
+
     /// 删除账号逻辑
     pub fn delete_account(&self, account_id: &str) -> Result<(), String> {
         modules::delete_account(account_id)?;

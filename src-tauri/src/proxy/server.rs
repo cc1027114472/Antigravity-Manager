@@ -4427,7 +4427,18 @@ async fn admin_sync_batch_import_with_proxies(
     for (idx, item) in payload.items.into_iter().enumerate() {
         let resolved_proxy_id = &items_proxy_ids[idx];
 
-        match state.account_service.add_account(&item.refresh_token).await {
+        let import_result = if let Some(ref email) = item.email {
+            if !email.trim().is_empty() {
+                // 如果前端提供了确定邮箱，使用免校验直接入库，避免远端网络无法直连 Google 时导致导入失败
+                state.account_service.add_account_direct(email, &item.refresh_token)
+            } else {
+                state.account_service.add_account(&item.refresh_token).await
+            }
+        } else {
+            state.account_service.add_account(&item.refresh_token).await
+        };
+
+        match import_result {
             Ok(account) => {
                 let was_existing = existing_emails.contains(&account.email);
                 if was_existing {
