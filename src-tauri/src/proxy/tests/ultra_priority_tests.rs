@@ -123,10 +123,7 @@ fn compare_tokens_for_model(a: &ProxyToken, b: &ProxyToken, _target_model: &str)
     }
 
     // Priority 2: Health score
-    let health_cmp = b
-        .health_score
-        .partial_cmp(&a.health_score)
-        .unwrap_or(Ordering::Equal);
+    let health_cmp = b.health_score.total_cmp(&a.health_score);
     if health_cmp != Ordering::Equal {
         return health_cmp;
     }

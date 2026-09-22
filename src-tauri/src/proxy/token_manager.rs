@@ -1788,7 +1788,6 @@ impl TokenManager {
         // [NEW] 1. 动态能力过滤 (Capability Filter)
 
         // 定义常量
-        const RESET_TIME_THRESHOLD_SECS: i64 = 600; // 10 分钟阈值
 
         // Official billing group for ledger / protection / sorting
         let billing_target = crate::proxy::common::model_mapping::normalize_to_billing_group(
@@ -1863,22 +1862,22 @@ impl TokenManager {
             }
 
             // Priority 2: Health score (higher is better)
-            let health_cmp = b
-                .health_score
-                .partial_cmp(&a.health_score)
-                .unwrap_or(std::cmp::Ordering::Equal);
+            // total_cmp 是 f64 全序比较，NaN 安全（不会违反 total order 导致 sort panic）
+            let health_cmp = b.health_score.total_cmp(&a.health_score);
             if health_cmp != std::cmp::Ordering::Equal {
                 return health_cmp;
             }
 
-            // Priority 3: Reset time (earlier is better, but only if diff > 10 min)
+            // Priority 3: Reset time (earlier is better)
+            // 注意：不能用"差值 < 阈值即相等"的近似比较——它违反全序传递性，
+            // 会触发 Rust sort 的 total-order panic（曾导致线上 worker 线程崩溃卡死）。
             let reset_a = a.reset_time.unwrap_or(i64::MAX);
             let reset_b = b.reset_time.unwrap_or(i64::MAX);
-            if (reset_a - reset_b).abs() >= RESET_TIME_THRESHOLD_SECS {
-                reset_a.cmp(&reset_b)
-            } else {
-                std::cmp::Ordering::Equal
+            let reset_cmp = reset_a.cmp(&reset_b);
+            if reset_cmp != std::cmp::Ordering::Equal {
+                return reset_cmp;
             }
+            std::cmp::Ordering::Equal
         });
 
         // 【调试日志】打印排序后的账号顺序（显示目标模型的 quota）
@@ -4614,8 +4613,6 @@ mod tests {
 
     /// 测试排序比较函数（与 get_token_internal 中的逻辑一致）
     fn compare_tokens(a: &ProxyToken, b: &ProxyToken) -> Ordering {
-        const RESET_TIME_THRESHOLD_SECS: i64 = 600; // 10 分钟阈值
-
         let tier_priority = |tier: &Option<String>| {
             let t = tier.as_deref().unwrap_or("").to_lowercase();
             if t.contains("ultra") {
@@ -4637,24 +4634,19 @@ mod tests {
         }
 
         // Second: compare by health score (higher is better)
-        let health_cmp = b
-            .health_score
-            .partial_cmp(&a.health_score)
-            .unwrap_or(Ordering::Equal);
+        // total_cmp 是 f64 全序比较，NaN 安全
+        let health_cmp = b.health_score.total_cmp(&a.health_score);
         if health_cmp != Ordering::Equal {
             return health_cmp;
         }
 
         // Third: compare by reset time (earlier/closer is better)
+        // 移除"差值 < 阈值即相等"的近似比较——违反全序传递性会导致 sort panic
         let reset_a = a.reset_time.unwrap_or(i64::MAX);
         let reset_b = b.reset_time.unwrap_or(i64::MAX);
-        let reset_diff = (reset_a - reset_b).abs();
-
-        if reset_diff >= RESET_TIME_THRESHOLD_SECS {
-            let reset_cmp = reset_a.cmp(&reset_b);
-            if reset_cmp != Ordering::Equal {
-                return reset_cmp;
-            }
+        let reset_cmp = reset_a.cmp(&reset_b);
+        if reset_cmp != Ordering::Equal {
+            return reset_cmp;
         }
 
         // Fourth: compare by remaining quota percentage (higher is better)
@@ -5092,8 +5084,6 @@ mod tests {
     /// 测试高端模型排序：Ultra 账号优先于 Pro 账号（即使 Pro 配额更高）
     #[test]
     fn test_ultra_priority_for_high_end_models() {
-        const RESET_TIME_THRESHOLD_SECS: i64 = 600;
-
         // 模拟高端模型排序逻辑
         fn compare_tokens_for_model(
             a: &ProxyToken,
@@ -5137,10 +5127,7 @@ mod tests {
             }
 
             // Priority 2: Health score
-            let health_cmp = b
-                .health_score
-                .partial_cmp(&a.health_score)
-                .unwrap_or(Ordering::Equal);
+            let health_cmp = b.health_score.total_cmp(&a.health_score);
             if health_cmp != Ordering::Equal {
                 return health_cmp;
             }
