@@ -50,6 +50,16 @@ pub async fn list_accounts(
                     }
                 }
             }
+
+            // [UI] Inject auto-recovery attempt count for display
+            if account.proxy_disabled {
+                let recovery_guard = instance.token_manager.auto_recovery.read().await;
+                if let Some(ref recovery) = *recovery_guard {
+                    if let Some(task) = recovery.get_task(&account.id) {
+                        account.auto_recovery_attempt = Some(task.attempt);
+                    }
+                }
+            }
         }
     }
 

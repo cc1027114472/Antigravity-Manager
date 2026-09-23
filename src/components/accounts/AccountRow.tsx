@@ -85,6 +85,11 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             >
                                 <Ban className="w-2.5 h-2.5" />
                                 <span>{t('accounts.proxy_disabled')}</span>
+                                {account.auto_recovery_attempt != null ? (
+                                    <span className="opacity-75">· {account.auto_recovery_attempt}/4</span>
+                                ) : (
+                                    <span className="opacity-60">· —</span>
+                                )}
                             </span>
                         )}
 

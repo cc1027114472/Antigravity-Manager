@@ -76,6 +76,7 @@ function Accounts() {
   const [detailsAccount, setDetailsAccount] = useState<Account | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [isBatchDelete, setIsBatchDelete] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [toggleProxyConfirm, setToggleProxyConfirm] = useState<{
     accountId: string;
     enable: boolean;
@@ -439,22 +440,39 @@ function Accounts() {
   };
 
   const handleBatchDelete = () => {
-    if (selectedIds.size === 0) return;
+    if (selectedIds.size === 0) {
+      showToast(t("accounts.toast.no_account_selected", "请先选择要操作的账号"), "warning");
+      return;
+    }
     setIsBatchDelete(true);
   };
 
   const executeBatchDelete = async () => {
-    setIsBatchDelete(false);
+    if (selectedIds.size === 0) {
+      setIsBatchDelete(false);
+      return;
+    }
+    setIsDeleting(true);
+    const count = selectedIds.size;
     try {
       const ids = Array.from(selectedIds);
       console.log("[Accounts] Batch deleting:", ids);
       await deleteAccounts(ids);
       setSelectedIds(new Set());
+      setIsBatchDelete(false);
       console.log("[Accounts] Batch delete success");
-      showToast(t("common.success"), "success");
+      showToast(
+        t("accounts.toast.batch_delete_success", {
+          count,
+          defaultValue: `已成功删除 ${count} 个账号`,
+        }),
+        "success"
+      );
     } catch (error) {
       console.error("[Accounts] Batch delete failed:", error);
       showToast(`${t("common.error")}: ${error}`, "error");
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -465,17 +483,18 @@ function Accounts() {
 
   const executeDelete = async () => {
     if (!deleteConfirmId) return;
-
+    setIsDeleting(true);
     try {
       console.log("[Accounts] Executing delete for:", deleteConfirmId);
       await deleteAccount(deleteConfirmId);
+      setDeleteConfirmId(null);
       console.log("[Accounts] Delete success");
-      showToast(t("common.success"), "success");
+      showToast(t("accounts.delete_success", "账号删除成功"), "success");
     } catch (error) {
       console.error("[Accounts] Delete failed:", error);
       showToast(`${t("common.error")}: ${error}`, "error");
     } finally {
-      setDeleteConfirmId(null);
+      setIsDeleting(false);
     }
   };
 
@@ -1246,8 +1265,10 @@ function Accounts() {
         type="confirm"
         confirmText={t("common.delete")}
         isDestructive={true}
+        loading={isDeleting}
         onConfirm={isBatchDelete ? executeBatchDelete : executeDelete}
         onCancel={() => {
+          if (isDeleting) return;
           setDeleteConfirmId(null);
           setIsBatchDelete(false);
         }}

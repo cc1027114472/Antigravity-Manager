@@ -153,9 +153,13 @@ export default function DeviceFingerprintDialog({ account, onClose }: DeviceFing
     if (!account) return null;
 
     return createPortal(
-        <div className="modal modal-open z-[120]">
-            <div data-tauri-drag-region className="fixed top-0 left-0 right-0 h-8 z-[130]" />
-            <div className="modal-box relative max-w-3xl bg-white dark:bg-base-100 shadow-2xl rounded-2xl p-0 overflow-hidden">
+        <div
+            className="fixed inset-0 z-[9999] flex items-center justify-center p-4"
+            style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }}
+        >
+            <div data-tauri-drag-region className="fixed top-0 left-0 right-0 h-8 z-[10000] pointer-events-auto" />
+            <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-0" onClick={onClose} />
+            <div className="relative z-10 w-full max-w-3xl bg-white dark:bg-slate-900 text-gray-900 dark:text-base-content shadow-2xl rounded-2xl p-0 overflow-hidden border border-gray-100 dark:border-slate-800">
                 <div className="px-6 py-5 border-b border-gray-100 dark:border-base-200 bg-gray-50/50 dark:bg-base-200/50 flex justify-between items-center">
                     <div className="flex items-center gap-3">
                         <h3 className="font-bold text-lg text-gray-900 dark:text-base-content">{t('accounts.device_fingerprint_dialog.title')}</h3>
@@ -304,8 +308,12 @@ function ConfirmDialog({ profile, type, onConfirm, onCancel, loading }: { profil
             ? t('accounts.device_fingerprint_dialog.confirm_generate_desc')
             : t('accounts.device_fingerprint_dialog.confirm_restore_desc');
     return createPortal(
-        <div className="modal modal-open z-[140]">
-            <div className="modal-box max-w-sm bg-white dark:bg-base-100 rounded-2xl shadow-2xl p-6 text-center">
+        <div
+            className="fixed inset-0 z-[10001] flex items-center justify-center p-4"
+            style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }}
+        >
+            <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-0" onClick={onCancel} />
+            <div className="relative z-10 w-full max-w-sm bg-white dark:bg-slate-900 text-gray-900 dark:text-base-content rounded-2xl shadow-2xl p-6 text-center border border-gray-100 dark:border-slate-800">
                 <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-blue-50 text-blue-500 dark:bg-blue-500/10 dark:text-blue-300">
                     <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                         <path d="M12 9v4" strokeLinecap="round" strokeLinejoin="round" />
@@ -326,7 +334,6 @@ function ConfirmDialog({ profile, type, onConfirm, onCancel, loading }: { profil
                     <button className="btn btn-sm btn-primary min-w-[100px]" onClick={onConfirm} disabled={!!loading}>{loading ? t('accounts.device_fingerprint_dialog.processing') : t('accounts.device_fingerprint_dialog.confirm')}</button>
                 </div>
             </div>
-            <div className="modal-backdrop bg-black/30" onClick={onCancel}></div>
         </div>,
         document.body
     );

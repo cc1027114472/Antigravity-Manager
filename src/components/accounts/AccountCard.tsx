@@ -153,6 +153,11 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                 >
                                     <Ban className="w-2.5 h-2.5" />
                                     {t('accounts.proxy_disabled').toUpperCase()}
+                                    {account.auto_recovery_attempt != null ? (
+                                        <span className="opacity-70">{account.auto_recovery_attempt}/4</span>
+                                    ) : (
+                                        <span className="opacity-50">—</span>
+                                    )}
                                 </span>
                             )}
                             {account.quota?.is_forbidden && (

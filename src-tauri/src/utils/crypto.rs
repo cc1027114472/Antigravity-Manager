@@ -11,12 +11,64 @@ const LEGACY_FIXED_NONCE: &[u8; 12] = b"antigravsalt";
 const ENCRYPTED_PREFIX: &str = "ag_enc_";
 const ENCRYPTED_V2_PREFIX: &str = "ag_enc_v2_";
 
+/// 获取用于加密的主密钥（优先从持久化数据目录读取，不存在则固化当前机器码）
 fn get_encryption_key() -> [u8; 32] {
+    if let Ok(data_dir) = crate::modules::account::get_data_dir() {
+        let key_file = data_dir.join("device_id.key");
+        if let Ok(content) = std::fs::read_to_string(&key_file) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let mut key = [0u8; 32];
+                let hash = sha2::Sha256::digest(trimmed.as_bytes());
+                key.copy_from_slice(&hash);
+                return key;
+            }
+        }
+        // 如果文件不存在，则将当前机器码固化到持久化目录，避免后续容器重建导致密钥丢失
+        let current_uid = machine_uid::get().unwrap_or_else(|_| "default".to_string());
+        let _ = std::fs::write(&key_file, current_uid.trim());
+        let mut key = [0u8; 32];
+        let hash = sha2::Sha256::digest(current_uid.as_bytes());
+        key.copy_from_slice(&hash);
+        return key;
+    }
+
     let device_id = machine_uid::get().unwrap_or_else(|_| "default".to_string());
     let mut key = [0u8; 32];
     let hash = sha2::Sha256::digest(device_id.as_bytes());
     key.copy_from_slice(&hash);
     key
+}
+
+/// 获取所有候选解密密钥（持久化密钥 -> 当前机器码 -> 默认机器码），确保跨环境/重建也能平滑解密
+fn get_candidate_keys() -> Vec<[u8; 32]> {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // 1. 持久化密钥
+    let primary = get_encryption_key();
+    if seen.insert(primary) {
+        candidates.push(primary);
+    }
+
+    // 2. 当前运行时机器码
+    let current_uid = machine_uid::get().unwrap_or_else(|_| "default".to_string());
+    let mut key = [0u8; 32];
+    let hash = sha2::Sha256::digest(current_uid.as_bytes());
+    key.copy_from_slice(&hash);
+    if seen.insert(key) {
+        candidates.push(key);
+    }
+
+    // 3. 兜底 "default"
+    let mut def_key = [0u8; 32];
+    let hash = sha2::Sha256::digest(b"default");
+    def_key.copy_from_slice(&hash);
+    if seen.insert(def_key) {
+        candidates.push(def_key);
+    }
+
+    candidates
 }
 
 pub fn serialize_password<S>(password: &str, serializer: S) -> Result<S::Ok, S::Error>
@@ -79,19 +131,26 @@ pub fn encrypt_string(password: &str) -> Result<String, String> {
 }
 
 fn decrypt_legacy(encrypted_base64: &str) -> Result<String, String> {
-    let key = get_encryption_key();
-    let cipher = Aes256Gcm::new(&key.into());
-    let nonce = Nonce::from_slice(LEGACY_FIXED_NONCE);
-
     let ciphertext = general_purpose::STANDARD
         .decode(encrypted_base64)
         .map_err(|e| format!("Base64 decode failed: {}", e))?;
+    let nonce = Nonce::from_slice(LEGACY_FIXED_NONCE);
 
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext.as_ref())
-        .map_err(|e| format!("Decryption failed: {}", e))?;
+    let mut last_err = "Decryption failed".to_string();
+    for key in get_candidate_keys() {
+        let cipher = Aes256Gcm::new(&key.into());
+        match cipher.decrypt(nonce, ciphertext.as_ref()) {
+            Ok(plaintext) => {
+                return String::from_utf8(plaintext)
+                    .map_err(|e| format!("UTF-8 conversion failed: {}", e));
+            }
+            Err(e) => {
+                last_err = format!("Decryption failed: {}", e);
+            }
+        }
+    }
 
-    String::from_utf8(plaintext).map_err(|e| format!("UTF-8 conversion failed: {}", e))
+    Err(last_err)
 }
 
 fn decrypt_string_v2(encrypted: &str) -> Result<String, String> {
@@ -110,13 +169,22 @@ fn decrypt_string_v2(encrypted: &str) -> Result<String, String> {
         .decode(ciphertext_base64)
         .map_err(|e| format!("Ciphertext decode failed: {}", e))?;
 
-    let key = get_encryption_key();
-    let cipher = Aes256Gcm::new(&key.into());
-    let plaintext = cipher
-        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
-        .map_err(|e| format!("Decryption failed: {}", e))?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let mut last_err = "Decryption failed".to_string();
+    for key in get_candidate_keys() {
+        let cipher = Aes256Gcm::new(&key.into());
+        match cipher.decrypt(nonce, ciphertext.as_ref()) {
+            Ok(plaintext) => {
+                return String::from_utf8(plaintext)
+                    .map_err(|e| format!("UTF-8 conversion failed: {}", e));
+            }
+            Err(e) => {
+                last_err = format!("Decryption failed: {}", e);
+            }
+        }
+    }
 
-    String::from_utf8(plaintext).map_err(|e| format!("UTF-8 conversion failed: {}", e))
+    Err(last_err)
 }
 
 pub fn decrypt_string(encrypted: &str) -> Result<String, String> {

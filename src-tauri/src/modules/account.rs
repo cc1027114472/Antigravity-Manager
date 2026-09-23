@@ -1560,6 +1560,25 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
         });
     }
 
+    // [AUTO-HEAL] If proxy was disabled, but quota refreshed and account is healthy, auto-enable proxy!
+    let is_forbidden = account.quota.as_ref().map_or(false, |q| q.is_forbidden);
+    if account.proxy_disabled && !is_forbidden && !account.disabled {
+        let has_healthy_quota = account.quota.as_ref().map_or(false, |q| {
+            q.models.iter().any(|m| m.percentage > 10)
+        });
+        let reason_lower = account.proxy_disabled_reason.as_deref().unwrap_or("").to_lowercase();
+        let is_strictly_manual = reason_lower.contains("invalid_grant") || reason_lower.contains("revoked");
+        if has_healthy_quota && !is_strictly_manual {
+            tracing::info!(
+                "[AutoRecovery] Account {} recovered healthy quota, auto-enabling proxy status",
+                account.email
+            );
+            account.proxy_disabled = false;
+            account.proxy_disabled_reason = None;
+            account.proxy_disabled_at = None;
+        }
+    }
+
     // Save account first
     save_account(&account)?;
 
@@ -1571,6 +1590,7 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
         if let Ok(mut index) = load_account_index() {
             if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {
                 summary.protected_models = account.protected_models.clone();
+                summary.proxy_disabled = account.proxy_disabled;
                 let _ = save_account_index(&index);
             }
         }

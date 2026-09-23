@@ -23,6 +23,8 @@ export interface Account {
     validation_blocked_until?: number;
     validation_blocked_reason?: string;
     validation_url?: string;
+    /** Runtime-only: current auto-recovery attempt (1–4). Absent when not in queue. */
+    auto_recovery_attempt?: number;
     created_at: number;
     last_used: number;
 }

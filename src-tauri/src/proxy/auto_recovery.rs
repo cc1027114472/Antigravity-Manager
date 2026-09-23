@@ -118,17 +118,41 @@ impl AutoRecoveryScheduler {
             }
         };
 
-        // 1. Get token & project_id via token_mgr.get_token_by_email(email)
-        let (access_token, mut project_id, _, _, _) = match token_mgr.get_token_by_email(email).await {
-            Ok(res) => res,
-            Err(e) => {
-                tracing::warn!(
-                    "[AutoRecovery] Failed to get token for account {} ({}): {}",
-                    account_id,
-                    email,
-                    e
-                );
-                return Ok(false);
+        // 1. Get token & project_id: first try active token_manager, fallback to disk storage
+        let (access_token, mut project_id) = match token_mgr.get_token_by_email(email).await {
+            Ok((tok, proj, _, _, _)) => (tok, proj),
+            Err(_) => {
+                // Disabled accounts are removed from in-memory pool, so load directly from storage
+                match crate::modules::account::load_account(account_id) {
+                    Ok(mut account) => {
+                        let proj = account.token.project_id.clone().unwrap_or_default();
+                        let now = chrono::Utc::now().timestamp();
+                        let is_expired = now >= (account.token.expiry_timestamp - 300);
+                        let tok = if is_expired {
+                            if let Ok(token_resp) = crate::modules::oauth::refresh_access_token(&account.token.refresh_token, Some(account_id)).await {
+                                account.token.access_token = token_resp.access_token.clone();
+                                account.token.expires_in = token_resp.expires_in;
+                                account.token.expiry_timestamp = now + token_resp.expires_in;
+                                let _ = crate::modules::account::save_account(&account);
+                                token_resp.access_token
+                            } else {
+                                account.token.access_token.clone()
+                            }
+                        } else {
+                            account.token.access_token.clone()
+                        };
+                        (tok, proj)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[AutoRecovery] Failed to load account {} ({}) from disk: {}",
+                            account_id,
+                            email,
+                            e
+                        );
+                        return Ok(false);
+                    }
+                }
             }
         };
 
@@ -139,9 +163,9 @@ impl AutoRecoveryScheduler {
         // 2. Build lightweight probe payload
         let probe_payload = Self::build_probe_payload(&project_id);
 
-        // 3. Send via upstream.call_v1_internal with 5-second timeout
+        // 3. Send via upstream.call_v1_internal with 15-second timeout (relaxed for cross-region proxy networks)
         let call_res = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             upstream.call_v1_internal("generateContent", &access_token, probe_payload, None, Some(account_id)),
         )
         .await;
@@ -235,20 +259,17 @@ impl AutoRecoveryScheduler {
     }
 
     /// Advance a task to the next attempt:
-    /// Increments attempt; if attempt > 4, removes the task and returns None;
-    /// else updates next_probe_at and returns Some(updated_task).
+    /// Increments attempt; caps at 4 and keeps recurring every 4 hours rather than abandoning;
+    /// returns Some(updated_task).
     pub fn advance_task(&self, account_id: &str) -> Option<RecoveryTask> {
         match self.tasks.entry(account_id.to_string()) {
             dashmap::Entry::Occupied(mut occ) => {
                 let task = occ.get_mut();
-                task.attempt += 1;
-                if task.attempt > 4 {
-                    occ.remove();
-                    None
-                } else {
-                    task.next_probe_at = Instant::now() + get_backoff_delay(task.attempt);
-                    Some(task.clone())
+                if task.attempt < 4 {
+                    task.attempt += 1;
                 }
+                task.next_probe_at = Instant::now() + get_backoff_delay(task.attempt);
+                Some(task.clone())
             }
             dashmap::Entry::Vacant(_) => None,
         }
@@ -304,14 +325,13 @@ impl AutoRecoveryScheduler {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let reason_lower = reason.to_lowercase();
-                let is_429 = reason_lower.contains("429")
-                    || reason_lower.contains("quotaexhausted")
-                    || reason_lower.contains("ratelimitexceeded")
-                    || reason_lower.contains("resource_exhausted");
-                let is_excluded = reason_lower.contains("manual")
-                    || reason_lower.contains("forbidden")
-                    || reason_lower.contains("invalid_grant");
-                if is_429 && !is_excluded {
+
+                // Only exclude strictly terminal conditions (hard 403 forbidden or revoked OAuth)
+                let is_strictly_excluded = reason_lower.contains("forbidden")
+                    || reason_lower.contains("invalid_grant")
+                    || reason_lower.contains("revoked");
+
+                if !is_strictly_excluded {
                     let account_id = json
                         .get("id")
                         .and_then(|v| v.as_str())
