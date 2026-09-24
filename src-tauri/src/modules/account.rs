@@ -1566,9 +1566,10 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
         let has_healthy_quota = account.quota.as_ref().map_or(false, |q| {
             q.models.iter().any(|m| m.percentage > 10)
         });
-        let reason_lower = account.proxy_disabled_reason.as_deref().unwrap_or("").to_lowercase();
-        let is_strictly_manual = reason_lower.contains("invalid_grant") || reason_lower.contains("revoked");
-        if has_healthy_quota && !is_strictly_manual {
+        let reason = account.proxy_disabled_reason.as_deref().unwrap_or("");
+        // 严格遵循自动恢复准入原则：仅限系统限流/429异常，人为手动禁用严禁被拉起
+        let is_auto_recoverable = crate::proxy::auto_recovery::is_eligible_for_auto_recovery(reason);
+        if has_healthy_quota && is_auto_recoverable {
             tracing::info!(
                 "[AutoRecovery] Account {} recovered healthy quota, auto-enabling proxy status",
                 account.email
