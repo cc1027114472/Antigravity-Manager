@@ -654,6 +654,38 @@ pub async fn handle_generate(
                 .await;
         }
 
+        // [FIX] 403 时设置 is_forbidden 状态并移出池子，避免账号被重复选中
+        if status_code == 403 {
+            if let Some(acc_id) = token_manager.get_account_id_by_email(&email) {
+                // Check for VALIDATION_REQUIRED error - temporarily block account
+                if error_text.contains("VALIDATION_REQUIRED")
+                    || error_text.contains("verify your account")
+                    || error_text.contains("validation_url")
+                {
+                    tracing::warn!(
+                        "[Gemini] VALIDATION_REQUIRED detected on account {}, temporarily blocking",
+                        email
+                    );
+                    let block_minutes = 10i64;
+                    let block_until = chrono::Utc::now().timestamp() + (block_minutes * 60);
+
+                    if let Err(e) = token_manager
+                        .set_validation_block_public(&acc_id, block_until, &error_text)
+                        .await
+                    {
+                        tracing::error!("Failed to set validation block: {}", e);
+                    }
+                }
+
+                // 设置 is_forbidden 状态
+                if let Err(e) = token_manager.set_forbidden(&acc_id, &error_text).await {
+                    tracing::error!("Failed to set forbidden status: {}", e);
+                } else {
+                    tracing::warn!("[Gemini] Account {} marked as forbidden due to 403", email);
+                }
+            }
+        }
+
         // 确定重试策略
         let strategy = determine_retry_strategy(status_code, &error_text, false);
         let trace_id = format!("gemini_{}", session_id);
