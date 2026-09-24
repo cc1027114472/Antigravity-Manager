@@ -338,6 +338,20 @@ impl TokenManager {
         Ok(count)
     }
 
+    /// 取消指定账号在后台的自动恢复任务
+    pub fn cancel_auto_recovery(&self, account_id: &str) {
+        if let Ok(guard) = self.auto_recovery.try_read() {
+            if let Some(ref recovery) = *guard {
+                if recovery.remove_task(account_id).is_some() {
+                    tracing::info!(
+                        "[AutoRecovery] Cancelled auto-recovery task for account {}",
+                        account_id
+                    );
+                }
+            }
+        }
+    }
+
     /// 从内存中彻底移除指定账号及其关联数据 (Issue #1477)
     pub fn remove_account(&self, account_id: &str) {
         // ... (省略原有逻辑)
@@ -346,6 +360,7 @@ impl TokenManager {
         }
         self.health_scores.remove(account_id);
         self.clear_rate_limit(account_id);
+        self.cancel_auto_recovery(account_id);
         self.session_accounts.retain(|_, v| v != account_id);
         if let Ok(mut preferred) = self.preferred_account_id.try_write() {
             if preferred.as_deref() == Some(account_id) {

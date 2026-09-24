@@ -21,6 +21,28 @@ pub fn get_backoff_delay(attempt: u8) -> Duration {
     }
 }
 
+/// 判断账号禁用原因是否属于允许自动恢复的范围（仅允许 429 / 限流 / 配额耗尽；人工手动禁用和永久封禁严禁恢复）
+pub fn is_eligible_for_auto_recovery(reason: &str) -> bool {
+    let lower = reason.to_lowercase();
+    // 排除人为手动禁用、批量禁用、配额保护与硬性永久封禁
+    if lower.contains("manual")
+        || lower.contains("手动")
+        || lower.contains("batch")
+        || lower.contains("批量")
+        || lower.contains("forbidden")
+        || lower.contains("invalid_grant")
+        || lower.contains("revoked")
+        || lower.contains("quota_protection")
+    {
+        return false;
+    }
+    // 必须明确包含限流或配额耗尽标记
+    lower.contains("429")
+        || lower.contains("rate_limit")
+        || lower.contains("resource_exhausted")
+        || lower.contains("quotaexhausted")
+}
+
 /// Recovery task representing an account undergoing exponential backoff auto-recovery probing.
 #[derive(Debug, Clone)]
 pub struct RecoveryTask {
@@ -216,6 +238,11 @@ impl AutoRecoveryScheduler {
     /// Inserts if not exists (or updates if new reason), initial attempt = 1,
     /// next_probe_at = Instant::now() + get_backoff_delay(1).
     pub fn enqueue_task(&self, account_id: &str, email: &str, initial_reason: &str) {
+        if !is_eligible_for_auto_recovery(initial_reason) {
+            self.remove_task(account_id);
+            return;
+        }
+
         match self.tasks.entry(account_id.to_string()) {
             dashmap::Entry::Occupied(mut occ) => {
                 let task = occ.get_mut();
@@ -324,14 +351,9 @@ impl AutoRecoveryScheduler {
                     .get("proxy_disabled_reason")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let reason_lower = reason.to_lowercase();
 
-                // Only exclude strictly terminal conditions (hard 403 forbidden or revoked OAuth)
-                let is_strictly_excluded = reason_lower.contains("forbidden")
-                    || reason_lower.contains("invalid_grant")
-                    || reason_lower.contains("revoked");
-
-                if !is_strictly_excluded {
+                // 仅允许明确因 429/限流异常禁用的账号参与自动恢复，人为手动禁用严禁拉起
+                if is_eligible_for_auto_recovery(reason) {
                     let account_id = json
                         .get("id")
                         .and_then(|v| v.as_str())
