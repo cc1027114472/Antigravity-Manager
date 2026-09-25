@@ -4,15 +4,25 @@ use crate::proxy::token_manager::ProxyToken;
 
 #[test]
 fn test_backoff_ladder_intervals() {
-    assert_eq!(get_backoff_delay(0), Duration::from_secs(60));
-    assert_eq!(get_backoff_delay(1), Duration::from_secs(60));
-    assert_eq!(get_backoff_delay(2), Duration::from_secs(15 * 60));
-    assert_eq!(get_backoff_delay(3), Duration::from_secs(60 * 60));
-    assert_eq!(get_backoff_delay(4), Duration::from_secs(4 * 60 * 60));
-    // 超过 4 阶不再延长
-    assert_eq!(get_backoff_delay(5), Duration::from_secs(4 * 60 * 60));
-    assert_eq!(get_backoff_delay(6), Duration::from_secs(4 * 60 * 60));
-    assert_eq!(get_backoff_delay(255), Duration::from_secs(4 * 60 * 60));
+    for _ in 0..20 {
+        let d0 = get_backoff_delay(0);
+        assert!(d0 >= Duration::from_secs(480) && d0 <= Duration::from_secs(900));
+
+        let d1 = get_backoff_delay(1);
+        assert!(d1 >= Duration::from_secs(480) && d1 <= Duration::from_secs(900));
+
+        let d2 = get_backoff_delay(2);
+        assert!(d2 >= Duration::from_secs(1200) && d2 <= Duration::from_secs(2100));
+
+        let d3 = get_backoff_delay(3);
+        assert!(d3 >= Duration::from_secs(3600) && d3 <= Duration::from_secs(7200));
+
+        let d4 = get_backoff_delay(4);
+        assert!(d4 >= Duration::from_secs(10800) && d4 <= Duration::from_secs(14400));
+
+        let d5 = get_backoff_delay(255);
+        assert!(d5 >= Duration::from_secs(10800) && d5 <= Duration::from_secs(14400));
+    }
 }
 
 #[test]

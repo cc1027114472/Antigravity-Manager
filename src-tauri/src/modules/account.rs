@@ -1560,25 +1560,8 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
         });
     }
 
-    // [AUTO-HEAL] If proxy was disabled, but quota refreshed and account is healthy, auto-enable proxy!
-    let is_forbidden = account.quota.as_ref().map_or(false, |q| q.is_forbidden);
-    if account.proxy_disabled && !is_forbidden && !account.disabled {
-        let has_healthy_quota = account.quota.as_ref().map_or(false, |q| {
-            q.models.iter().any(|m| m.percentage > 10)
-        });
-        let reason = account.proxy_disabled_reason.as_deref().unwrap_or("");
-        // 严格遵循自动恢复准入原则：仅限系统限流/429异常，人为手动禁用严禁被拉起
-        let is_auto_recoverable = crate::proxy::auto_recovery::is_eligible_for_auto_recovery(reason);
-        if has_healthy_quota && is_auto_recoverable {
-            tracing::info!(
-                "[AutoRecovery] Account {} recovered healthy quota, auto-enabling proxy status",
-                account.email
-            );
-            account.proxy_disabled = false;
-            account.proxy_disabled_reason = None;
-            account.proxy_disabled_at = None;
-        }
-    }
+    // 注意：被 429 禁用的账号严禁在此处仅凭静态配额百分比草率自愈！
+    // 无论是后台自愈还是人工刷新自愈，必须通过真实探针 (Probe) 探测通了（HTTP 200，无 429）后，方可解除禁用。
 
     // Save account first
     save_account(&account)?;

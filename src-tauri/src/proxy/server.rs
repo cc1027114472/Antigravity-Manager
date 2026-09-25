@@ -1249,7 +1249,9 @@ async fn admin_switch_account(
     }
 }
 
-async fn admin_refresh_all_quotas() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
+async fn admin_refresh_all_quotas(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
 {
     logger::log_info("[API] Starting refresh of all account quotas");
     let stats = account::refresh_all_quotas_logic().await.map_err(|e| {
@@ -1258,6 +1260,24 @@ async fn admin_refresh_all_quotas() -> Result<impl IntoResponse, (StatusCode, Js
             Json(ErrorResponse { error: e }),
         )
     })?;
+
+    // 人为触发全部刷新后：对处于 429 禁用的账号执行真实探针探测，探测通了方可自愈解禁
+    if let Ok(accounts) = crate::modules::account::list_accounts() {
+        for acc in accounts {
+            if acc.proxy_disabled && !acc.disabled {
+                let reason = acc.proxy_disabled_reason.as_deref().unwrap_or("");
+                if crate::proxy::auto_recovery::is_eligible_for_auto_recovery(reason) {
+                    if let Ok(true) = state.auto_recovery.probe_account(&acc.id, &acc.email).await {
+                        tracing::info!(
+                            "🎉 [Batch Refresh] Account {} probe succeeded (200 OK)! Recovering account!",
+                            acc.email
+                        );
+                        let _ = state.auto_recovery.recover_account(&acc.id, &acc.email, 0).await;
+                    }
+                }
+            }
+        }
+    }
 
     Ok(Json(stats))
 }
@@ -2654,6 +2674,7 @@ async fn admin_reorder_accounts(
 }
 
 async fn admin_fetch_account_quota(
+    State(state): State<AppState>,
     Path(account_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let mut account = crate::modules::load_account(&account_id).map_err(|e| {
@@ -2680,6 +2701,42 @@ async fn admin_fetch_account_quota(
             Json(ErrorResponse { error: e }),
         )
     })?;
+
+    // [MANUAL RECOVERY WITH PROBE] 如果该账号当前因 429 被反代禁用：
+    // 人为刷新时主动发起实际探针探测，只有探测真正通了（不报 429，返回 200）才自愈解禁！
+    if let Ok(fresh_account) = crate::modules::load_account(&account_id) {
+        if fresh_account.proxy_disabled && !fresh_account.disabled {
+            let reason = fresh_account.proxy_disabled_reason.as_deref().unwrap_or("");
+            if crate::proxy::auto_recovery::is_eligible_for_auto_recovery(reason) {
+                tracing::info!(
+                    "[Manual Refresh] Account {} is 429 proxy-disabled. Initiating real-time probe...",
+                    fresh_account.email
+                );
+                match state.auto_recovery.probe_account(&account_id, &fresh_account.email).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            "🎉 [Manual Refresh] Account {} probe succeeded (200 OK)! Google 429 cleared, recovering account immediately!",
+                            fresh_account.email
+                        );
+                        let _ = state.auto_recovery.recover_account(&account_id, &fresh_account.email, 0).await;
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            "[Manual Refresh] Account {} quota refreshed, but probe failed (still 429 or non-success). Keeping disabled to prevent 403 ban.",
+                            fresh_account.email
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[Manual Refresh] Account {} probe error: {}. Keeping disabled.",
+                            fresh_account.email,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     Ok(Json(quota))
 }

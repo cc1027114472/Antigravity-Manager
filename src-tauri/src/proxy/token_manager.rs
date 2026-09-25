@@ -3383,7 +3383,7 @@ impl TokenManager {
                 .unwrap_or_else(|| account_id.to_string());
             recovery.enqueue_task(account_id, &email, &reason_text);
             tracing::info!(
-                "[AutoRecovery] Account {} ({}) enqueued for backoff auto-recovery (Step 1 scheduled in 60s)",
+                "[AutoRecovery] Account {} ({}) enqueued for backoff auto-recovery (Step 1 scheduled in 8-15m random jitter)",
                 email,
                 account_id
             );
