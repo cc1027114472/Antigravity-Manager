@@ -6,29 +6,29 @@ use std::time::{Duration, Instant};
 /// Get backoff delay for an auto-recovery probe attempt with randomized jitter.
 ///
 /// Ladder:
-/// - Attempt 1: 8 ~ 15 minutes (480s ~ 900s, randomized)
-/// - Attempt 2: 20 ~ 35 minutes (1200s ~ 2100s, randomized)
-/// - Attempt 3: 1 ~ 2 hours (3600s ~ 7200s, randomized)
-/// - Attempt >= 4: 3 ~ 4 hours (10800s ~ 14400s, randomized)
+/// - Attempt 0/1: 50 ~ 70 minutes (3000s ~ 4200s, randomized, ~1 hour)
+/// - Attempt 2: 1.5 ~ 2.5 hours (5400s ~ 9000s, randomized, ~2 hours)
+/// - Attempt 3: 2.5 ~ 3.5 hours (9000s ~ 12600s, randomized, ~3 hours)
+/// - Attempt >= 4: 4 ~ 5 hours (14400s ~ 18000s, randomized, ~4.5 hours)
 pub fn get_backoff_delay(attempt: u8) -> Duration {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     match attempt {
         0 | 1 => {
-            // 8 到 15 分钟随机抖动 (480 到 900 秒)
-            Duration::from_secs(rng.gen_range(480..=900))
+            // 首次探测：50 到 70 分钟随机抖动 (3000 到 4200 秒，约 1 小时)
+            Duration::from_secs(rng.gen_range(3000..=4200))
         }
         2 => {
-            // 20 到 35 分钟随机抖动 (1200 到 2100 秒)
-            Duration::from_secs(rng.gen_range(1200..=2100))
+            // 1.5 到 2.5 小时随机抖动 (5400 到 9000 秒)
+            Duration::from_secs(rng.gen_range(5400..=9000))
         }
         3 => {
-            // 1 到 2 小时随机抖动 (3600 到 7200 秒)
-            Duration::from_secs(rng.gen_range(3600..=7200))
+            // 2.5 到 3.5 小时随机抖动 (9000 到 12600 秒)
+            Duration::from_secs(rng.gen_range(9000..=12600))
         }
         _ => {
-            // 3 到 4 小时随机抖动 (10800 到 14400 秒)
-            Duration::from_secs(rng.gen_range(10800..=14400))
+            // 4 到 5 小时随机抖动 (14400 到 18000 秒)
+            Duration::from_secs(rng.gen_range(14400..=18000))
         }
     }
 }
