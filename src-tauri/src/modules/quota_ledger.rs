@@ -83,10 +83,11 @@ pub fn estimated_percentage_map(account: &Account) -> HashMap<String, i32> {
 }
 
 /// Map official quota_groups buckets → billing group percentages.
-/// Prefers `5h` window; falls back to `weekly` / any other window.
+/// Prefers `5h` window; when weekly is exhausted (<=0%), prefers weekly (aligns with quotaDisplay.ts).
 pub fn billing_percentages_from_quota_groups(groups: &[QuotaGroup]) -> HashMap<String, i32> {
-    // billing -> (preferred_pct from 5h, fallback_pct)
+    // billing -> (preferred_pct from 5h, weekly_pct, fallback_pct)
     let mut five_h: HashMap<String, i32> = HashMap::new();
+    let mut weekly: HashMap<String, i32> = HashMap::new();
     let mut fallback: HashMap<String, i32> = HashMap::new();
 
     for group in groups {
@@ -94,15 +95,19 @@ pub fn billing_percentages_from_quota_groups(groups: &[QuotaGroup]) -> HashMap<S
             if let Some((billing, pct)) = bucket_to_billing_pct(bucket) {
                 let is_5h = bucket.window.eq_ignore_ascii_case("5h")
                     || bucket.bucket_id.to_lowercase().contains("5h");
+                let is_weekly = bucket.window.eq_ignore_ascii_case("weekly")
+                    || bucket.bucket_id.to_lowercase().contains("weekly");
                 if is_5h {
                     five_h.insert(billing, pct);
+                } else if is_weekly {
+                    weekly.insert(billing, pct);
                 } else {
                     fallback.entry(billing).or_insert(pct);
                 }
             }
         }
         // Also try display_name heuristics when buckets lack gemini-/3p- prefixes
-        if five_h.is_empty() && fallback.is_empty() {
+        if five_h.is_empty() && weekly.is_empty() && fallback.is_empty() {
             let dn = group.display_name.to_lowercase();
             if let Some(first) = group.buckets.first() {
                 let pct = fraction_to_pct(first.remaining_fraction);
@@ -118,6 +123,13 @@ pub fn billing_percentages_from_quota_groups(groups: &[QuotaGroup]) -> HashMap<S
     let mut out = fallback;
     for (k, v) in five_h {
         out.insert(k, v);
+    }
+    for (billing, pct) in weekly {
+        if pct <= 0 {
+            out.insert(billing, pct);
+        } else if !out.contains_key(&billing) {
+            out.insert(billing, pct);
+        }
     }
     out
 }
@@ -657,5 +669,127 @@ mod tests {
         let migrated = migrate_estimated_quotas(legacy);
         assert_eq!(migrated.len(), 1);
         assert_eq!(migrated.get("gemini").map(|e| e.percentage), Some(10));
+    }
+
+    #[test]
+    fn test_weekly_exhausted_overrides_5h_bucket() {
+        let groups = vec![QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: None,
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.0,
+                    reset_time: "2026-10-01T00:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: 1.0,
+                    reset_time: "2026-09-24T05:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        }];
+
+        let map = billing_percentages_from_quota_groups(&groups);
+        // Weekly is 0%, so it must override the 5h 100%
+        assert_eq!(map.get("gemini"), Some(&0));
+    }
+
+    #[test]
+    fn test_weekly_healthy_prefers_5h_bucket() {
+        let groups = vec![QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: None,
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.5, // 50% weekly remaining
+                    reset_time: "2026-10-01T00:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: 0.85, // 85% in current 5h window
+                    reset_time: "2026-09-24T05:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        }];
+
+        let map = billing_percentages_from_quota_groups(&groups);
+        // Weekly is healthy (50% > 0%), so daily 5h Sprint (85%) must be preferred
+        assert_eq!(map.get("gemini"), Some(&85));
+    }
+
+    #[test]
+    fn test_weekly_exhausted_triggers_protection() {
+        use crate::models::TokenData;
+
+        let mut account = Account::new(
+            "acc1".into(),
+            "test@example.com".into(),
+            TokenData::new(
+                "x".into(),
+                "y".into(),
+                3600,
+                Some("test@example.com".into()),
+                None,
+                None,
+                false,
+                None,
+            ),
+        );
+        let groups = vec![QuotaGroup {
+            display_name: "Gemini Models".into(),
+            description: None,
+            buckets: vec![
+                QuotaBucket {
+                    bucket_id: "gemini-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.0,
+                    reset_time: "2026-10-01T00:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+                QuotaBucket {
+                    bucket_id: "gemini-5h".into(),
+                    window: "5h".into(),
+                    remaining_fraction: 1.0,
+                    reset_time: "2026-09-24T05:00:00Z".into(),
+                    display_name: None,
+                    description: None,
+                },
+            ],
+        }];
+        let mut quota = QuotaData::default();
+        quota.quota_groups = Some(groups);
+        account.quota = Some(quota.clone());
+
+        // Calibrate from online quota
+        account.calibrate_estimated_from_quota(&quota);
+        assert_eq!(account.estimated_quotas.get("gemini").map(|e| e.percentage), Some(0));
+
+        // Protection config with 16% threshold
+        let protection = QuotaProtectionConfig {
+            enabled: true,
+            threshold_percentage: 16,
+            monitored_models: vec!["gemini".into(), "claude".into()],
+        };
+
+        let percentages = effective_percentage_map(&account, &QuotaLedgerConfig::default());
+        apply_protection_from_percentages(&mut account, &percentages, &protection);
+
+        // Gemini should now be protected
+        assert!(account.protected_models.contains("gemini"));
     }
 }
