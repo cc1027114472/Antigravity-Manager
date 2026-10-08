@@ -53,19 +53,52 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        // Auto cleanup old logs (keep last 30 days)
-        tokio::task::spawn_blocking(
-            move || match crate::modules::proxy_db::cleanup_old_logs(30) {
-                Ok(deleted) => {
+        // Periodic auto-cleanup of old logs (keep last 7 days).
+        // Runs once immediately at startup, then every 6 hours, so the
+        // request_logs DB can never grow unbounded again (observed: the
+        // timestamp-unit bug let it balloon to 29GB in a few hours).
+        tokio::task::spawn(async move {
+            // Immediate cleanup on boot.
+            let boot = tokio::task::spawn_blocking(move || {
+                crate::modules::proxy_db::cleanup_old_logs(7)
+            })
+            .await;
+            match boot {
+                Ok(Ok(deleted)) => {
                     if deleted > 0 {
-                        tracing::info!("Auto cleanup: removed {} old logs (>30 days)", deleted);
+                        tracing::info!("Startup cleanup: removed {} old logs (>7 days)", deleted);
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::error!("Failed to cleanup old logs: {}", e);
                 }
-            },
-        );
+                Err(e) => {
+                    tracing::error!("Startup cleanup task failed: {}", e);
+                }
+            }
+
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            loop {
+                ticker.tick().await;
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::modules::proxy_db::cleanup_old_logs(7)
+                })
+                .await;
+                match result {
+                    Ok(Ok(deleted)) => {
+                        if deleted > 0 {
+                            tracing::info!("Periodic cleanup: removed {} old logs (>7 days)", deleted);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Failed to cleanup old logs: {}", e);
+                    }
+                    Err(e) => {
+                        tracing::error!("Periodic cleanup task failed: {}", e);
+                    }
+                }
+            }
+        });
 
         Self {
             logs: RwLock::new(VecDeque::with_capacity(max_logs)),

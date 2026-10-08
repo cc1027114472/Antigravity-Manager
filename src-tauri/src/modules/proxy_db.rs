@@ -238,10 +238,15 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
 }
 
 /// Cleanup old logs (keep last N days)
+/// NOTE: `request_logs.timestamp` is stored in **milliseconds**
+/// (see `middleware/monitor.rs` which uses `timestamp_millis()`), so the
+/// cutoff must be computed in milliseconds too — otherwise the DELETE
+/// never matches and the DB grows unbounded (observed: 29GB in hours).
 pub fn cleanup_old_logs(days: i64) -> Result<usize, String> {
     let conn = connect_db()?;
 
-    let cutoff_timestamp = chrono::Utc::now().timestamp() - (days * 24 * 3600);
+    // timestamp is milliseconds since epoch; compute cutoff in ms.
+    let cutoff_timestamp = chrono::Utc::now().timestamp_millis() - (days * 24 * 3600 * 1000);
 
     let deleted = conn
         .execute(
@@ -250,8 +255,10 @@ pub fn cleanup_old_logs(days: i64) -> Result<usize, String> {
         )
         .map_err(|e| e.to_string())?;
 
-    // Execute VACUUM to reclaim disk space
-    conn.execute("VACUUM", []).map_err(|e| e.to_string())?;
+    // Execute VACUUM to reclaim disk space (best-effort: if the disk is
+    // too full for VACUUM, the DELETE above still frees rows, and the next
+    // periodic run will shrink the file once space is available).
+    let _ = conn.execute("VACUUM", []);
 
     Ok(deleted)
 }
