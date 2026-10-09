@@ -15,8 +15,11 @@ fn connect_db() -> Result<Connection, String> {
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
 
-    // Set busy timeout to 5000ms to avoid "database is locked" errors
-    conn.pragma_update(None, "busy_timeout", 5000)
+    // Set busy timeout to 1000ms: on a busy node, concurrent writers should
+    // fail fast and drop the log rather than pile up in the blocking pool
+    // (a 5s timeout under lock contention starved the spawn_blocking pool
+    // and hung the whole service on high-traffic nodes).
+    conn.pragma_update(None, "busy_timeout", 1000)
         .map_err(|e| e.to_string())?;
 
     // Synchronous NORMAL is faster and safe enough for WAL
@@ -299,60 +302,103 @@ pub fn get_proxy_db_disk_size() -> Result<u64, String> {
     Ok(total)
 }
 
+/// Free bytes on the filesystem hosting the proxy DB (used before VACUUM,
+/// which needs ~2x the DB size in temporary space).
+fn free_disk_bytes() -> u64 {
+    #[cfg(unix)]
+    {
+        let dir = get_proxy_db_path()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("/"));
+        if let Ok(c_path) = std::ffi::CString::new(dir.to_string_lossy().as_bytes()) {
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } == 0 {
+                return stat.f_bavail as u64 * stat.f_frsize as u64;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        return 0;
+    }
+    0
+}
+
+/// Delete in small batches so the SQLite write lock is never held for long.
+/// Uses the `idx_timestamp` index (timestamp-cutoff style), never NOT IN full scans.
+fn delete_batched(
+    conn: &Connection,
+    status_clause: &str,
+    cutoff_ts: i64,
+    batch: usize,
+) -> usize {
+    let sql = format!(
+        "DELETE FROM request_logs WHERE {} AND timestamp < ?1 LIMIT ?2",
+        status_clause
+    );
+    let mut total = 0;
+    loop {
+        let deleted = conn.execute(&sql, rusqlite::params![cutoff_ts, batch]).unwrap_or(0);
+        if deleted == 0 {
+            break;
+        }
+        total += deleted;
+        // Don't hammer in a tight loop forever; stop if a huge backlog exists
+        // (will be handled by the next periodic pass).
+        if total > 2_000_000 {
+            break;
+        }
+    }
+    total
+}
+
+/// Delete all but the newest `keep` rows of a status class, using the
+/// index-backed timestamp of the Nth-newest row as cutoff (no NOT IN scan).
+fn delete_beyond_keep(
+    conn: &Connection,
+    status_clause: &str,
+    keep: usize,
+    batch: usize,
+) -> usize {
+    let lookup = format!(
+        "SELECT timestamp FROM request_logs WHERE {} ORDER BY timestamp DESC LIMIT 1 OFFSET ?1",
+        status_clause
+    );
+    let cutoff: Option<i64> = conn.query_row(&lookup, [keep], |r| r.get(0)).unwrap_or(None);
+    match cutoff {
+        Some(ts) => delete_batched(conn, status_clause, ts, batch),
+        None => 0,
+    }
+}
+
 /// Tiered cleanup: aggressively prune transient 200 OK logs, while
 /// safeguarding precious 4xx/5xx error diagnostics for up to 30 days / 50k rows.
+/// All deletes run in small batches to never hold the SQLite write lock long
+/// (previously a single giant NOT-IN DELETE + VACUUM starved concurrent
+/// save_log writers on high-traffic nodes and hung the service).
 pub fn cleanup_tiered_logs() -> Result<usize, String> {
     let conn = connect_db()?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut total_deleted = 0;
 
-    // 1. Prune success logs older than 12 hours
+    const BATCH: usize = 2000;
+    const SUCCESS_CLAUSE: &str = "status >= 200 AND status < 400";
+    const ERROR_CLAUSE: &str = "(status < 200 OR status >= 400)";
+
+    // 1. Prune success logs older than 12 hours (batched)
     let success_cutoff = now_ms - (SUCCESS_MAX_AGE_HOURS * 3600 * 1000);
-    let d1 = conn
-        .execute(
-            "DELETE FROM request_logs WHERE status >= 200 AND status < 400 AND timestamp < ?1",
-            [success_cutoff],
-        )
-        .unwrap_or(0);
-    total_deleted += d1;
+    total_deleted += delete_batched(&conn, SUCCESS_CLAUSE, success_cutoff, BATCH);
 
-    // 2. Limit total success logs to SUCCESS_MAX_ROWS (keep newest)
-    let d2 = conn
-        .execute(
-            "DELETE FROM request_logs 
-             WHERE status >= 200 AND status < 400 AND id NOT IN (
-                 SELECT id FROM request_logs 
-                 WHERE status >= 200 AND status < 400 
-                 ORDER BY timestamp DESC LIMIT ?1
-             )",
-            [SUCCESS_MAX_ROWS],
-        )
-        .unwrap_or(0);
-    total_deleted += d2;
+    // 2. Keep newest SUCCESS_MAX_ROWS success logs (index-cutoff, batched)
+    total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, SUCCESS_MAX_ROWS, BATCH);
 
-    // 3. Prune error logs older than 30 days
+    // 3. Prune error logs older than 30 days (batched)
     let error_cutoff = now_ms - (ERROR_MAX_AGE_DAYS * 24 * 3600 * 1000);
-    let d3 = conn
-        .execute(
-            "DELETE FROM request_logs WHERE (status < 200 OR status >= 400) AND timestamp < ?1",
-            [error_cutoff],
-        )
-        .unwrap_or(0);
-    total_deleted += d3;
+    total_deleted += delete_batched(&conn, ERROR_CLAUSE, error_cutoff, BATCH);
 
-    // 4. Limit total error logs to ERROR_MAX_ROWS (keep newest 50k)
-    let d4 = conn
-        .execute(
-            "DELETE FROM request_logs 
-             WHERE (status < 200 OR status >= 400) AND id NOT IN (
-                 SELECT id FROM request_logs 
-                 WHERE (status < 200 OR status >= 400) 
-                 ORDER BY timestamp DESC LIMIT ?1
-             )",
-            [ERROR_MAX_ROWS],
-        )
-        .unwrap_or(0);
-    total_deleted += d4;
+    // 4. Keep newest ERROR_MAX_ROWS error logs (index-cutoff, batched)
+    total_deleted += delete_beyond_keep(&conn, ERROR_CLAUSE, ERROR_MAX_ROWS, BATCH);
 
     // 5. Circuit-breaker: If DB size exceeds 1.5GB, apply emergency pressure relief
     if let Ok(size) = get_proxy_db_disk_size() {
@@ -363,34 +409,26 @@ pub fn cleanup_tiered_logs() -> Result<usize, String> {
             );
             // Emergency: only keep 2 hours of success logs, 1,000 success rows
             let emergency_success_cutoff = now_ms - (2 * 3600 * 1000);
-            let _ = conn.execute(
-                "DELETE FROM request_logs WHERE status >= 200 AND status < 400 AND timestamp < ?1",
-                [emergency_success_cutoff],
-            );
-            let _ = conn.execute(
-                "DELETE FROM request_logs 
-                 WHERE status >= 200 AND status < 400 AND id NOT IN (
-                     SELECT id FROM request_logs 
-                     WHERE status >= 200 AND status < 400 
-                     ORDER BY timestamp DESC LIMIT 1000
-                 )",
-                [],
-            );
+            total_deleted += delete_batched(&conn, SUCCESS_CLAUSE, emergency_success_cutoff, BATCH);
+            total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, 1_000, BATCH);
             // Emergency error limit: keep newest 10,000
-            let _ = conn.execute(
-                "DELETE FROM request_logs 
-                 WHERE (status < 200 OR status >= 400) AND id NOT IN (
-                     SELECT id FROM request_logs 
-                     WHERE (status < 200 OR status >= 400) 
-                     ORDER BY timestamp DESC LIMIT 10000
-                 )",
-                [],
-            );
-            // Force vacuum on emergency
-            let _ = conn.execute("VACUUM", []);
-        } else if total_deleted > 0 {
-            // Periodic maintenance: reclaim space if any rows were deleted
-            let _ = conn.execute("VACUUM", []);
+            total_deleted += delete_beyond_keep(&conn, ERROR_CLAUSE, 10_000, BATCH);
+            // Force vacuum on emergency (only if enough free disk for the copy)
+            let free_bytes = free_disk_bytes();
+            if free_bytes > 2u64 * 1024 * 1024 * 1024 {
+                let _ = conn.execute("VACUUM", []);
+            }
+        } else if total_deleted > 100_000 {
+            // Only VACUUM when a lot of rows were deleted AND the DB is big;
+            // otherwise let SQLite reuse freed pages (VACUUM takes an exclusive
+            // lock and rewrites the whole file — dangerous on a busy node).
+            let size_mb = size / 1024 / 1024;
+            if size_mb > 300 {
+                let free_bytes = free_disk_bytes();
+                if free_bytes > 2u64 * 1024 * 1024 * 1024 {
+                    let _ = conn.execute("VACUUM", []);
+                }
+            }
         }
     }
 
