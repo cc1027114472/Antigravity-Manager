@@ -53,49 +53,42 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        // Periodic auto-cleanup of old logs (keep last 7 days).
-        // Runs once immediately at startup, then every 6 hours, so the
-        // request_logs DB can never grow unbounded again (observed: the
-        // timestamp-unit bug let it balloon to 29GB in a few hours).
+        // Periodic auto-cleanup with tiered storage:
+        // - Success logs (200..400): max 12 hours, max 5,000 rows, bodies truncated
+        // - Error logs (4xx/5xx): max 30 days, max 50,000 rows, full original bodies
+        // - Hard fuse: 1.5GB emergency prune + vacuum
+        // Runs immediately at startup, then every 30 minutes.
         tokio::task::spawn(async move {
-            // Immediate cleanup on boot.
+            // Immediate startup pass
             let boot = tokio::task::spawn_blocking(move || {
-                crate::modules::proxy_db::cleanup_old_logs(7)
+                crate::modules::proxy_db::cleanup_tiered_logs()
             })
             .await;
             match boot {
                 Ok(Ok(deleted)) => {
                     if deleted > 0 {
-                        tracing::info!("Startup cleanup: removed {} old logs (>7 days)", deleted);
+                        tracing::info!("Startup tiered cleanup: purged {} stale log rows", deleted);
                     }
                 }
-                Ok(Err(e)) => {
-                    tracing::error!("Failed to cleanup old logs: {}", e);
-                }
-                Err(e) => {
-                    tracing::error!("Startup cleanup task failed: {}", e);
-                }
+                Ok(Err(e)) => tracing::error!("Startup tiered cleanup failed: {}", e),
+                Err(e) => tracing::error!("Startup cleanup task panicked: {}", e),
             }
 
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
             loop {
                 ticker.tick().await;
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::modules::proxy_db::cleanup_old_logs(7)
+                    crate::modules::proxy_db::cleanup_tiered_logs()
                 })
                 .await;
                 match result {
                     Ok(Ok(deleted)) => {
                         if deleted > 0 {
-                            tracing::info!("Periodic cleanup: removed {} old logs (>7 days)", deleted);
+                            tracing::info!("Periodic 30m tiered cleanup: purged {} stale log rows", deleted);
                         }
                     }
-                    Ok(Err(e)) => {
-                        tracing::error!("Failed to cleanup old logs: {}", e);
-                    }
-                    Err(e) => {
-                        tracing::error!("Periodic cleanup task failed: {}", e);
-                    }
+                    Ok(Err(e)) => tracing::error!("Periodic tiered cleanup failed: {}", e),
+                    Err(e) => tracing::error!("Periodic tiered cleanup panicked: {}", e),
                 }
             }
         });

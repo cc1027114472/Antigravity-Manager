@@ -86,8 +86,43 @@ pub fn init_db() -> Result<(), String> {
     Ok(())
 }
 
+/// Max body length to persist for successful (200..400) requests to prevent DB ballooning.
+/// Error requests (4xx/5xx) are NEVER truncated.
+const MAX_SUCCESS_REQ_BODY_BYTES: usize = 4096;
+const MAX_SUCCESS_RESP_BODY_BYTES: usize = 8192;
+
+fn truncate_body(s: Option<String>, max_len: usize) -> Option<String> {
+    s.map(|text| {
+        if text.len() > max_len {
+            let mut truncated = text;
+            let mut end = max_len;
+            while end > 0 && !truncated.is_char_boundary(end) {
+                end -= 1;
+            }
+            truncated.truncate(end);
+            truncated.push_str("... [truncated for storage optimization]");
+            truncated
+        } else {
+            text
+        }
+    })
+}
+
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let conn = connect_db()?;
+
+    // Tiered storage optimization:
+    // Error responses (status < 200 or status >= 400) keep 100% full original bodies.
+    // Successful responses are capped to lightweight summaries to prevent multi-GB ballooning.
+    let is_error = log.status < 200 || log.status >= 400;
+    let (req_body, resp_body) = if is_error {
+        (log.request_body.clone(), log.response_body.clone())
+    } else {
+        (
+            truncate_body(log.request_body.clone(), MAX_SUCCESS_REQ_BODY_BYTES),
+            truncate_body(log.response_body.clone(), MAX_SUCCESS_RESP_BODY_BYTES),
+        )
+    };
 
     conn.execute(
         "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak)
@@ -101,8 +136,8 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.duration,
             log.model,
             log.error,
-            log.request_body,
-            log.response_body,
+            req_body,
+            resp_body,
             log.input_tokens,
             log.output_tokens,
             log.cached_tokens,
@@ -237,30 +272,134 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
     .map_err(|e| e.to_string())
 }
 
-/// Cleanup old logs (keep last N days)
-/// NOTE: `request_logs.timestamp` is stored in **milliseconds**
-/// (see `middleware/monitor.rs` which uses `timestamp_millis()`), so the
-/// cutoff must be computed in milliseconds too — otherwise the DELETE
-/// never matches and the DB grows unbounded (observed: 29GB in hours).
-pub fn cleanup_old_logs(days: i64) -> Result<usize, String> {
+/// Tiered log retention constants
+const SUCCESS_MAX_AGE_HOURS: i64 = 12;
+const SUCCESS_MAX_ROWS: usize = 5_000;
+
+const ERROR_MAX_AGE_DAYS: i64 = 30;
+const ERROR_MAX_ROWS: usize = 50_000;
+
+const DB_FUSE_SIZE_BYTES: u64 = 1536 * 1024 * 1024; // 1.5 GB hard circuit-breaker
+
+/// Get total physical size on disk of proxy_logs.db (+ wal/shm)
+pub fn get_proxy_db_disk_size() -> Result<u64, String> {
+    let db_path = get_proxy_db_path()?;
+    let mut total: u64 = 0;
+    if let Ok(meta) = std::fs::metadata(&db_path) {
+        total += meta.len();
+    }
+    let wal = db_path.with_extension("db-wal");
+    if let Ok(meta) = std::fs::metadata(&wal) {
+        total += meta.len();
+    }
+    let shm = db_path.with_extension("db-shm");
+    if let Ok(meta) = std::fs::metadata(&shm) {
+        total += meta.len();
+    }
+    Ok(total)
+}
+
+/// Tiered cleanup: aggressively prune transient 200 OK logs, while
+/// safeguarding precious 4xx/5xx error diagnostics for up to 30 days / 50k rows.
+pub fn cleanup_tiered_logs() -> Result<usize, String> {
     let conn = connect_db()?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut total_deleted = 0;
 
-    // timestamp is milliseconds since epoch; compute cutoff in ms.
-    let cutoff_timestamp = chrono::Utc::now().timestamp_millis() - (days * 24 * 3600 * 1000);
-
-    let deleted = conn
+    // 1. Prune success logs older than 12 hours
+    let success_cutoff = now_ms - (SUCCESS_MAX_AGE_HOURS * 3600 * 1000);
+    let d1 = conn
         .execute(
-            "DELETE FROM request_logs WHERE timestamp < ?1",
-            [cutoff_timestamp],
+            "DELETE FROM request_logs WHERE status >= 200 AND status < 400 AND timestamp < ?1",
+            [success_cutoff],
         )
-        .map_err(|e| e.to_string())?;
+        .unwrap_or(0);
+    total_deleted += d1;
 
-    // Execute VACUUM to reclaim disk space (best-effort: if the disk is
-    // too full for VACUUM, the DELETE above still frees rows, and the next
-    // periodic run will shrink the file once space is available).
-    let _ = conn.execute("VACUUM", []);
+    // 2. Limit total success logs to SUCCESS_MAX_ROWS (keep newest)
+    let d2 = conn
+        .execute(
+            "DELETE FROM request_logs 
+             WHERE status >= 200 AND status < 400 AND id NOT IN (
+                 SELECT id FROM request_logs 
+                 WHERE status >= 200 AND status < 400 
+                 ORDER BY timestamp DESC LIMIT ?1
+             )",
+            [SUCCESS_MAX_ROWS],
+        )
+        .unwrap_or(0);
+    total_deleted += d2;
 
-    Ok(deleted)
+    // 3. Prune error logs older than 30 days
+    let error_cutoff = now_ms - (ERROR_MAX_AGE_DAYS * 24 * 3600 * 1000);
+    let d3 = conn
+        .execute(
+            "DELETE FROM request_logs WHERE (status < 200 OR status >= 400) AND timestamp < ?1",
+            [error_cutoff],
+        )
+        .unwrap_or(0);
+    total_deleted += d3;
+
+    // 4. Limit total error logs to ERROR_MAX_ROWS (keep newest 50k)
+    let d4 = conn
+        .execute(
+            "DELETE FROM request_logs 
+             WHERE (status < 200 OR status >= 400) AND id NOT IN (
+                 SELECT id FROM request_logs 
+                 WHERE (status < 200 OR status >= 400) 
+                 ORDER BY timestamp DESC LIMIT ?1
+             )",
+            [ERROR_MAX_ROWS],
+        )
+        .unwrap_or(0);
+    total_deleted += d4;
+
+    // 5. Circuit-breaker: If DB size exceeds 1.5GB, apply emergency pressure relief
+    if let Ok(size) = get_proxy_db_disk_size() {
+        if size > DB_FUSE_SIZE_BYTES {
+            tracing::warn!(
+                "Proxy DB size ({} MB) exceeded 1.5GB circuit-breaker. Triggering emergency prune!",
+                size / 1024 / 1024
+            );
+            // Emergency: only keep 2 hours of success logs, 1,000 success rows
+            let emergency_success_cutoff = now_ms - (2 * 3600 * 1000);
+            let _ = conn.execute(
+                "DELETE FROM request_logs WHERE status >= 200 AND status < 400 AND timestamp < ?1",
+                [emergency_success_cutoff],
+            );
+            let _ = conn.execute(
+                "DELETE FROM request_logs 
+                 WHERE status >= 200 AND status < 400 AND id NOT IN (
+                     SELECT id FROM request_logs 
+                     WHERE status >= 200 AND status < 400 
+                     ORDER BY timestamp DESC LIMIT 1000
+                 )",
+                [],
+            );
+            // Emergency error limit: keep newest 10,000
+            let _ = conn.execute(
+                "DELETE FROM request_logs 
+                 WHERE (status < 200 OR status >= 400) AND id NOT IN (
+                     SELECT id FROM request_logs 
+                     WHERE (status < 200 OR status >= 400) 
+                     ORDER BY timestamp DESC LIMIT 10000
+                 )",
+                [],
+            );
+            // Force vacuum on emergency
+            let _ = conn.execute("VACUUM", []);
+        } else if total_deleted > 0 {
+            // Periodic maintenance: reclaim space if any rows were deleted
+            let _ = conn.execute("VACUUM", []);
+        }
+    }
+
+    Ok(total_deleted)
+}
+
+/// Cleanup old logs (backward compatible wrapper for legacy calls)
+pub fn cleanup_old_logs(_days: i64) -> Result<usize, String> {
+    cleanup_tiered_logs()
 }
 
 /// Limit maximum log count (keep newest N records)
