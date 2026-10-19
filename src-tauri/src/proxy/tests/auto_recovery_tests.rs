@@ -236,6 +236,7 @@ async fn test_token_manager_set_auto_recovery_scheduler() {
         validation_blocked_until: 0,
         validation_url: None,
         model_quotas: std::collections::HashMap::new(),
+        model_quotas_weekly: std::collections::HashMap::new(),
         model_limits: std::collections::HashMap::new(),
         max_concurrency: None,
     };

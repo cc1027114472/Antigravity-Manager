@@ -139,20 +139,9 @@ impl Account {
         self.quota = Some(quota);
     }
 
-    /// Overwrite local ledger from online quota snapshot (calibration).
-    /// Prefer official `quota_groups` (5h); fall back to per-model billing-group min.
+    /// Overwrite local ledger from online quota snapshot (calibration) using dual-window modeling.
     pub fn calibrate_estimated_from_quota(&mut self, quota: &QuotaData) {
-        let now = chrono::Utc::now().timestamp();
-        let percentages =
-            crate::modules::quota_ledger::online_percentage_map_from_quota(quota);
-        let mut next: HashMap<String, EstimatedModelQuota> = HashMap::new();
-        for (billing_id, pct) in percentages {
-            next.insert(
-                billing_id.clone(),
-                EstimatedModelQuota::from_online(billing_id, pct, now),
-            );
-        }
-        self.estimated_quotas = next;
+        crate::modules::quota_ledger::calibrate_account_dual_window(self, quota);
     }
 
     /// Normalize legacy fine-grained ledger / protection keys to billing groups.

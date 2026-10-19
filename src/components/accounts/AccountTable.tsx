@@ -503,7 +503,7 @@ function AccountRowContent({
                                     isProtected={isModelProtected(account.protected_models, model.protectedKey)}
                                     liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                     Icon={model.Icon || Bot}
-                                    quotaTitle={formatQuotaTooltip(model.percentage, model.officialPercentage)}
+                                    quotaTitle={formatQuotaTooltip(model.percentage, model.officialPercentage, model.limitingWindow, model.windowDetails)}
                                 />
                             ))}
                     </div>

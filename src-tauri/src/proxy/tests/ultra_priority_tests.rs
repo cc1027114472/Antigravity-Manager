@@ -54,6 +54,7 @@ fn create_test_token(
         validation_blocked_until: 0,
         validation_url: None,
         model_quotas,
+        model_quotas_weekly: HashMap::new(),
         model_limits: std::collections::HashMap::new(),
         max_concurrency: None,
     }

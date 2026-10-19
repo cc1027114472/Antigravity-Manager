@@ -162,7 +162,7 @@ export default function MiniView() {
             return 'bg-gradient-to-r from-rose-400 to-rose-500';
         };
 
-        const tip = formatQuotaTooltip(model.percentage, model.officialPercentage);
+        const tip = formatQuotaTooltip(model.percentage, model.officialPercentage, model.limitingWindow, model.windowDetails);
 
         return (
             <motion.div

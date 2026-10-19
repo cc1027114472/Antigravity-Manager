@@ -85,7 +85,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                             isProtected={account.protected_models?.includes(row.protectedKey)}
                             liveLimit={getLiveLimitForModel(account, row.id, row.protectedKey)}
                             Icon={row.protectedKey === 'claude' ? Claude.Color : Gemini.Color}
-                            quotaTitle={formatQuotaTooltip(row.percentage, row.officialPercentage)}
+                            quotaTitle={formatQuotaTooltip(row.percentage, row.officialPercentage, row.limitingWindow, row.windowDetails)}
                         />
                     ))}
                 </div>

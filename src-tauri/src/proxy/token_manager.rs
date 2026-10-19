@@ -44,7 +44,8 @@ pub struct ProxyToken {
     pub validation_blocked: bool, // [NEW] Check for validation block (VALIDATION_REQUIRED temporary block)
     pub validation_blocked_until: i64, // [NEW] Timestamp until which the account is blocked
     pub validation_url: Option<String>, // [NEW] Validation URL (#1522)
-    pub model_quotas: HashMap<String, i32>, // [OPTIMIZATION] In-memory cache for model-specific quotas
+    pub model_quotas: HashMap<String, i32>, // [OPTIMIZATION] In-memory cache for model-specific quotas (5h)
+    pub model_quotas_weekly: HashMap<String, i32>, // [NEW] In-memory cache for 7d weekly quotas
     pub model_limits: HashMap<String, u64>, // [NEW] max_output_tokens per model from quota data
     /// Per-account concurrency override (None/0 = inherit global).
     pub max_concurrency: Option<u32>,
@@ -95,6 +96,7 @@ pub struct TokenManager {
     cancel_token: CancellationToken,
 
     pub auto_recovery: Arc<tokio::sync::RwLock<Option<Arc<crate::proxy::AutoRecoveryScheduler>>>>,
+    pub pacer: Arc<crate::proxy::rate_limit::HumanizedPacer>,
 }
 
 impl TokenManager {
@@ -125,6 +127,7 @@ impl TokenManager {
             auto_cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cancel_token: CancellationToken::new(),
             auto_recovery: Arc::new(tokio::sync::RwLock::new(None)),
+            pacer: Arc::new(crate::proxy::rate_limit::HumanizedPacer::new()),
         }
     }
 
@@ -712,24 +715,36 @@ impl TokenManager {
         }
 
         // Prefer local ledger estimates for selection when enabled.
+        let mut model_quotas_weekly: HashMap<String, i32> = HashMap::new();
         let ledger_enabled = crate::modules::config::load_app_config()
             .map(|c| c.quota_ledger.enabled)
             .unwrap_or(true);
         if ledger_enabled {
             if let Some(estimated) = account.get("estimated_quotas").and_then(|v| v.as_object()) {
                 for (raw_id, entry) in estimated {
-                    if let Some(pct) = entry.get("percentage").and_then(|v| v.as_i64()) {
-                        let billing =
-                            crate::proxy::common::model_mapping::migrate_to_billing_group_id(raw_id)
-                                .unwrap_or_else(|| raw_id.clone());
+                    let billing =
+                        crate::proxy::common::model_mapping::migrate_to_billing_group_id(raw_id)
+                            .unwrap_or_else(|| raw_id.clone());
+                    if let Some(pct) = entry.get("percentage5h").or_else(|| entry.get("percentage_5h")).or_else(|| entry.get("percentage")).and_then(|v| v.as_i64()) {
                         let pct_i = pct as i32;
-                        let slot = model_quotas.entry(billing).or_insert(pct_i);
+                        let slot = model_quotas.entry(billing.clone()).or_insert(pct_i);
                         if pct_i < *slot {
                             *slot = pct_i;
                         }
                     }
+                    if let Some(pct_w) = entry.get("percentageWeekly").or_else(|| entry.get("percentage_weekly")).or_else(|| entry.get("percentage")).and_then(|v| v.as_i64()) {
+                        let pct_w_i = pct_w as i32;
+                        let slot_w = model_quotas_weekly.entry(billing).or_insert(pct_w_i);
+                        if pct_w_i < *slot_w {
+                            *slot_w = pct_w_i;
+                        }
+                    }
                 }
             }
+        }
+
+        for (k, v) in &model_quotas {
+            model_quotas_weekly.entry(k.clone()).or_insert(*v);
         }
 
         // Store capability keys with a sentinel so contains_key works for fine-grained checks
@@ -795,6 +810,7 @@ impl TokenManager {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             model_quotas,
+            model_quotas_weekly,
             model_limits,
             max_concurrency: account
                 .get("max_concurrency")
@@ -983,19 +999,19 @@ impl TokenManager {
         let std_id = crate::proxy::common::model_mapping::normalize_to_billing_group(model_raw)
             .unwrap_or_else(|| model_raw.to_string());
 
-        let burn = app_config.quota_ledger.compute_burn_pct(
+        let (burn_5h, burn_weekly) = app_config.quota_ledger.compute_burn_pct_dual(
             model_raw,
             input_tokens,
             output_tokens,
             cached_tokens,
         );
-        if burn <= 0 {
+        if burn_5h <= 0 && burn_weekly <= 0 {
             return;
         }
 
-        let mut new_pct = 0;
+        let mut new_pct_5h = 0;
+        let mut new_pct_weekly = 0;
         let mut should_protect = false;
-        let mut should_calibrate = false;
         let threshold = app_config.quota_protection.threshold_percentage as i32;
         let protection_on = app_config.quota_protection.enabled
             && app_config.quota_protection.monitored_models.iter().any(|m| {
@@ -1006,13 +1022,23 @@ impl TokenManager {
             });
 
         if let Some(mut entry) = self.tokens.get_mut(&account_id) {
-            let current = entry
+            let current_5h = entry
                 .model_quotas
                 .get(&std_id)
                 .copied()
                 .unwrap_or(100);
-            new_pct = (current - burn).max(0);
-            entry.model_quotas.insert(std_id.clone(), new_pct);
+            let current_weekly = entry
+                .model_quotas_weekly
+                .get(&std_id)
+                .copied()
+                .unwrap_or(current_5h);
+
+            new_pct_5h = (current_5h - burn_5h).max(0);
+            new_pct_weekly = (current_weekly - burn_weekly).max(0);
+
+            entry.model_quotas.insert(std_id.clone(), new_pct_5h);
+            entry.model_quotas_weekly.insert(std_id.clone(), new_pct_weekly);
+
             // Keep fine-grained capability keys in sync with billing burn
             let billing = std_id.clone();
             let sync_keys: Vec<String> = entry
@@ -1027,49 +1053,41 @@ impl TokenManager {
                 .cloned()
                 .collect();
             for k in sync_keys {
-                entry.model_quotas.insert(k, new_pct);
-            }
-            if let Some(max_q) = entry
-                .model_quotas
-                .iter()
-                .filter(|(k, _)| *k == "gemini" || *k == "claude")
-                .map(|(_, v)| *v)
-                .max()
-            {
-                entry.remaining_quota = Some(max_q);
+                entry.model_quotas.insert(k.clone(), new_pct_5h);
+                entry.model_quotas_weekly.insert(k, new_pct_weekly);
             }
 
-            let cooldown_key =
-                crate::modules::quota_ledger::threshold_calibrate_cooldown_key(&account_id, &std_id);
-            let now_ts = chrono::Utc::now().timestamp();
-            let in_cooldown = crate::modules::quota_ledger::is_calibrate_cooldown_active(
-                self.threshold_calibrate_cooldown
-                    .get(&cooldown_key)
-                    .map(|v| *v),
-                now_ts,
-                crate::modules::quota_ledger::THRESHOLD_CALIBRATE_COOLDOWN_SECS,
-            );
-            let decision = crate::modules::quota_ledger::evaluate_threshold_cross(
-                protection_on,
-                current,
-                new_pct,
-                threshold,
-                in_cooldown,
-            );
-            should_protect = decision.should_protect_now;
-            should_calibrate = decision.should_trigger_calibrate;
+            // 双窗口检查：5小时 或 周限额 任一触及保护阈值，立刻触发保护（周限额优先）
+            let hit_5h = new_pct_5h <= threshold;
+            let hit_weekly = new_pct_weekly <= threshold;
+            should_protect = protection_on && (hit_5h || hit_weekly);
 
             if should_protect {
                 entry.protected_models.insert(std_id.clone());
+                let reason = if hit_weekly {
+                    format!("Weekly {}% <= Thres {}%", new_pct_weekly, threshold)
+                } else {
+                    format!("5h {}% <= Thres {}%", new_pct_5h, threshold)
+                };
+                tracing::info!(
+                    "[QuotaLedger] Account {} protected for {} on local ledger ({})",
+                    account_id,
+                    std_id,
+                    reason
+                );
             }
+
+            entry.remaining_quota = Some(new_pct_5h.min(new_pct_weekly));
+
             tracing::debug!(
-                "[QuotaLedger] burn account={} model={} -{}% -> {}% protect={} calibrate={}",
+                "[QuotaLedger] burn account={} model={} -5h:{}% (->{}%) -weekly:{}% (->{}%) protect={}",
                 account_id,
                 std_id,
-                burn,
-                new_pct,
-                should_protect,
-                should_calibrate
+                burn_5h,
+                new_pct_5h,
+                burn_weekly,
+                new_pct_weekly,
+                should_protect
             );
         } else {
             return;
@@ -1082,46 +1100,13 @@ impl TokenManager {
             if let Err(e) = crate::modules::account::persist_estimated_quota_burn(
                 &account_id_persist,
                 &std_id_persist,
-                new_pct,
+                new_pct_5h,
+                new_pct_weekly,
                 protected,
             ) {
                 tracing::debug!("[QuotaLedger] persist burn failed: {}", e);
             }
         });
-
-        if should_calibrate {
-            let cooldown_key =
-                crate::modules::quota_ledger::threshold_calibrate_cooldown_key(&account_id, &std_id);
-            let now_ts = chrono::Utc::now().timestamp();
-            // Stamp cooldown before spawn to prevent concurrent double-fire.
-            self.threshold_calibrate_cooldown
-                .insert(cooldown_key, now_ts);
-
-            tracing::info!(
-                "[QuotaLedger] Threshold cross → online calibrate: account={} group={} local={}% threshold={}%",
-                account_id,
-                std_id,
-                new_pct,
-                threshold
-            );
-
-            if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
-                let account_id_c = account_id.clone();
-                let billing_c = std_id.clone();
-                let fallback_pct = new_pct;
-                tauri::async_runtime::spawn(async move {
-                    tm.calibrate_on_threshold_cross(&account_id_c, &billing_c, fallback_pct)
-                        .await;
-                });
-            } else {
-                tracing::warn!(
-                    "[QuotaLedger] No shared TokenManager; falling back to local protect for {} / {}",
-                    account_id,
-                    std_id
-                );
-                self.apply_threshold_cross_protect_fallback(&account_id, &std_id, new_pct);
-            }
-        }
     }
 
     /// Apply local protect after a failed / unavailable threshold-cross calibrate.
@@ -1129,7 +1114,8 @@ impl TokenManager {
         &self,
         account_id: &str,
         billing_group: &str,
-        local_pct: i32,
+        local_pct_5h: i32,
+        local_pct_weekly: i32,
     ) {
         if let Some(mut entry) = self.tokens.get_mut(account_id) {
             entry.protected_models.insert(billing_group.to_string());
@@ -1140,7 +1126,8 @@ impl TokenManager {
             if let Err(e) = crate::modules::account::persist_estimated_quota_burn(
                 &account_id,
                 &billing_group,
-                local_pct,
+                local_pct_5h,
+                local_pct_weekly,
                 true,
             ) {
                 tracing::warn!(
@@ -1172,6 +1159,7 @@ impl TokenManager {
                 self.apply_threshold_cross_protect_fallback(
                     account_id,
                     billing_group,
+                    fallback_local_pct,
                     fallback_local_pct,
                 );
                 return;
@@ -1212,6 +1200,7 @@ impl TokenManager {
                             account_id,
                             billing_group,
                             fallback_local_pct,
+                            fallback_local_pct,
                         );
                     }
                 }
@@ -1226,6 +1215,7 @@ impl TokenManager {
                 self.apply_threshold_cross_protect_fallback(
                     account_id,
                     billing_group,
+                    fallback_local_pct,
                     fallback_local_pct,
                 );
             }
@@ -1636,7 +1626,7 @@ impl TokenManager {
     ) -> Option<&'a ProxyToken> {
         use rand::Rng;
 
-        // 过滤可用 token
+        // 1. 基础过滤：排除已尝试与配额保护的 token
         let available: Vec<&ProxyToken> = candidates
             .iter()
             .filter(|t| !attempted.contains(&t.account_id))
@@ -1648,12 +1638,41 @@ impl TokenManager {
         if available.is_empty() {
             return None;
         }
-        if available.len() == 1 {
-            return Some(available[0]);
+
+        // 2. 拟人化微休眠 (Micro-Nap) 过滤：优先从非休眠状态的账号中挑选，打散账号的使用密集度
+        let non_napping: Vec<&ProxyToken> = available
+            .iter()
+            .copied()
+            .filter(|t| !self.pacer.is_in_nap(&t.account_id))
+            .collect();
+        let pool = if !non_napping.is_empty() {
+            non_napping
+        } else {
+            available
+        };
+
+        if pool.len() == 1 {
+            return Some(pool[0]);
+        }
+
+        // 3. 拟人化波段节奏优化：优先挑选已经休息满 1~5s 波段间隔的账号
+        let well_rested: Vec<&ProxyToken> = pool
+            .iter()
+            .copied()
+            .filter(|t| self.pacer.get_required_wait_ms(&t.account_id) == 0)
+            .collect();
+        let final_candidates = if !well_rested.is_empty() {
+            well_rested
+        } else {
+            pool
+        };
+
+        if final_candidates.len() == 1 {
+            return Some(final_candidates[0]);
         }
 
         // P2C: 从前 min(P2C_POOL_SIZE, len) 个中随机选 2 个
-        let pool_size = available.len().min(Self::P2C_POOL_SIZE);
+        let pool_size = final_candidates.len().min(Self::P2C_POOL_SIZE);
         let mut rng = rand::thread_rng();
 
         let pick1 = rng.gen_range(0..pool_size);
@@ -1665,8 +1684,8 @@ impl TokenManager {
             pick2
         };
 
-        let c1 = available[pick1];
-        let c2 = available[pick2];
+        let c1 = final_candidates[pick1];
+        let c2 = final_candidates[pick2];
 
         // 选择配额更高的
         let selected = if c1.remaining_quota.unwrap_or(0) >= c2.remaining_quota.unwrap_or(0) {
@@ -2114,6 +2133,17 @@ impl TokenManager {
                                     Err(_) => "bamboo-precept-lgxtn".to_string(), // fallback
                                 }
                             };
+
+                            let wait_ms = self.pacer.get_required_wait_ms(&token.account_id);
+                            if wait_ms > 0 {
+                                tracing::info!(
+                                    "[HumanizedPacer] Pacing request on {}: waiting {}ms (1~5s wave interval)",
+                                    token.email,
+                                    wait_ms
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                            }
+                            self.pacer.mark_request_started(&token.account_id);
 
                             return Ok((
                                 token.access_token,
@@ -2645,6 +2675,17 @@ impl TokenManager {
                     }
                 }
             }
+
+            let wait_ms = self.pacer.get_required_wait_ms(&token.account_id);
+            if wait_ms > 0 {
+                tracing::info!(
+                    "[HumanizedPacer] Pacing request on {}: waiting {}ms (1~5s wave interval)",
+                    token.email,
+                    wait_ms
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            }
+            self.pacer.mark_request_started(&token.account_id);
 
             return Ok((
                 token.access_token,
@@ -4621,6 +4662,7 @@ mod tests {
             validation_blocked_until: 0,
             validation_url: None,
             model_quotas: HashMap::new(),
+            model_quotas_weekly: HashMap::new(),
             model_limits: HashMap::new(),
             max_concurrency: None,
         }
@@ -4959,6 +5001,7 @@ mod tests {
             validation_blocked_until: 0,
             validation_url: None,
             model_quotas: HashMap::new(),
+            model_quotas_weekly: HashMap::new(),
             model_limits: HashMap::new(),
             max_concurrency: None,
         }

@@ -1587,11 +1587,12 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
     Ok(())
 }
 
-/// Persist a single-model estimated burn without online recalibration.
+/// Persist a dual-window estimated burn without online recalibration.
 pub fn persist_estimated_quota_burn(
     account_id: &str,
     std_model_id: &str,
-    new_percentage: i32,
+    new_pct_5h: i32,
+    new_pct_weekly: i32,
     protect_model: bool,
 ) -> Result<(), String> {
     let mut account = load_account(account_id)?;
@@ -1604,12 +1605,25 @@ pub fn persist_estimated_quota_burn(
         .or_insert_with(|| crate::models::EstimatedModelQuota {
             model: billing_id.clone(),
             percentage: 100,
+            percentage_5h: 100,
+            percentage_weekly: 100,
+            reset_time_5h: None,
+            reset_time_weekly: None,
+            delta_5h: None,
+            delta_weekly: None,
+            limiting_window: Some("5h".to_string()),
             last_online_pct: None,
             last_calibrated_at: None,
         });
-    entry.percentage = new_percentage.clamp(0, 100);
+    entry.percentage_5h = new_pct_5h.clamp(0, 100);
+    entry.percentage_weekly = new_pct_weekly.clamp(0, 100);
+    entry.percentage = entry.percentage_5h.min(entry.percentage_weekly);
+    if entry.percentage_weekly <= 0 || entry.percentage_weekly < entry.percentage_5h {
+        entry.limiting_window = Some("weekly".to_string());
+    } else {
+        entry.limiting_window = Some("5h".to_string());
+    }
     entry.model = billing_id.clone();
-    // Keep last calibration metadata; only update percentage.
 
     if protect_model {
         account.protected_models.insert(billing_id);

@@ -79,6 +79,13 @@ export interface ModelQuota {
 export interface EstimatedModelQuota {
     model: string;
     percentage: number;
+    percentage5h?: number;
+    percentageWeekly?: number;
+    resetTime5h?: number;
+    resetTimeWeekly?: number;
+    delta5h?: number;
+    deltaWeekly?: number;
+    limitingWindow?: '5h' | 'weekly' | 'none';
     lastOnlinePct?: number;
     lastCalibratedAt?: number;
 }

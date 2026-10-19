@@ -87,6 +87,8 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
             percentage: row.percentage,
             officialPercentage: row.officialPercentage,
             reset_time: row.reset_time,
+            limitingWindow: row.limitingWindow,
+            windowDetails: row.windowDetails,
         }));
     }, [account, showAllQuotas, config?.pinned_quota_models?.models]);
 
@@ -249,7 +251,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                 isProtected={isModelProtected(model.protectedKey)}
                                 liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                 Icon={model.Icon}
-                                quotaTitle={formatQuotaTooltip(model.percentage, model.officialPercentage)}
+                                quotaTitle={formatQuotaTooltip(model.percentage, model.officialPercentage, model.limitingWindow, model.windowDetails)}
                             />
                         ))}
                     </div>

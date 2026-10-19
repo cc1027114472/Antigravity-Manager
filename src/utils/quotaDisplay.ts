@@ -40,6 +40,8 @@ export type SplitQuotaDisplay = {
     reset_time?: string;
     /** True when ledger/official/online has any signal for this billing group */
     hasData: boolean;
+    limitingWindow?: '5h' | 'weekly';
+    windowDetails?: { p5h?: number; pWeekly?: number; delta5h?: number; deltaWeekly?: number };
 };
 
 const SPLIT_SLOTS: Array<{
@@ -150,6 +152,11 @@ export type BillingQuotaResolved = {
     officialPercentage?: number;
     reset_time?: string;
     hasData: boolean;
+    limitingWindow?: '5h' | 'weekly';
+    percentage5h?: number;
+    percentageWeekly?: number;
+    delta5h?: number;
+    deltaWeekly?: number;
 };
 
 /** Unified list/card row (split slots or expanded model rows). */
@@ -160,6 +167,8 @@ export type ListQuotaDisplay = {
     percentage: number;
     officialPercentage?: number;
     reset_time?: string;
+    limitingWindow?: '5h' | 'weekly';
+    windowDetails?: { p5h?: number; pWeekly?: number; delta5h?: number; deltaWeekly?: number };
 };
 
 export type ListQuotaDisplayOptions = {
@@ -183,11 +192,44 @@ function resolveBillingPct(
     const hasOnline = onlineMin[billing] !== undefined;
     const hasData = hasEst || hasOff || hasOnline;
 
-    const percentage =
-        est?.percentage ??
-        off?.percentage ??
-        onlineMin[billing] ??
-        0;
+    let percentage = 0;
+    let limitingWindow: '5h' | 'weekly' = '5h';
+    let reset_time = off?.reset_time;
+
+    if (est) {
+        const p5h = est.percentage5h ?? est.percentage;
+        const pWeekly = est.percentageWeekly ?? est.percentage;
+
+        // 核心限额显示优先级：
+        // 1. 若触发了周限额 (<=15% 或 limitingWindow 为 weekly)，优先展示周限额
+        // 2. 若触发了 5小时 限额 (<=15% 或 limitingWindow 为 5h)，优先展示 5小时 限额
+        // 3. 常态下默认展示 5小时 限额
+        if (est.limitingWindow === 'weekly' || pWeekly <= 15) {
+            limitingWindow = 'weekly';
+            percentage = pWeekly;
+            if (est.resetTimeWeekly) {
+                reset_time = new Date(est.resetTimeWeekly * 1000).toISOString();
+            }
+        } else if (est.limitingWindow === '5h' || p5h <= 15) {
+            limitingWindow = '5h';
+            percentage = p5h;
+            if (est.resetTime5h) {
+                reset_time = new Date(est.resetTime5h * 1000).toISOString();
+            }
+        } else {
+            limitingWindow = '5h';
+            percentage = p5h;
+            if (est.resetTime5h) {
+                reset_time = new Date(est.resetTime5h * 1000).toISOString();
+            }
+        }
+    } else if (off) {
+        percentage = off.percentage;
+        limitingWindow = '5h';
+        reset_time = off.reset_time;
+    } else {
+        percentage = onlineMin[billing] ?? 0;
+    }
 
     const rawOfficial = est?.lastOnlinePct ?? off?.percentage ?? onlineMin[billing];
     const officialPercentage =
@@ -198,8 +240,13 @@ function resolveBillingPct(
     return {
         percentage,
         officialPercentage,
-        reset_time: off?.reset_time,
+        reset_time,
         hasData,
+        limitingWindow,
+        percentage5h: est?.percentage5h,
+        percentageWeekly: est?.percentageWeekly,
+        delta5h: est?.delta5h,
+        deltaWeekly: est?.deltaWeekly,
     };
 }
 
@@ -291,13 +338,21 @@ export function getListQuotaDisplays(
     const rows: ListQuotaDisplay[] = ledgerModels.map((m) => {
         const billing = normalizeToBillingGroup(m.name) ?? 'gemini';
         const resolved = resolveBillingPct(account, billing);
+        const winTag = resolved.limitingWindow === 'weekly' ? ' (周)' : '';
         return {
             id: m.name.toLowerCase(),
-            label: modelLabel(m.name, m.display_name),
+            label: `${modelLabel(m.name, m.display_name)}${winTag}`,
             protectedKey: billing,
             percentage: resolved.hasData ? resolved.percentage : m.percentage,
             officialPercentage: resolved.officialPercentage ?? m.officialPercentage,
             reset_time: resolved.reset_time || m.reset_time,
+            limitingWindow: resolved.limitingWindow,
+            windowDetails: {
+                p5h: resolved.percentage5h,
+                pWeekly: resolved.percentageWeekly,
+                delta5h: resolved.delta5h,
+                deltaWeekly: resolved.deltaWeekly,
+            },
         };
     });
 
@@ -315,14 +370,22 @@ export function getSplitQuotaDisplays(
 
     return SPLIT_SLOTS.map((slot) => {
         const resolved = resolveBillingPct(account, slot.billing);
+        const winTag = resolved.limitingWindow === 'weekly' ? ' (周)' : '';
         return {
             id: slot.id,
-            label: slot.label,
+            label: `${slot.label}${winTag}`,
             protectedKey: slot.billing,
             percentage: resolved.percentage,
             officialPercentage: resolved.officialPercentage,
             reset_time: resolved.reset_time,
             hasData: resolved.hasData,
+            limitingWindow: resolved.limitingWindow,
+            windowDetails: {
+                p5h: resolved.percentage5h,
+                pWeekly: resolved.percentageWeekly,
+                delta5h: resolved.delta5h,
+                deltaWeekly: resolved.deltaWeekly,
+            },
         };
     }).filter((row) => row.hasData || row.percentage > 0);
 }
@@ -391,23 +454,38 @@ export function getDisplayQuotaModels(account: Account | null | undefined): Disp
     }));
 }
 
-/** Tooltip: show official calibration only when it differs from local. */
+/** Tooltip: show official calibration only when it differs from local, and show dual-window details when available. */
 export function formatQuotaTooltip(
     localPct: number | undefined,
     officialPct: number | undefined,
+    limitingWindow?: '5h' | 'weekly',
+    windowDetails?: { p5h?: number; pWeekly?: number; delta5h?: number; deltaWeekly?: number },
 ): string {
     if (localPct === undefined || localPct === null || Number.isNaN(localPct)) {
         return '';
     }
-    if (
-        officialPct === undefined ||
-        officialPct === null ||
-        Number.isNaN(officialPct) ||
-        officialPct === localPct
-    ) {
-        return `本地估算 ${localPct}%`;
+    const winLabel = limitingWindow ? (limitingWindow === 'weekly' ? ' [周限额]' : ' [5h限额]') : '';
+    let base = `本地估算 ${localPct}%${winLabel}`;
+    if (windowDetails?.p5h !== undefined && windowDetails?.pWeekly !== undefined) {
+        base += ` (5h: ${windowDetails.p5h}%, 周: ${windowDetails.pWeekly}%)`;
     }
-    return `本地估算 ${localPct}% · 官方校准 ${officialPct}%`;
+    if (windowDetails?.delta5h !== undefined || windowDetails?.deltaWeekly !== undefined) {
+        const d5 = windowDetails.delta5h !== undefined ? `5h偏差:${windowDetails.delta5h > 0 ? '+' : ''}${windowDetails.delta5h}%` : '';
+        const dw = windowDetails.deltaWeekly !== undefined ? `周偏差:${windowDetails.deltaWeekly > 0 ? '+' : ''}${windowDetails.deltaWeekly}%` : '';
+        const dStr = [d5, dw].filter(Boolean).join(' ');
+        if (dStr) {
+            base += ` [${dStr}]`;
+        }
+    }
+    if (
+        officialPct !== undefined &&
+        officialPct !== null &&
+        !Number.isNaN(officialPct) &&
+        officialPct !== localPct
+    ) {
+        base += ` · 官方校准 ${officialPct}%`;
+    }
+    return base;
 }
 
 export function findDisplayQuotaModel(

@@ -38,8 +38,110 @@ pub struct RateLimitInfo {
     pub model: Option<String>,
 }
 
-/// 失败计数过期时间：1小时（超过此时间未失败则重置计数）
+/// 连续失败计数过期时间：1小时（超过此时间未失败则重置计数）
 const FAILURE_COUNT_EXPIRY_SECONDS: u64 = 3600;
+
+/// 单账号拟人化节奏状态
+#[derive(Debug, Clone)]
+pub struct AccountPacerState {
+    pub last_request_time: std::time::Instant,
+    pub request_counter: u64,
+    pub current_interval_ms: u64,
+    pub nap_until: Option<std::time::Instant>,
+    pub threshold_jitter: i32,
+}
+
+/// 单账号拟人化流控与防均质化调度器
+pub struct HumanizedPacer {
+    account_states: DashMap<String, AccountPacerState>,
+}
+
+impl HumanizedPacer {
+    pub fn new() -> Self {
+        Self {
+            account_states: DashMap::new(),
+        }
+    }
+
+    /// 获取账号当前需要的拟人化波段间隔（毫秒，1000ms ~ 5000ms），带有正弦潮汐波与正态随机抖动
+    pub fn compute_wave_interval_ms(counter: u64, account_id: &str) -> u64 {
+        use rand::Rng;
+        // 波段周期：约每 10~14 次请求一个涨落周期
+        let wave_phase = (counter as f64) * std::f64::consts::PI / 6.0;
+        let sine_component = (wave_phase.sin() + 1.0) / 2.0; // 0.0 ~ 1.0
+
+        // 基础波段范围：1200ms ~ 4200ms
+        let base_interval = 1200.0 + sine_component * 3000.0;
+        // 随机拟人抖动：-400ms ~ +600ms
+        let jitter: f64 = rand::thread_rng().gen_range(-400.0..=600.0);
+
+        let final_ms = (base_interval + jitter).round() as i64;
+        final_ms.clamp(1000, 5000) as u64
+    }
+
+    /// 计算每个账号的专属保护阈值浮动 (-2% ~ +3%)，打散不同账号的停止水位，防止所有账号同时耗尽
+    pub fn get_threshold_jitter(account_id: &str) -> i32 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        account_id.hash(&mut hasher);
+        let h = hasher.finish();
+        ((h % 6) as i32) - 2
+    }
+
+    /// 检查账号是否处于拟人化微休眠中 (Micro-Nap)
+    pub fn is_in_nap(&self, account_id: &str) -> bool {
+        if let Some(entry) = self.account_states.get(account_id) {
+            if let Some(nap) = entry.nap_until {
+                if std::time::Instant::now() < nap {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 检查账号距离上次请求还需要等待多少毫秒
+    pub fn get_required_wait_ms(&self, account_id: &str) -> u64 {
+        if let Some(entry) = self.account_states.get(account_id) {
+            let elapsed = entry.last_request_time.elapsed().as_millis() as u64;
+            if elapsed < entry.current_interval_ms {
+                return entry.current_interval_ms - elapsed;
+            }
+        }
+        0
+    }
+
+    /// 记录账号发起了一次请求，推进其计数并生成下一次的波段浮动间隔
+    pub fn mark_request_started(&self, account_id: &str) {
+        use rand::Rng;
+        let now = std::time::Instant::now();
+        let mut entry = self.account_states.entry(account_id.to_string()).or_insert_with(|| {
+            AccountPacerState {
+                last_request_time: now,
+                request_counter: 0,
+                current_interval_ms: 2000,
+                nap_until: None,
+                threshold_jitter: Self::get_threshold_jitter(account_id),
+            }
+        });
+
+        entry.last_request_time = now;
+        entry.request_counter += 1;
+        entry.current_interval_ms = Self::compute_wave_interval_ms(entry.request_counter, account_id);
+
+        // 连续处理 20~35 次请求后，随机进入一段 2~5 分钟的微休眠，让流量流转到其它账号
+        let nap_trigger_count = 20 + ((account_id.len() * 3) % 15) as u64;
+        if entry.request_counter % nap_trigger_count == 0 {
+            let nap_secs = rand::thread_rng().gen_range(120..=300);
+            entry.nap_until = Some(now + Duration::from_secs(nap_secs));
+            tracing::info!(
+                "[HumanizedPacer] Account {} entering micro-nap for {}s to prevent quota homogenization",
+                account_id,
+                nap_secs
+            );
+        }
+    }
+}
 
 /// 限流跟踪器
 pub struct RateLimitTracker {

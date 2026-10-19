@@ -152,7 +152,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                     MODEL_CONFIG[row.id]?.Icon ||
                                     (row.protectedKey === 'claude' ? Claude.Color : Gemini.Color)
                                 }
-                                quotaTitle={formatQuotaTooltip(row.percentage, row.officialPercentage)}
+                                quotaTitle={formatQuotaTooltip(row.percentage, row.officialPercentage, row.limitingWindow, row.windowDetails)}
                             />
                         ))}
                     </div>

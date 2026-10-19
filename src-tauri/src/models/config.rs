@@ -141,9 +141,12 @@ pub struct QuotaLedgerConfig {
     /// 5h sprint capacity in CU (100% of local ledger bucket).
     #[serde(default = "default_sprint_capacity_cu")]
     pub sprint_capacity_cu: f64,
-    /// Reserved 7d marathon capacity; not enforced locally.
+    /// 7d marathon capacity; 3x sprint capacity (7天总量是5小时总量的3倍).
     #[serde(default = "default_marathon_capacity_cu")]
     pub marathon_capacity_cu: f64,
+    /// 保守安全放大系数（>=1.0，默认1.25，确保本地账本只少不多，防止上游限流）.
+    #[serde(default = "default_conservative_multiplier")]
+    pub conservative_multiplier: f64,
     /// When true, billable_in = max(0, input - cache).
     #[serde(default = "default_cache_is_subset_of_input")]
     pub cache_is_subset_of_input: bool,
@@ -188,7 +191,11 @@ fn default_sprint_capacity_cu() -> f64 {
 }
 
 fn default_marathon_capacity_cu() -> f64 {
-    2800.0
+    1500.0 // 7天总量是5小时总量的3倍 (3 * 500.0)
+}
+
+fn default_conservative_multiplier() -> f64 {
+    1.25 // 本地账本保守放大系数，确保只少不多
 }
 
 fn default_cache_is_subset_of_input() -> bool {
@@ -258,6 +265,7 @@ impl QuotaLedgerConfig {
             tokens_per_cu: default_tokens_per_cu(),
             sprint_capacity_cu: default_sprint_capacity_cu(),
             marathon_capacity_cu: default_marathon_capacity_cu(),
+            conservative_multiplier: default_conservative_multiplier(),
             cache_is_subset_of_input: default_cache_is_subset_of_input(),
             model_multipliers: default_model_multipliers(),
             family_multipliers: default_family_multipliers(),
@@ -341,8 +349,29 @@ impl QuotaLedgerConfig {
         if delta_cu <= 0.0 {
             return min_burn;
         }
-        let from_cu = (delta_cu / sprint * 100.0).ceil() as i32;
+        let conservative = if self.conservative_multiplier >= 1.0 {
+            self.conservative_multiplier
+        } else {
+            1.25
+        };
+        let from_cu = ((delta_cu * conservative) / sprint * 100.0).ceil() as i32;
         min_burn.max(from_cu.max(1))
+    }
+
+    /// 双窗口保守扣减计算：同时计算 5小时 和 7天周窗口的扣除比例。
+    /// 7天周总量是 5小时总量的 3倍，因此周窗口扣除比例为 5h扣除量的 1/3 (向上取整保证保守)。
+    pub fn compute_burn_pct_dual(
+        &self,
+        model: &str,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+        cached_tokens: Option<u32>,
+    ) -> (i32, i32) {
+        let burn_5h = self.compute_burn_pct(model, input_tokens, output_tokens, cached_tokens);
+        let min_burn = self.min_burn_pct.max(1) as i32;
+        // 7天总量为 3倍 5小时总量，故扣除百分比为 burn_5h / 3.0，向上取整 (ceil) 保持只少不多
+        let burn_weekly = ((burn_5h as f64 / 3.0).ceil() as i32).max(min_burn);
+        (burn_5h, burn_weekly)
     }
 }
 

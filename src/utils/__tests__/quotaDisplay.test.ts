@@ -334,5 +334,42 @@ test('tooltip shows official only when different', () => {
     assertEq(formatQuotaTooltip(10, undefined), '本地估算 10%');
 });
 
+test('prefers 5h window when 5h triggered, and weekly when weekly triggered', () => {
+    // 1. 5h 触发限额 (12% <= 15%)，周限额健康 (80%) -> 优先展示 5h 消耗限额 12%
+    const account5h = baseAccount({
+        estimated_quotas: {
+            gemini: {
+                model: 'gemini',
+                percentage: 12,
+                percentage5h: 12,
+                percentageWeekly: 80,
+                limitingWindow: '5h',
+            },
+        },
+    });
+    const split5h = getSplitQuotaDisplays(account5h);
+    const gemini5h = split5h.find((s) => s.protectedKey === 'gemini');
+    assertEq(gemini5h?.percentage, 12);
+    assertEq(gemini5h?.limitingWindow, '5h');
+
+    // 2. 周限额触发 (10% <= 15%)，5h 较充裕 (90%) -> 优先展示周限额 10%
+    const accountWeekly = baseAccount({
+        estimated_quotas: {
+            gemini: {
+                model: 'gemini',
+                percentage: 10,
+                percentage5h: 90,
+                percentageWeekly: 10,
+                limitingWindow: 'weekly',
+            },
+        },
+    });
+    const splitWeekly = getSplitQuotaDisplays(accountWeekly);
+    const geminiWeekly = splitWeekly.find((s) => s.protectedKey === 'gemini');
+    assertEq(geminiWeekly?.percentage, 10);
+    assertEq(geminiWeekly?.limitingWindow, 'weekly');
+    assertEq(geminiWeekly?.label.includes('(周)'), true);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

@@ -9,8 +9,9 @@ use crate::proxy::common::model_mapping::{
 };
 use std::collections::HashMap;
 
-/// Apply quota_protection using billing-group → percentage map.
+/// Apply quota_protection using dual-window (5h & 7d weekly) estimated percentages.
 /// Uses `<=` threshold so reserve at exactly threshold is protected.
+/// If 5h is triggered, limiting_window is "5h"; if weekly is triggered, limiting_window is "weekly" (weekly has higher severity).
 pub fn apply_protection_from_percentages(
     account: &mut Account,
     percentages: &HashMap<String, i32>,
@@ -28,20 +29,48 @@ pub fn apply_protection_from_percentages(
         let Some(billing_id) = migrate_to_billing_group_id(raw_id) else {
             continue;
         };
-        let max_pct = percentages.get(&billing_id).cloned().unwrap_or(100);
 
-        if max_pct <= threshold {
+        let (p_5h, p_weekly) = if let Some(est) = account.estimated_quotas.get(&billing_id) {
+            (est.percentage_5h, est.percentage_weekly)
+        } else {
+            let p = percentages.get(&billing_id).cloned().unwrap_or(100);
+            (p, p)
+        };
+
+        let hit_5h = p_5h <= threshold;
+        let hit_weekly = p_weekly <= threshold;
+        let should_protect = hit_5h || hit_weekly;
+
+        if let Some(est) = account.estimated_quotas.get_mut(&billing_id) {
+            if hit_weekly {
+                est.limiting_window = Some("weekly".to_string());
+                est.percentage = p_weekly;
+            } else if hit_5h {
+                est.limiting_window = Some("5h".to_string());
+                est.percentage = p_5h;
+            } else {
+                est.limiting_window = Some("5h".to_string());
+                est.percentage = p_5h.min(p_weekly);
+            }
+        }
+
+        if should_protect {
             if !account.protected_models.contains(&billing_id) {
+                let reason = if hit_weekly {
+                    format!("Weekly {}% <= Thres {}%", p_weekly, threshold)
+                } else {
+                    format!("5h {}% <= Thres {}%", p_5h, threshold)
+                };
                 crate::modules::logger::log_info(&format!(
-                    "[QuotaLedger] Triggering model protection: {} (Group: {} Est: {}% <= Thres: {}%)",
-                    account.email, billing_id, max_pct, threshold
+                    "[QuotaLedger] Triggering model protection: {} (Group: {} Reason: {})",
+                    account.email, billing_id, reason
                 ));
                 account.protected_models.insert(billing_id);
             }
         } else if account.protected_models.contains(&billing_id) {
             crate::modules::logger::log_info(&format!(
-                "[QuotaLedger] Model protection recovered: {} (Group: {} Est: {}% > Thres: {}%)",
-                account.email, billing_id, max_pct, threshold
+                "[QuotaLedger] Model protection recovered: {} (Group: {} 5h: {}% Weekly: {}% > Thres: {}%)",
+                account.email, billing_id, p_5h, p_weekly, threshold
             ));
             account.protected_models.remove(&billing_id);
         }
@@ -61,6 +90,48 @@ pub fn apply_protection_from_percentages(
         account.proxy_disabled_reason = None;
         account.proxy_disabled_at = None;
     }
+}
+
+/// 时间滑动自愈逻辑：检测 5h 与周限额重置时间。
+/// 当本地时间超过 reset_time 时，无需发起网络请求即可自动恢复相应窗口为 100%，
+/// 并在没有触发其它限额时解除相应保护。
+pub fn check_time_recovery(account: &mut Account, now: i64) -> bool {
+    let mut modified = false;
+    for (billing, est) in account.estimated_quotas.iter_mut() {
+        // 5h 恢复
+        if let Some(r5h) = est.reset_time_5h {
+            if now >= r5h && est.percentage_5h < 100 {
+                crate::modules::logger::log_info(&format!(
+                    "[QuotaLedger] 5h window reset reached for {} ({}): auto-recovering 5h to 100%",
+                    account.email, billing
+                ));
+                est.percentage_5h = 100;
+                est.reset_time_5h = Some(now + 5 * 3600);
+                modified = true;
+            }
+        }
+        // 周限额恢复
+        if let Some(rw) = est.reset_time_weekly {
+            if now >= rw && est.percentage_weekly < 100 {
+                crate::modules::logger::log_info(&format!(
+                    "[QuotaLedger] Weekly window reset reached for {} ({}): auto-recovering weekly to 100%",
+                    account.email, billing
+                ));
+                est.percentage_weekly = 100;
+                est.reset_time_weekly = Some(now + 7 * 86400);
+                modified = true;
+            }
+        }
+        if modified {
+            est.percentage = est.percentage_5h.min(est.percentage_weekly);
+            if est.percentage_weekly <= 0 || est.percentage_weekly < est.percentage_5h {
+                est.limiting_window = Some("weekly".to_string());
+            } else {
+                est.limiting_window = Some("5h".to_string());
+            }
+        }
+    }
+    modified
 }
 
 /// Build percentage map from estimated_quotas (preferred) or empty.
@@ -132,6 +203,122 @@ pub fn billing_percentages_from_quota_groups(groups: &[QuotaGroup]) -> HashMap<S
         }
     }
     out
+}
+
+pub fn parse_rfc3339_timestamp(s: &str) -> Option<i64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .map(|dt| dt.timestamp())
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%SZ")
+                .map(|dt| dt.and_utc().timestamp())
+                .ok()
+        })
+}
+
+#[derive(Debug, Clone)]
+pub struct OnlineDualWindowBucket {
+    pub pct_5h: i32,
+    pub pct_weekly: i32,
+    pub reset_5h: Option<i64>,
+    pub reset_weekly: Option<i64>,
+}
+
+pub fn extract_dual_window_online_map(quota: &QuotaData) -> HashMap<String, OnlineDualWindowBucket> {
+    let mut map: HashMap<String, OnlineDualWindowBucket> = HashMap::new();
+    if let Some(ref groups) = quota.quota_groups {
+        for group in groups {
+            for bucket in &group.buckets {
+                let id = bucket.bucket_id.to_lowercase();
+                let billing = if id.starts_with("gemini") || id.contains("gemini") {
+                    BILLING_GEMINI.to_string()
+                } else if id.starts_with("3p") || id.contains("3p") || id.contains("claude") {
+                    BILLING_CLAUDE.to_string()
+                } else {
+                    let dn = group.display_name.to_lowercase();
+                    if dn.contains("gemini") {
+                        BILLING_GEMINI.to_string()
+                    } else if dn.contains("claude") || dn.contains("gpt") || dn.contains("3p") {
+                        BILLING_CLAUDE.to_string()
+                    } else {
+                        continue;
+                    }
+                };
+
+                let entry = map.entry(billing).or_insert(OnlineDualWindowBucket {
+                    pct_5h: 100,
+                    pct_weekly: 100,
+                    reset_5h: None,
+                    reset_weekly: None,
+                });
+
+                let pct = fraction_to_pct(bucket.remaining_fraction);
+                let ts = parse_rfc3339_timestamp(&bucket.reset_time);
+                let is_5h = bucket.window.eq_ignore_ascii_case("5h") || id.contains("5h");
+                let is_weekly = bucket.window.eq_ignore_ascii_case("weekly") || id.contains("weekly");
+                if is_5h {
+                    entry.pct_5h = pct;
+                    entry.reset_5h = ts;
+                } else if is_weekly {
+                    entry.pct_weekly = pct;
+                    entry.reset_weekly = ts;
+                }
+            }
+        }
+    }
+
+    // Fallback if quota_groups was absent
+    if map.is_empty() {
+        for model in &quota.models {
+            let Some(billing) = normalize_to_billing_group(&model.name) else {
+                continue;
+            };
+            let ts = parse_rfc3339_timestamp(&model.reset_time);
+            let entry = map.entry(billing).or_insert(OnlineDualWindowBucket {
+                pct_5h: model.percentage,
+                pct_weekly: model.percentage,
+                reset_5h: ts,
+                reset_weekly: None,
+            });
+            if model.percentage < entry.pct_5h {
+                entry.pct_5h = model.percentage;
+                entry.pct_weekly = model.percentage;
+            }
+        }
+    }
+
+    map
+}
+
+/// 执行双窗口在线校准，精确记录本地估算与远程实际的偏差 (delta)，用于防风控保守校验与自学习
+pub fn calibrate_account_dual_window(account: &mut Account, quota: &QuotaData) {
+    let now = chrono::Utc::now().timestamp();
+    let dual_map = extract_dual_window_online_map(quota);
+    for (billing_id, online) in dual_map {
+        let prev = account.estimated_quotas.get(&billing_id);
+        if let Some(p) = prev {
+            let d5 = p.percentage_5h - online.pct_5h;
+            let dw = p.percentage_weekly - online.pct_weekly;
+            crate::modules::logger::log_info(&format!(
+                "[QuotaLedger] Calibration delta for {} ({}): 5h delta = {}% (local was {}%, actual is {}%), weekly delta = {}% (local was {}%, actual is {}%)",
+                account.email, billing_id, d5, p.percentage_5h, online.pct_5h, dw, p.percentage_weekly, online.pct_weekly
+            ));
+        }
+        let next_entry = crate::models::quota::EstimatedModelQuota::from_online_dual(
+            billing_id.clone(),
+            online.pct_5h,
+            online.pct_weekly,
+            online.reset_5h,
+            online.reset_weekly,
+            now,
+            prev,
+        );
+        account.estimated_quotas.insert(billing_id, next_entry);
+    }
 }
 
 fn fraction_to_pct(fraction: f64) -> i32 {
@@ -206,6 +393,9 @@ pub fn migrate_estimated_quotas(
             Some(existing) => {
                 if est.percentage < existing.percentage {
                     existing.percentage = est.percentage;
+                    existing.percentage_5h = est.percentage_5h;
+                    existing.percentage_weekly = est.percentage_weekly;
+                    existing.limiting_window = est.limiting_window;
                 }
                 // Keep more recent calibration metadata when present
                 match (existing.last_calibrated_at, est.last_calibrated_at) {
@@ -227,6 +417,13 @@ pub fn migrate_estimated_quotas(
                     EstimatedModelQuota {
                         model: billing,
                         percentage: est.percentage,
+                        percentage_5h: est.percentage_5h,
+                        percentage_weekly: est.percentage_weekly,
+                        reset_time_5h: est.reset_time_5h,
+                        reset_time_weekly: est.reset_time_weekly,
+                        delta_5h: est.delta_5h,
+                        delta_weekly: est.delta_weekly,
+                        limiting_window: est.limiting_window,
                         last_online_pct: est.last_online_pct,
                         last_calibrated_at: est.last_calibrated_at,
                     },
@@ -650,21 +847,11 @@ mod tests {
         let mut legacy = HashMap::new();
         legacy.insert(
             "gemini-3-flash".into(),
-            EstimatedModelQuota {
-                model: "gemini-3-flash".into(),
-                percentage: 10,
-                last_online_pct: Some(10),
-                last_calibrated_at: Some(1),
-            },
+            EstimatedModelQuota::from_online("gemini-3-flash".into(), 10, 1),
         );
         legacy.insert(
             "gemini-3-pro-high".into(),
-            EstimatedModelQuota {
-                model: "gemini-3-pro-high".into(),
-                percentage: 50,
-                last_online_pct: Some(50),
-                last_calibrated_at: Some(2),
-            },
+            EstimatedModelQuota::from_online("gemini-3-pro-high".into(), 50, 2),
         );
         let migrated = migrate_estimated_quotas(legacy);
         assert_eq!(migrated.len(), 1);

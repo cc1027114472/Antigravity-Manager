@@ -97,14 +97,39 @@ impl Default for QuotaData {
     }
 }
 
+fn default_hundred() -> i32 {
+    100
+}
+
 /// Local estimated remaining quota for one standard model id (ledger).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EstimatedModelQuota {
-    /// Standard model id (e.g. `claude`, `gemini-3-flash`)
+    /// Standard model id (e.g. `claude`, `gemini`)
     pub model: String,
-    /// Estimated remaining percentage 0-100
+    /// Effective remaining percentage 0-100 (min of active windows, for backward compatibility)
     pub percentage: i32,
+    /// Estimated remaining percentage in 5h window (0-100)
+    #[serde(default = "default_hundred")]
+    pub percentage_5h: i32,
+    /// Estimated remaining percentage in 7d (weekly) window (0-100)
+    #[serde(default = "default_hundred")]
+    pub percentage_weekly: i32,
+    /// 5h reset timestamp (unix seconds)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_time_5h: Option<i64>,
+    /// Weekly reset timestamp (unix seconds)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_time_weekly: Option<i64>,
+    /// Last calibration delta 5h: (local_est - remote_actual)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_5h: Option<i32>,
+    /// Last calibration delta weekly: (local_est - remote_actual)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_weekly: Option<i32>,
+    /// Active limiting window: "5h" | "weekly" | "none"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limiting_window: Option<String>,
     /// Last online percentage applied during calibration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_online_pct: Option<i32>,
@@ -115,10 +140,52 @@ pub struct EstimatedModelQuota {
 
 impl EstimatedModelQuota {
     pub fn from_online(model: String, online_pct: i32, now: i64) -> Self {
+        let pct = online_pct.clamp(0, 100);
         Self {
             model,
-            percentage: online_pct.clamp(0, 100),
-            last_online_pct: Some(online_pct.clamp(0, 100)),
+            percentage: pct,
+            percentage_5h: pct,
+            percentage_weekly: pct,
+            reset_time_5h: None,
+            reset_time_weekly: None,
+            delta_5h: None,
+            delta_weekly: None,
+            limiting_window: Some("5h".to_string()),
+            last_online_pct: Some(pct),
+            last_calibrated_at: Some(now),
+        }
+    }
+
+    pub fn from_online_dual(
+        model: String,
+        online_5h: i32,
+        online_weekly: i32,
+        reset_5h: Option<i64>,
+        reset_weekly: Option<i64>,
+        now: i64,
+        prev: Option<&EstimatedModelQuota>,
+    ) -> Self {
+        let p5h = online_5h.clamp(0, 100);
+        let pw = online_weekly.clamp(0, 100);
+        let delta_5h = prev.map(|p| p.percentage_5h - p5h);
+        let delta_weekly = prev.map(|p| p.percentage_weekly - pw);
+        let eff = p5h.min(pw);
+        let limiting_window = if pw <= 0 || pw < p5h {
+            Some("weekly".to_string())
+        } else {
+            Some("5h".to_string())
+        };
+        Self {
+            model,
+            percentage: eff,
+            percentage_5h: p5h,
+            percentage_weekly: pw,
+            reset_time_5h: reset_5h,
+            reset_time_weekly: reset_weekly,
+            delta_5h,
+            delta_weekly,
+            limiting_window,
+            last_online_pct: Some(eff),
             last_calibrated_at: Some(now),
         }
     }
