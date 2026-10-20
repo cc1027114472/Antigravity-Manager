@@ -257,7 +257,7 @@ impl TokenManager {
         tracing::info!("Rate limit auto-cleanup task started (interval: 15s)");
     }
 
-    /// 从主应用账号目录加载所有账号
+    /// 从主应用账号目录加载所有账号（两阶段零停机平滑原子同步）
     pub async fn load_accounts(&self) -> Result<usize, String> {
         let accounts_dir = self.data_dir.join("accounts");
 
@@ -265,18 +265,11 @@ impl TokenManager {
             return Err(format!("账号目录不存在: {:?}", accounts_dir));
         }
 
-        // Reload should reflect current on-disk state (accounts can be added/removed/disabled).
-        self.tokens.clear();
-        self.current_index.store(0, Ordering::SeqCst);
-        {
-            let mut last_used = self.last_used_account.lock().await;
-            *last_used = None;
-        }
-
         let entries =
             std::fs::read_dir(&accounts_dir).map_err(|e| format!("读取账号目录失败: {}", e))?;
 
-        let mut count = 0;
+        // 阶段 1：在局部集合中加载新账号，严禁提前清空现有活跃池导致并发 503 宕机
+        let mut new_tokens = std::collections::HashMap::new();
 
         for entry in entries {
             let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
@@ -290,14 +283,33 @@ impl TokenManager {
             match self.load_single_account(&path).await {
                 Ok(Some(token)) => {
                     let account_id = token.account_id.clone();
-                    self.tokens.insert(account_id, token);
-                    count += 1;
+                    new_tokens.insert(account_id, token);
                 }
                 Ok(None) => {
                     // 跳过无效账号
                 }
                 Err(e) => {
                     tracing::debug!("加载账号失败 {:?}: {}", path, e);
+                }
+            }
+        }
+
+        let count = new_tokens.len();
+
+        // 阶段 2：零停机平滑原子同步到 self.tokens
+        // 剔除已在磁盘删除或停用的账号
+        self.tokens.retain(|k, _| new_tokens.contains_key(k));
+        // 更新或插入新载入的有效账号
+        for (k, v) in new_tokens {
+            self.tokens.insert(k, v);
+        }
+
+        // 若上次记录的使用账号已不在池中，则安全清理
+        {
+            let mut last_used = self.last_used_account.lock().await;
+            if let Some((ref acc_id, _)) = *last_used {
+                if !self.tokens.contains_key(acc_id) {
+                    *last_used = None;
                 }
             }
         }
@@ -3282,18 +3294,24 @@ impl TokenManager {
             model.and_then(|m| crate::proxy::common::model_mapping::normalize_to_standard_id(m));
         let model_to_track = normalized_model.as_deref().or(model);
 
-        // [NEW] 检查熔断是否启用
-        let config = self.circuit_breaker_config.read().await.clone();
-        if !config.enabled {
-            return;
-        }
-
         // [FIX] Convert email to account_id for consistent tracking
         let account_id = self
             .email_to_account_id(email)
             .unwrap_or_else(|| email.to_string());
 
         let reason = self.classify_rate_limit_reason(error_body);
+
+        // 1) 只要上游出现 429，无条件立即写盘禁用、移出选号池，并排入 1 小时阶梯自愈退避队列（绝不区分真假 429）
+        if status == 429 {
+            self.disable_proxy_on_429(&account_id, model_to_track, reason, error_body)
+                .await;
+        }
+
+        // [NEW] 检查熔断是否启用（用于短期内存 rate_limit_tracker 锁与模型限流）
+        let config = self.circuit_breaker_config.read().await.clone();
+        if !config.enabled {
+            return;
+        }
 
         // Prefer caller peak; else sample current overlapping count at error time.
         let peak = in_flight_peak.or_else(|| {
@@ -3305,7 +3323,7 @@ impl TokenManager {
             }
         });
 
-        // 1) 立刻落锁，确保 handler 下一轮 force_rotate / 串行 advance 能跳过本号
+        // 立刻落锁，确保 handler 下一轮 force_rotate / 串行 advance 能跳过本号
         self.rate_limit_tracker.parse_from_error(
             &account_id,
             status,
@@ -3322,16 +3340,6 @@ impl TokenManager {
             error_body,
             peak,
         );
-
-        // 2) 429 且非 Grace 短窗：反代禁用 + 移出内存池 + 串行游标推进
-        //    短 retry（≤2s）保留账号以便原地重试；长锁/无 delay 则立刻踢出并切号。
-        let is_grace_window = crate::proxy::upstream::retry::parse_retry_delay(error_body)
-            .map(crate::proxy::upstream::retry::should_grace_retry)
-            .unwrap_or(false);
-        if status == 429 && !is_grace_window {
-            self.disable_proxy_on_429(&account_id, model_to_track, reason, error_body)
-                .await;
-        }
     }
 
     fn classify_rate_limit_reason(

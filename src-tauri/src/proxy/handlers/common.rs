@@ -43,30 +43,12 @@ pub fn determine_retry_strategy(
             RetryStrategy::FixedDelay(Duration::from_millis(200))
         }
 
-        // 429 限流错误
+        // 429 限流错误：无论长短延迟一视同仁，立即切号（50ms缓冲），账号无条件立即写盘禁用并进自愈退避队列
         429 => {
-            // 优先使用服务端返回的 Retry-After / quotaResetDelay
-            if let Some(delay_ms) = crate::proxy::upstream::retry::parse_retry_delay(error_text) {
-                // 短窗口：原地重试比切号更划算
-                if crate::proxy::upstream::retry::should_grace_retry(delay_ms) {
-                    let actual_delay = delay_ms.saturating_add(100); // 增加 100ms 安全缓冲
-                    tracing::info!(
-                        "Grace Retry Triggered: Delay {}ms is within window, using same account",
-                        actual_delay
-                    );
-                    RetryStrategy::GraceRetry(Duration::from_millis(actual_delay))
-                } else {
-                    // 长 retry-after：账号已由 mark_rate_limited 锁定，立刻切号，不要干等 Google 重置
-                    tracing::info!(
-                        "429 delay {}ms exceeds grace window; rotate immediately (lockout already applied)",
-                        delay_ms
-                    );
-                    RetryStrategy::FixedDelay(Duration::from_millis(50))
-                }
-            } else {
-                // 无明确 delay：立刻切号（锁定时长由熔断/退避阶梯负责）
-                RetryStrategy::FixedDelay(Duration::from_millis(50))
-            }
+            tracing::info!(
+                "429 rate limit encountered; rotate immediately to next account (disable & enqueue recovery)"
+            );
+            RetryStrategy::FixedDelay(Duration::from_millis(50))
         }
 
         // 503 服务不可用 / 529 服务器过载
