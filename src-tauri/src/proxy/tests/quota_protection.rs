@@ -40,6 +40,8 @@ mod tests {
             validation_url: None,
             model_quotas: std::collections::HashMap::new(),
             model_quotas_weekly: std::collections::HashMap::new(),
+            pending_cu_5h: std::collections::HashMap::new(),
+            pending_cu_weekly: std::collections::HashMap::new(),
             model_limits: std::collections::HashMap::new(),
             max_concurrency: None,
         }
@@ -1124,6 +1126,8 @@ mod tests {
             validation_url: None,
             model_quotas: std::collections::HashMap::new(),
             model_quotas_weekly: std::collections::HashMap::new(),
+            pending_cu_5h: std::collections::HashMap::new(),
+            pending_cu_weekly: std::collections::HashMap::new(),
             model_limits: std::collections::HashMap::new(),
             max_concurrency: None,
         }

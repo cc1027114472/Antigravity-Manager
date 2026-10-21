@@ -46,6 +46,10 @@ pub struct ProxyToken {
     pub validation_url: Option<String>, // [NEW] Validation URL (#1522)
     pub model_quotas: HashMap<String, i32>, // [OPTIMIZATION] In-memory cache for model-specific quotas (5h)
     pub model_quotas_weekly: HashMap<String, i32>, // [NEW] In-memory cache for 7d weekly quotas
+    /// Fractional CU accumulated in 5h window pending integer percentage burn
+    pub pending_cu_5h: HashMap<String, f64>,
+    /// Fractional CU accumulated in 7d weekly window pending integer percentage burn
+    pub pending_cu_weekly: HashMap<String, f64>,
     pub model_limits: HashMap<String, u64>, // [NEW] max_output_tokens per model from quota data
     /// Per-account concurrency override (None/0 = inherit global).
     pub max_concurrency: Option<u32>,
@@ -728,6 +732,8 @@ impl TokenManager {
 
         // Prefer local ledger estimates for selection when enabled.
         let mut model_quotas_weekly: HashMap<String, i32> = HashMap::new();
+        let mut pending_cu_5h: HashMap<String, f64> = HashMap::new();
+        let mut pending_cu_weekly: HashMap<String, f64> = HashMap::new();
         let ledger_enabled = crate::modules::config::load_app_config()
             .map(|c| c.quota_ledger.enabled)
             .unwrap_or(true);
@@ -746,9 +752,27 @@ impl TokenManager {
                     }
                     if let Some(pct_w) = entry.get("percentageWeekly").or_else(|| entry.get("percentage_weekly")).or_else(|| entry.get("percentage")).and_then(|v| v.as_i64()) {
                         let pct_w_i = pct_w as i32;
-                        let slot_w = model_quotas_weekly.entry(billing).or_insert(pct_w_i);
+                        let slot_w = model_quotas_weekly.entry(billing.clone()).or_insert(pct_w_i);
                         if pct_w_i < *slot_w {
                             *slot_w = pct_w_i;
+                        }
+                    }
+                    if let Some(p5) = entry
+                        .get("pendingCu5h")
+                        .or_else(|| entry.get("pending_cu_5h"))
+                        .and_then(|v| v.as_f64())
+                    {
+                        if p5 > 0.0 {
+                            pending_cu_5h.insert(billing.clone(), p5);
+                        }
+                    }
+                    if let Some(pw) = entry
+                        .get("pendingCuWeekly")
+                        .or_else(|| entry.get("pending_cu_weekly"))
+                        .and_then(|v| v.as_f64())
+                    {
+                        if pw > 0.0 {
+                            pending_cu_weekly.insert(billing.clone(), pw);
                         }
                     }
                 }
@@ -823,6 +847,8 @@ impl TokenManager {
                 .map(|s| s.to_string()),
             model_quotas,
             model_quotas_weekly,
+            pending_cu_5h,
+            pending_cu_weekly,
             model_limits,
             max_concurrency: account
                 .get("max_concurrency")
@@ -1011,13 +1037,38 @@ impl TokenManager {
         let std_id = crate::proxy::common::model_mapping::normalize_to_billing_group(model_raw)
             .unwrap_or_else(|| model_raw.to_string());
 
-        let (burn_5h, burn_weekly) = app_config.quota_ledger.compute_burn_pct_dual(
+        let (p5h, pw) = if let Some(entry) = self.tokens.get(&account_id) {
+            (
+                entry.pending_cu_5h.get(&std_id).copied().unwrap_or(0.0),
+                entry.pending_cu_weekly.get(&std_id).copied().unwrap_or(0.0),
+            )
+        } else {
+            return;
+        };
+
+        let (burn_5h, rem_5h, burn_weekly, rem_weekly) = app_config.quota_ledger.accumulate_and_burn_dual(
+            p5h,
+            pw,
             model_raw,
             input_tokens,
             output_tokens,
             cached_tokens,
         );
+
+        // Always update in-memory pending CU remainder
+        if let Some(mut entry) = self.tokens.get_mut(&account_id) {
+            entry.pending_cu_5h.insert(std_id.clone(), rem_5h);
+            entry.pending_cu_weekly.insert(std_id.clone(), rem_weekly);
+        }
+
         if burn_5h <= 0 && burn_weekly <= 0 {
+            tracing::debug!(
+                "[QuotaLedger] micro-request account={} model={} pending_5h={:.3} pending_weekly={:.3} (no pct burn)",
+                account_id,
+                std_id,
+                rem_5h,
+                rem_weekly
+            );
             return;
         }
 
@@ -1114,8 +1165,8 @@ impl TokenManager {
                 &std_id_persist,
                 new_pct_5h,
                 new_pct_weekly,
-                0.0,
-                0.0,
+                rem_5h,
+                rem_weekly,
                 protected,
             ) {
                 tracing::debug!("[QuotaLedger] persist burn failed: {}", e);
@@ -1131,9 +1182,15 @@ impl TokenManager {
         local_pct_5h: i32,
         local_pct_weekly: i32,
     ) {
-        if let Some(mut entry) = self.tokens.get_mut(account_id) {
+        let (rem_5h, rem_weekly) = if let Some(mut entry) = self.tokens.get_mut(account_id) {
             entry.protected_models.insert(billing_group.to_string());
-        }
+            (
+                entry.pending_cu_5h.get(billing_group).copied().unwrap_or(0.0),
+                entry.pending_cu_weekly.get(billing_group).copied().unwrap_or(0.0),
+            )
+        } else {
+            (0.0, 0.0)
+        };
         let account_id = account_id.to_string();
         let billing_group = billing_group.to_string();
         tokio::task::spawn_blocking(move || {
@@ -1142,8 +1199,8 @@ impl TokenManager {
                 &billing_group,
                 local_pct_5h,
                 local_pct_weekly,
-                0.0,
-                0.0,
+                rem_5h,
+                rem_weekly,
                 true,
             ) {
                 tracing::warn!(
@@ -4675,6 +4732,8 @@ mod tests {
             validation_url: None,
             model_quotas: HashMap::new(),
             model_quotas_weekly: HashMap::new(),
+            pending_cu_5h: HashMap::new(),
+            pending_cu_weekly: HashMap::new(),
             model_limits: HashMap::new(),
             max_concurrency: None,
         }
@@ -5014,6 +5073,8 @@ mod tests {
             validation_url: None,
             model_quotas: HashMap::new(),
             model_quotas_weekly: HashMap::new(),
+            pending_cu_5h: HashMap::new(),
+            pending_cu_weekly: HashMap::new(),
             model_limits: HashMap::new(),
             max_concurrency: None,
         }
@@ -5541,6 +5602,153 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("exhausted"), "err={}", err);
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    struct TestEnvGuard(&'static str);
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_burn_account_quota_micro_requests_accumulate() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-micro-burn-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let _env_guard = {
+            std::env::set_var("ABV_DATA_DIR", &tmp_root);
+            TestEnvGuard("ABV_DATA_DIR")
+        };
+        let account_id = "acc_micro";
+        let email = "micro@test.com";
+        let now = chrono::Utc::now().timestamp();
+        let account_path = accounts_dir.join(format!("{}.json", account_id));
+
+        let account_json = serde_json::json!({
+            "id": account_id,
+            "email": email,
+            "token": {
+                "access_token": "atk",
+                "refresh_token": "rtk",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600
+            },
+            "disabled": false,
+            "proxy_disabled": false,
+            "estimated_quotas": {
+                "claude": {
+                    "percentage5h": 100,
+                    "percentageWeekly": 100,
+                    "pendingCu5h": 3.75,
+                    "pendingCuWeekly": 1.25
+                }
+            },
+            "created_at": now,
+            "last_used": now
+        });
+        std::fs::write(
+            &account_path,
+            serde_json::to_string_pretty(&account_json).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        let token_opt = manager.load_single_account(&account_path).await.unwrap();
+        assert!(token_opt.is_some());
+        let mut token = token_opt.unwrap();
+        assert_eq!(token.pending_cu_5h.get("claude").copied(), Some(3.75));
+        assert_eq!(token.pending_cu_weekly.get("claude").copied(), Some(1.25));
+
+        // Reset pending CU to 0.0 to test accumulation from clean state
+        token.pending_cu_5h.clear();
+        token.pending_cu_weekly.clear();
+        manager.tokens.insert(account_id.to_string(), token);
+
+        // A single micro request: 1000 input tokens on claude-sonnet-4-5-20250929
+        // Multiplier = 3.0 (family_multipliers matches "sonnet"), tokens_per_cu = 1000,
+        // conservative = 1.25 -> delta_cu = 1.0 * 1.25 * 3.0 = 3.75 CU.
+        // 3.75 CU < 5.0 CU (1% of 500 CU sprint) -> burn_5h = 0, rem_5h = 3.75.
+        // Weekly window: 1500 CU, 1% = 15 CU. 3.75 CU < 15 CU -> burn_weekly = 0, rem_weekly = 3.75.
+        manager.burn_estimated_quota(
+            Some(account_id),
+            None,
+            Some("claude-sonnet-4-5-20250929"),
+            Some(1000),
+            Some(0),
+            None,
+        );
+
+        {
+            let t = manager.tokens.get(account_id).unwrap();
+            assert_eq!(t.model_quotas.get("claude").copied(), Some(100));
+            assert_eq!(t.model_quotas_weekly.get("claude").copied(), Some(100));
+            let rem_5h = t.pending_cu_5h.get("claude").copied().unwrap();
+            let rem_w = t.pending_cu_weekly.get("claude").copied().unwrap();
+            assert!((rem_5h - 3.75).abs() < 1e-6, "expected 3.75, got {}", rem_5h);
+            assert!((rem_w - 3.75).abs() < 1e-6, "expected 3.75, got {}", rem_w);
+        }
+
+        // Second micro request: another 1000 input tokens -> delta_cu = 3.75 CU.
+        // Total 5h CU = 3.75 + 3.75 = 7.50 CU.
+        // 7.50 CU >= 5.0 CU -> burn_5h = 1 (1%), rem_5h = 2.50 CU, pct drops to 99%.
+        // Weekly CU = 3.75 + 3.75 = 7.50 CU < 15.0 CU -> burn_weekly = 0, rem_weekly = 7.50 CU, pct remains 100%.
+        manager.burn_estimated_quota(
+            Some(account_id),
+            None,
+            Some("claude-sonnet-4-5-20250929"),
+            Some(1000),
+            Some(0),
+            None,
+        );
+
+        {
+            let t = manager.tokens.get(account_id).unwrap();
+            assert_eq!(t.model_quotas.get("claude").copied(), Some(99), "5h percentage should drop to 99%");
+            assert_eq!(t.model_quotas_weekly.get("claude").copied(), Some(100), "weekly percentage should remain 100%");
+            let rem_5h = t.pending_cu_5h.get("claude").copied().unwrap();
+            let rem_w = t.pending_cu_weekly.get("claude").copied().unwrap();
+            assert!((rem_5h - 2.50).abs() < 1e-6, "expected 2.50, got {}", rem_5h);
+            assert!((rem_w - 7.50).abs() < 1e-6, "expected 7.50, got {}", rem_w);
+        }
+
+        // Third micro request: 1000 input tokens -> delta_cu = 3.75 CU.
+        // Total 5h CU = 2.50 + 3.75 = 6.25 CU -> burn_5h = 1, rem_5h = 1.25 CU, pct drops to 98%.
+        // Total weekly CU = 7.50 + 3.75 = 11.25 CU < 15.0 CU -> burn_weekly = 0, rem_weekly = 11.25 CU.
+        manager.burn_estimated_quota(
+            Some(account_id),
+            None,
+            Some("claude-sonnet-4-5-20250929"),
+            Some(1000),
+            Some(0),
+            None,
+        );
+        // Fourth micro request: 1000 input tokens -> delta_cu = 3.75 CU.
+        // Total 5h CU = 1.25 + 3.75 = 5.00 CU -> burn_5h = 1, rem_5h = 0.00 CU, pct drops to 97%.
+        // Total weekly CU = 11.25 + 3.75 = 15.00 CU -> burn_weekly = 1 (1%), rem_weekly = 0.00 CU, pct drops to 99%.
+        manager.burn_estimated_quota(
+            Some(account_id),
+            None,
+            Some("claude-sonnet-4-5-20250929"),
+            Some(1000),
+            Some(0),
+            None,
+        );
+
+        {
+            let t = manager.tokens.get(account_id).unwrap();
+            assert_eq!(t.model_quotas.get("claude").copied(), Some(97), "5h percentage should drop to 97%");
+            assert_eq!(t.model_quotas_weekly.get("claude").copied(), Some(99), "weekly percentage should drop to 99%");
+            let rem_5h = t.pending_cu_5h.get("claude").copied().unwrap();
+            let rem_w = t.pending_cu_weekly.get("claude").copied().unwrap();
+            assert!((rem_5h - 0.0).abs() < 1e-6, "expected 0.0, got {}", rem_5h);
+            assert!((rem_w - 0.0).abs() < 1e-6, "expected 0.0, got {}", rem_w);
+        }
 
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
