@@ -56,7 +56,8 @@ pub fn clean_json_schema(value: &mut Value) {
     // [FIX #952] 始终运行 flatten_refs，即使 defs 为空
     // 这样可以捕获并处理无法解析的 $ref (降级为 string 类型)
     if let Value::Object(map) = value {
-        flatten_refs(map, &all_defs, 0);
+        let mut active_refs = std::collections::HashSet::new();
+        flatten_refs(map, &all_defs, 0, &mut active_refs);
     }
 
     // 递归清理
@@ -127,11 +128,12 @@ fn collect_all_defs(value: &Value, defs: &mut serde_json::Map<String, Value>) {
     }
 }
 
-/// 递归展开 $ref
+/// 递归展开 $ref，带有活跃祖先集合跟踪，防止循环/自引用导致指数级内存爆炸 (Fixes #3690)
 fn flatten_refs(
     map: &mut serde_json::Map<String, Value>,
     defs: &serde_json::Map<String, Value>,
     depth: usize,
+    active_refs: &mut std::collections::HashSet<String>,
 ) {
     if depth > MAX_RECURSION_DEPTH {
         tracing::warn!("[Schema-Flatten] Max recursion depth reached, stopping ref expansion.");
@@ -143,6 +145,30 @@ fn flatten_refs(
         // 解析引用名 (例如 #/$defs/MyType -> MyType)
         let ref_name = ref_path.split('/').last().unwrap_or(&ref_path);
 
+        // [FIX #3690] 循环引用检测：若当前引用已处于活跃展开祖先链路中，停止递归展开并降级为安全终结 Object，
+        // 杜绝分支因子 b >= 2 时产生 2^64 指数级膨胀导致 Linux VPS OOM (SIGKILL 137) 崩溃
+        if active_refs.contains(ref_name) {
+            tracing::warn!(
+                ref_name,
+                depth,
+                "[Schema-Flatten] Cyclic $ref detected, degrading to safe terminal object."
+            );
+            map.insert("type".to_string(), serde_json::json!("object"));
+            let hint = format!("(Cyclic $ref: {})", ref_path);
+            let desc_val = map
+                .entry("description".to_string())
+                .or_insert_with(|| Value::String(String::new()));
+            if let Value::String(s) = desc_val {
+                if !s.contains(&hint) {
+                    if !s.is_empty() {
+                        s.push(' ');
+                    }
+                    s.push_str(&hint);
+                }
+            }
+            return;
+        }
+
         if let Some(def_schema) = defs.get(ref_name) {
             // 将定义的内容合并到当前 map
             if let Value::Object(def_map) = def_schema {
@@ -152,9 +178,25 @@ fn flatten_refs(
                     map.entry(k.clone()).or_insert_with(|| v.clone());
                 }
 
-                // 递归处理刚刚合并进来的内容中可能包含的 $ref
-                // 注意：由于引入了 depth 限制，循环引用不再会导致栈溢出
-                flatten_refs(map, defs, depth + 1);
+                // 递归处理刚刚合并进来的内容：将当前类型压入活跃祖先集合
+                active_refs.insert(ref_name.to_string());
+                if map.contains_key("$ref") {
+                    flatten_refs(map, defs, depth + 1, active_refs);
+                } else {
+                    for (_, v) in map.iter_mut() {
+                        if let Value::Object(child_map) = v {
+                            flatten_refs(child_map, defs, depth + 1, active_refs);
+                        } else if let Value::Array(arr) = v {
+                            for item in arr {
+                                if let Value::Object(item_map) = item {
+                                    flatten_refs(item_map, defs, depth + 1, active_refs);
+                                }
+                            }
+                        }
+                    }
+                }
+                active_refs.remove(ref_name);
+                return;
             }
         } else {
             // [FIX #952] 无法解析的 $ref: 转换为宽松的 string 类型，避免 API 400 错误
@@ -172,17 +214,18 @@ fn flatten_refs(
                     s.push_str(&hint);
                 }
             }
+            return;
         }
     }
 
     // 遍历子节点
     for (_, v) in map.iter_mut() {
         if let Value::Object(child_map) = v {
-            flatten_refs(child_map, defs, depth + 1);
+            flatten_refs(child_map, defs, depth + 1, active_refs);
         } else if let Value::Array(arr) = v {
             for item in arr {
                 if let Value::Object(item_map) = item {
-                    flatten_refs(item_map, defs, depth + 1);
+                    flatten_refs(item_map, defs, depth + 1, active_refs);
                 }
             }
         }

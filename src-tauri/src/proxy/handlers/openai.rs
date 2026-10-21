@@ -20,7 +20,6 @@ const CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX: &str = "msg_thought_";
 use super::common::{
     apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
 };
-use crate::modules::account;
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Adapter Registry
 use crate::proxy::session_manager::SessionManager;
 use axum::http::HeaderMap;
@@ -3553,11 +3552,6 @@ pub async fn handle_images_generations_internal(
         "data": images
     });
 
-    // [FIX] 图像生成成功后触发配额刷新 (Issue #1995)
-    tokio::spawn(async move {
-        let _ = account::refresh_all_quotas_logic().await;
-    });
-
     let email_header = used_email.unwrap_or_default();
     Ok((email_header, openai_response, used_peak))
 }
@@ -4003,10 +3997,6 @@ pub async fn handle_images_edits(
     let openai_response = json!({
         "created": chrono::Utc::now().timestamp(),
         "data": images
-    });
-
-    tokio::spawn(async move {
-        let _ = account::refresh_all_quotas_logic().await;
     });
 
     let email_header = used_email.unwrap_or_default();

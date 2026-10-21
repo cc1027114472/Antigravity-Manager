@@ -1505,10 +1505,104 @@ pub fn set_current_account_id_with_target(
     save_account_index(&index)
 }
 
+/// 提取错误报文中的人机验证链接 (validation_url) 或申诉链接 (appeal_url)
+pub fn extract_action_url(reason: &str) -> Option<String> {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(reason) {
+        let metadata_url = parsed
+            .get("error")
+            .and_then(|e| e.get("details"))
+            .and_then(|d| d.as_array())
+            .and_then(|arr| arr.iter().find_map(|item| item.get("metadata")))
+            .and_then(|m| m.get("validation_url").or_else(|| m.get("appeal_url")))
+            .and_then(|u| u.as_str())
+            .map(|s| s.replace("\\u0026", "&"));
+
+        if metadata_url.is_some() {
+            return metadata_url;
+        }
+
+        let link_url = parsed
+            .get("error")
+            .and_then(|e| e.get("details"))
+            .and_then(|d| d.as_array())
+            .and_then(|arr| arr.iter().find_map(|item| item.get("links")))
+            .and_then(|links| links.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("url"))
+            .and_then(|u| u.as_str())
+            .map(|s| s.replace("\\u0026", "&"));
+
+        if link_url.is_some() {
+            return link_url;
+        }
+    }
+
+    let url_regex = regex::Regex::new(r#"https://[^\s"'\\]+"#).ok()?;
+    url_regex.find(reason).map(|m| {
+        let raw_url = m.as_str().to_string();
+        raw_url.replace("\\u0026", "&")
+    })
+}
+
+pub fn mark_account_validation_blocked(
+    account_id: &str,
+    block_until: i64,
+    reason: &str,
+) -> Result<(), String> {
+    let _lock = ACCOUNT_INDEX_LOCK
+        .lock()
+        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+
+    let mut account = load_account(account_id)?;
+    account.validation_blocked = true;
+    account.validation_blocked_until = Some(block_until);
+    account.validation_blocked_reason = Some(reason.to_string());
+    if let Some(url) = extract_action_url(reason) {
+        account.validation_url = Some(url);
+    }
+    if let Some(ref mut q) = account.quota {
+        q.is_forbidden = true;
+        q.forbidden_reason = Some(reason.to_string());
+    }
+
+    save_account(&account)?;
+
+    let mut index = load_account_index()?;
+    if let Some(_summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {
+        save_account_index(&index)?;
+    }
+
+    crate::modules::log_bridge::emit_accounts_refreshed();
+    Ok(())
+}
+
 /// Update account quota
 pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), String> {
     let mut account = load_account(account_id)?;
+    let is_quota_healthy = !quota.is_forbidden;
     account.update_quota(quota);
+
+    // [自愈机制] 当配额正常恢复时，自动解除临时验证锁定和因403导致的禁用状态
+    if is_quota_healthy {
+        if account.validation_blocked || account.validation_url.is_some() {
+            account.validation_blocked = false;
+            account.validation_blocked_until = None;
+            account.validation_blocked_reason = None;
+            account.validation_url = None;
+            tracing::info!("[Account] Validation cleared automatically for {}", account.email);
+        }
+        if account.proxy_disabled
+            && account
+                .proxy_disabled_reason
+                .as_ref()
+                .map_or(false, |r| r.contains("403") || r.contains("Forbidden") || r.contains("validation"))
+        {
+            account.proxy_disabled = false;
+            account.proxy_disabled_reason = None;
+            account.proxy_disabled_at = None;
+            tracing::info!("[Account] Proxy unblocked automatically for {} after quota success", account.email);
+        }
+    }
 
     let app_config = crate::modules::config::load_app_config().ok();
     let ledger_enabled = app_config

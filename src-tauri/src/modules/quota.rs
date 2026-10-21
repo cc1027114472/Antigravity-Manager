@@ -4,18 +4,16 @@ use rquest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-// Quota API endpoints (fallback order: Sandbox → Daily → Prod)
-const QUOTA_API_ENDPOINTS: [&str; 3] = [
-    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
+// Quota API endpoints (fallback order: Daily → Sandbox, 剔除必死报 429 的 Prod 端点)
+const QUOTA_API_ENDPOINTS: [&str; 2] = [
     "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
 ];
 
 // Quota Summary API endpoints (weekly + 5h grouped quota, fallback order 同上)
-const QUOTA_SUMMARY_ENDPOINTS: [&str; 3] = [
-    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
+const QUOTA_SUMMARY_ENDPOINTS: [&str; 2] = [
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
 ];
 
 /// Critical retry threshold: considered near recovery when quota reaches 95%
@@ -313,12 +311,33 @@ pub async fn fetch_quota_with_cache(
                                 continue;
                             }
 
+                            let text = response.text().await.unwrap_or_default();
                             crate::modules::logger::log_warn(&format!(
-                                "Account unauthorized (403 Forbidden), marking as forbidden"
+                                "Account unauthorized (403 Forbidden): {}",
+                                text
                             ));
                             let mut q = QuotaData::new();
                             q.is_forbidden = true;
+                            q.forbidden_reason = Some(text.clone());
                             q.subscription_tier = subscription_tier.clone();
+
+                            if let Some(id) = account_id {
+                                let text_lower = text.to_lowercase();
+                                let is_validation = text_lower.contains("validation_required")
+                                    || text_lower.contains("verify your account")
+                                    || text_lower.contains("validation_url")
+                                    || text_lower.contains("appeal_url");
+
+                                if is_validation {
+                                    let block_until = chrono::Utc::now().timestamp() + (10 * 60);
+                                    let _ = crate::modules::account::mark_account_validation_blocked(
+                                        id,
+                                        block_until,
+                                        &text,
+                                    );
+                                }
+                            }
+
                             return Ok((q, project_id.clone()));
                         }
 
@@ -822,8 +841,6 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
                     "[Warmup] Warmup task completed: success {}/{}",
                     success, total
                 ));
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                let _ = crate::modules::account::refresh_all_quotas_logic().await;
             });
             crate::modules::logger::log_info(&format!(
                 "[Warmup] Returning to frontend: Warmup task triggered for {} models",
@@ -911,7 +928,6 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
-        let _ = crate::modules::account::refresh_all_quotas_logic().await;
     });
 
     Ok(format!(

@@ -61,17 +61,15 @@ pub fn sanitize_error_for_log(error_text: &str) -> String {
     }
 }
 
-// Cloud Code v1internal endpoints (fallback order: Sandbox → Daily → Prod)
-// 优先使用 Sandbox/Daily 环境以避免 Prod环境的 429 错误 (Ref: Issue #1176)
-const V1_INTERNAL_BASE_URL_PROD: &str = "https://cloudcode-pa.googleapis.com/v1internal";
+// Cloud Code v1internal endpoints (fallback order: Daily → Sandbox)
+// 剔除 100% 报 429 的 Prod 生产公共端点，切断导致账号误判限流的通道
 const V1_INTERNAL_BASE_URL_DAILY: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal";
 const V1_INTERNAL_BASE_URL_SANDBOX: &str =
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal";
 
-const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 3] = [
-    V1_INTERNAL_BASE_URL_SANDBOX, // 优先级 1: Sandbox (已知有效且稳定)
-    V1_INTERNAL_BASE_URL_DAILY,   // 优先级 2: Daily (备用)
-    V1_INTERNAL_BASE_URL_PROD,    // 优先级 3: Prod (仅作为兜底)
+pub const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 2] = [
+    V1_INTERNAL_BASE_URL_DAILY,   // 优先级 1: Daily (原生主力端点，毫秒级响应，稳定支持长流式与思维链)
+    V1_INTERNAL_BASE_URL_SANDBOX, // 优先级 2: Sandbox (沙箱备用，极速响应，无缝容灾)
 ];
 
 pub struct UpstreamClient {
@@ -351,11 +349,24 @@ impl UpstreamClient {
         &self,
         method: &str,
         access_token: &str,
-        body: Value,
+        mut body: Value,
         query_string: Option<&str>,
         extra_headers: std::collections::HashMap<String, String>,
         account_id: Option<&str>, // [NEW] Account ID
     ) -> Result<UpstreamCallResult, String> {
+        // [DEFENSE] 全局终极防御拦截：清洗提示词中的计费伪 Header 与外部指纹，对齐官方原生 Antigravity 身份，防止 Google WAF 假性 429
+        if method == "streamGenerateContent" || method == "generateContent" {
+            if let Some(inner) = body.get_mut("request") {
+                crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
+                    inner,
+                );
+            } else {
+                crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
+                    &mut body,
+                );
+            }
+        }
+
         // [NEW] Get client based on account (cached in proxy pool manager)
         let (client, egress_proxy_id) = self.get_client(account_id).await;
 
@@ -457,7 +468,40 @@ impl UpstreamClient {
                     req_builder = req_builder.body(body_bytes.clone());
                 }
 
-                let response = req_builder.send().await;
+                // [WATCHDOG] 端点级自适应防假死超时：流式接口保底 120s 满足大模型思维链与长上下文冷推理 (TTFT ~35s)，
+                // 普通轻量请求保底 15s 快速探活，兼顾防上游静默挂起与避免长思考被误判假死导致 429 假阳性
+                let watchdog_secs = if method == "streamGenerateContent" {
+                    std::cmp::max(120, (body_bytes.len() as u64) / (64 * 1024) + 120)
+                } else {
+                    std::cmp::max(15, (body_bytes.len() as u64) / (256 * 1024) + 15)
+                };
+                let send_future = req_builder.send();
+                let response = if has_next {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(watchdog_secs),
+                        send_future,
+                    )
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(_) => {
+                            let err_msg = format!(
+                                "HTTP request timed out after {}s waiting for response headers at {} (method={}, body_len={})",
+                                watchdog_secs, base_url, method, body_bytes.len()
+                            );
+                            tracing::warn!(%err_msg, "Upstream candidate endpoint timed out, fast falling back to next endpoint");
+                            fallback_attempts.push(FallbackAttemptLog {
+                                endpoint_url: base_url.to_string(),
+                                status: None,
+                                error: err_msg.clone(),
+                            });
+                            last_err = Some(err_msg);
+                            continue;
+                        }
+                    }
+                } else {
+                    send_future.await
+                };
 
                 match response {
                     Ok(resp) => {
