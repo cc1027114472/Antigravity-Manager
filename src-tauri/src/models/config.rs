@@ -163,7 +163,7 @@ fn default_ledger_enabled() -> bool {
 }
 
 fn default_min_burn_pct() -> u32 {
-    1
+    0
 }
 
 fn default_tokens_per_percent() -> u32 {
@@ -257,7 +257,7 @@ impl QuotaLedgerConfig {
     pub fn new() -> Self {
         Self {
             enabled: true,
-            min_burn_pct: 1,
+            min_burn_pct: default_min_burn_pct(),
             tokens_per_percent: 20_000,
             w_in: default_w_in(),
             w_cache: default_w_cache(),
@@ -300,6 +300,114 @@ impl QuotaLedgerConfig {
             .unwrap_or(3.0)
     }
 
+    /// Compute raw ΔCU (floating point) for a request without burn/thresholding.
+    ///
+    /// Formula:
+    ///   billable_in = if cache_is_subset_of_input { max(0, in - cache) } else { in }
+    ///   weighted = billable_in * w_in + cache * w_cache + out * w_out
+    ///   ΔCU = (weighted / tokens_per_cu) * multiplier * conservative_multiplier
+    /// Returns 0.0 if there is no usage or delta_cu <= 0.
+    pub fn compute_delta_cu(
+        &self,
+        model: &str,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+        cached_tokens: Option<u32>,
+    ) -> f64 {
+        let input = input_tokens.unwrap_or(0) as f64;
+        let output = output_tokens.unwrap_or(0) as f64;
+        let cache = cached_tokens.unwrap_or(0) as f64;
+        let has_usage = input_tokens.is_some() || output_tokens.is_some() || cached_tokens.is_some();
+        let any_tokens = input > 0.0 || output > 0.0 || cache > 0.0;
+
+        if !has_usage || !any_tokens {
+            return 0.0;
+        }
+
+        let billable_in = if self.cache_is_subset_of_input {
+            (input - cache).max(0.0)
+        } else {
+            input
+        };
+
+        let tokens_per_cu = if self.tokens_per_cu > 0.0 {
+            self.tokens_per_cu
+        } else {
+            1000.0
+        };
+        let m = self.resolve_model_multiplier(model);
+        let weighted =
+            billable_in * self.w_in + cache * self.w_cache + output * self.w_out;
+        let delta_cu = (weighted / tokens_per_cu) * m;
+        if delta_cu <= 0.0 {
+            return 0.0;
+        }
+        let conservative = if self.conservative_multiplier >= 1.0 {
+            self.conservative_multiplier
+        } else {
+            1.25
+        };
+        delta_cu * conservative
+    }
+
+    /// Accumulate delta_cu into pending_cu for 5-hour window.
+    ///
+    /// sprint_capacity_cu defaults to 500.0 (1% = 5.0 CU).
+    /// Returns (integer_burn_pct, remaining_fractional_pending_cu).
+    pub fn accumulate_and_burn_5h(&self, pending_cu: f64, delta_cu: f64) -> (i32, f64) {
+        let sprint = if self.sprint_capacity_cu > 0.0 {
+            self.sprint_capacity_cu
+        } else {
+            500.0
+        };
+        let cu_per_pct = sprint / 100.0;
+        let total_cu = pending_cu + delta_cu;
+        if cu_per_pct <= 0.0 {
+            return (0, 0.0);
+        }
+        let burn_pct = (total_cu / cu_per_pct).floor() as i32;
+        let remainder = total_cu - (burn_pct as f64 * cu_per_pct);
+        (burn_pct, remainder)
+    }
+
+    /// Accumulate delta_cu into pending_cu for weekly window.
+    ///
+    /// marathon_capacity_cu defaults to 1500.0 (1% = 15.0 CU).
+    /// Returns (integer_burn_pct, remaining_fractional_pending_cu).
+    pub fn accumulate_and_burn_weekly(&self, pending_cu: f64, delta_cu: f64) -> (i32, f64) {
+        let marathon = if self.marathon_capacity_cu > 0.0 {
+            self.marathon_capacity_cu
+        } else {
+            self.sprint_capacity_cu.max(500.0) * 3.0
+        };
+        let cu_per_pct = marathon / 100.0;
+        let total_cu = pending_cu + delta_cu;
+        if cu_per_pct <= 0.0 {
+            return (0, 0.0);
+        }
+        let burn_pct = (total_cu / cu_per_pct).floor() as i32;
+        let remainder = total_cu - (burn_pct as f64 * cu_per_pct);
+        (burn_pct, remainder)
+    }
+
+    /// Dual-window accumulation and burn calculation.
+    ///
+    /// Returns (burn_5h, remaining_pending_5h, burn_weekly, remaining_pending_weekly).
+    pub fn accumulate_and_burn_dual(
+        &self,
+        pending_cu_5h: f64,
+        pending_cu_weekly: f64,
+        model: &str,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+        cached_tokens: Option<u32>,
+    ) -> (i32, f64, i32, f64) {
+        let delta_cu = self.compute_delta_cu(model, input_tokens, output_tokens, cached_tokens);
+        let (burn_5h, rem_5h) = self.accumulate_and_burn_5h(pending_cu_5h, delta_cu);
+        let (burn_weekly, rem_weekly) = self.accumulate_and_burn_weekly(pending_cu_weekly, delta_cu);
+        (burn_5h, rem_5h, burn_weekly, rem_weekly)
+    }
+
     /// Weighted CU burn → integer % of sprint capacity.
     ///
     /// ```text
@@ -315,47 +423,18 @@ impl QuotaLedgerConfig {
         output_tokens: Option<u32>,
         cached_tokens: Option<u32>,
     ) -> i32 {
-        let min_burn = self.min_burn_pct.max(1) as i32;
-        let input = input_tokens.unwrap_or(0) as f64;
-        let output = output_tokens.unwrap_or(0) as f64;
-        let cache = cached_tokens.unwrap_or(0) as f64;
-        let has_usage = input_tokens.is_some() || output_tokens.is_some() || cached_tokens.is_some();
-        let any_tokens = input > 0.0 || output > 0.0 || cache > 0.0;
-
-        if !has_usage || !any_tokens {
+        let min_burn = self.min_burn_pct as i32;
+        let delta_cu = self.compute_delta_cu(model, input_tokens, output_tokens, cached_tokens);
+        if delta_cu <= 0.0 {
             return min_burn;
         }
-
-        let billable_in = if self.cache_is_subset_of_input {
-            (input - cache).max(0.0)
-        } else {
-            input
-        };
-
-        let tokens_per_cu = if self.tokens_per_cu > 0.0 {
-            self.tokens_per_cu
-        } else {
-            1000.0
-        };
         let sprint = if self.sprint_capacity_cu > 0.0 {
             self.sprint_capacity_cu
         } else {
             500.0
         };
-        let m = self.resolve_model_multiplier(model);
-        let weighted =
-            billable_in * self.w_in + cache * self.w_cache + output * self.w_out;
-        let delta_cu = (weighted / tokens_per_cu) * m;
-        if delta_cu <= 0.0 {
-            return min_burn;
-        }
-        let conservative = if self.conservative_multiplier >= 1.0 {
-            self.conservative_multiplier
-        } else {
-            1.25
-        };
-        let from_cu = ((delta_cu * conservative) / sprint * 100.0).ceil() as i32;
-        min_burn.max(from_cu.max(1))
+        let from_cu = (delta_cu / sprint * 100.0).ceil() as i32;
+        min_burn.max(from_cu)
     }
 
     /// 双窗口保守扣减计算：同时计算 5小时 和 7天周窗口的扣除比例。
@@ -368,7 +447,7 @@ impl QuotaLedgerConfig {
         cached_tokens: Option<u32>,
     ) -> (i32, i32) {
         let burn_5h = self.compute_burn_pct(model, input_tokens, output_tokens, cached_tokens);
-        let min_burn = self.min_burn_pct.max(1) as i32;
+        let min_burn = self.min_burn_pct as i32;
         // 7天总量为 3倍 5小时总量，故扣除百分比为 burn_5h / 3.0，向上取整 (ceil) 保持只少不多
         let burn_weekly = ((burn_5h as f64 / 3.0).ceil() as i32).max(min_burn);
         (burn_5h, burn_weekly)
