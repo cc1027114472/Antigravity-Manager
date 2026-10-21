@@ -1114,6 +1114,8 @@ impl TokenManager {
                 &std_id_persist,
                 new_pct_5h,
                 new_pct_weekly,
+                0.0,
+                0.0,
                 protected,
             ) {
                 tracing::debug!("[QuotaLedger] persist burn failed: {}", e);
@@ -1140,6 +1142,8 @@ impl TokenManager {
                 &billing_group,
                 local_pct_5h,
                 local_pct_weekly,
+                0.0,
+                0.0,
                 true,
             ) {
                 tracing::warn!(

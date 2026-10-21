@@ -426,6 +426,8 @@ pub fn migrate_estimated_quotas(
                         limiting_window: est.limiting_window,
                         last_online_pct: est.last_online_pct,
                         last_calibrated_at: est.last_calibrated_at,
+                        pending_cu_5h: est.pending_cu_5h,
+                        pending_cu_weekly: est.pending_cu_weekly,
                     },
                 );
             }

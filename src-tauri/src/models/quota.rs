@@ -136,6 +136,12 @@ pub struct EstimatedModelQuota {
     /// Unix timestamp of last online calibration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_calibrated_at: Option<i64>,
+    /// Fractional CU accumulated in 5h window pending integer percentage burn
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_cu_5h: Option<f64>,
+    /// Fractional CU accumulated in 7d weekly window pending integer percentage burn
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_cu_weekly: Option<f64>,
 }
 
 impl EstimatedModelQuota {
@@ -153,6 +159,8 @@ impl EstimatedModelQuota {
             limiting_window: Some("5h".to_string()),
             last_online_pct: Some(pct),
             last_calibrated_at: Some(now),
+            pending_cu_5h: None,
+            pending_cu_weekly: None,
         }
     }
 
@@ -187,6 +195,46 @@ impl EstimatedModelQuota {
             limiting_window,
             last_online_pct: Some(eff),
             last_calibrated_at: Some(now),
+            pending_cu_5h: None,
+            pending_cu_weekly: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_estimated_model_quota_pending_cu_serde() {
+        let q = EstimatedModelQuota {
+            model: "claude".to_string(),
+            percentage: 95,
+            percentage_5h: 95,
+            percentage_weekly: 98,
+            reset_time_5h: None,
+            reset_time_weekly: None,
+            delta_5h: None,
+            delta_weekly: None,
+            limiting_window: Some("5h".to_string()),
+            last_online_pct: Some(95),
+            last_calibrated_at: Some(123456789),
+            pending_cu_5h: Some(3.75),
+            pending_cu_weekly: Some(1.25),
+        };
+
+        let json = serde_json::to_string(&q).expect("serialize");
+        assert!(json.contains("pendingCu5h"));
+        assert!(json.contains("pendingCuWeekly"));
+
+        let deserialized: EstimatedModelQuota = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.pending_cu_5h, Some(3.75));
+        assert_eq!(deserialized.pending_cu_weekly, Some(1.25));
+
+        // Test backward compatibility when pending fields are absent
+        let legacy_json = r#"{"model":"claude","percentage":95,"percentage5h":95,"percentageWeekly":98}"#;
+        let leg: EstimatedModelQuota = serde_json::from_str(legacy_json).expect("deserialize legacy");
+        assert_eq!(leg.pending_cu_5h, None);
+        assert_eq!(leg.pending_cu_weekly, None);
     }
 }

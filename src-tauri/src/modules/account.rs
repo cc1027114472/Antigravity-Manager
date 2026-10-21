@@ -412,6 +412,55 @@ mod tests {
 
         println!("Backup creation on parse failure: successfully created backup");
     }
+
+    #[test]
+    fn test_persist_pending_cu() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let dir = TestDataDir::new();
+        std::env::set_var("ABV_DATA_DIR", dir.path());
+
+        // Create a valid account
+        create_account_file(dir.path(), "test-pending-acc", "pending@example.com");
+
+        // Persist estimated burn with pending CU
+        let res = persist_estimated_quota_burn(
+            "test-pending-acc",
+            "claude",
+            95,
+            98,
+            3.75,
+            1.25,
+            false,
+        );
+        assert!(res.is_ok(), "persist_estimated_quota_burn failed: {:?}", res);
+
+        // Load account and verify
+        let account = load_account("test-pending-acc").expect("load_account");
+        let quota = account.estimated_quotas.get("claude").expect("quota entry");
+        assert_eq!(quota.percentage_5h, 95);
+        assert_eq!(quota.percentage_weekly, 98);
+        assert_eq!(quota.percentage, 95);
+        assert_eq!(quota.pending_cu_5h, Some(3.75));
+        assert_eq!(quota.pending_cu_weekly, Some(1.25));
+
+        // Persist zero pending CU, should become None
+        let res2 = persist_estimated_quota_burn(
+            "test-pending-acc",
+            "claude",
+            90,
+            96,
+            0.0,
+            0.0,
+            false,
+        );
+        assert!(res2.is_ok());
+        let account2 = load_account("test-pending-acc").expect("load_account 2");
+        let quota2 = account2.estimated_quotas.get("claude").expect("quota entry 2");
+        assert_eq!(quota2.pending_cu_5h, None);
+        assert_eq!(quota2.pending_cu_weekly, None);
+
+        std::env::remove_var("ABV_DATA_DIR");
+    }
 }
 
 /// Global account write lock to prevent corruption during concurrent operations
@@ -1687,6 +1736,8 @@ pub fn persist_estimated_quota_burn(
     std_model_id: &str,
     new_pct_5h: i32,
     new_pct_weekly: i32,
+    pending_cu_5h: f64,
+    pending_cu_weekly: f64,
     protect_model: bool,
 ) -> Result<(), String> {
     let mut account = load_account(account_id)?;
@@ -1708,9 +1759,13 @@ pub fn persist_estimated_quota_burn(
             limiting_window: Some("5h".to_string()),
             last_online_pct: None,
             last_calibrated_at: None,
+            pending_cu_5h: None,
+            pending_cu_weekly: None,
         });
     entry.percentage_5h = new_pct_5h.clamp(0, 100);
     entry.percentage_weekly = new_pct_weekly.clamp(0, 100);
+    entry.pending_cu_5h = if pending_cu_5h > 0.0 { Some(pending_cu_5h) } else { None };
+    entry.pending_cu_weekly = if pending_cu_weekly > 0.0 { Some(pending_cu_weekly) } else { None };
     entry.percentage = entry.percentage_5h.min(entry.percentage_weekly);
     if entry.percentage_weekly <= 0 || entry.percentage_weekly < entry.percentage_5h {
         entry.limiting_window = Some("weekly".to_string());
