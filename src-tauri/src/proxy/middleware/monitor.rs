@@ -645,6 +645,22 @@ pub async fn monitor_middleware(
                         // Claude/Anthropic format: content_block_start, content_block_delta, etc.
                         let msg_type = json.get("type").and_then(|t| t.as_str());
                         match msg_type {
+                            Some("message_start") => {
+                                if let Some(msg) = json.get("message") {
+                                    if let Some(usage) = msg.get("usage") {
+                                        if let Some(in_tok) = extract_input_tokens(usage) {
+                                            log.input_tokens = Some(in_tok);
+                                        }
+                                        if let Some(out_tok) = extract_output_tokens(usage) {
+                                            log.output_tokens = Some(out_tok);
+                                        }
+                                        if let Some(c_tok) = extract_cached_tokens(usage) {
+                                            cached_tokens = Some(c_tok);
+                                            log.cached_tokens = Some(c_tok);
+                                        }
+                                    }
+                                }
+                            }
                             Some("content_block_start") => {
                                 if let (Some(index), Some(block)) = (
                                     json.get("index").and_then(|i| i.as_u64()),
@@ -706,13 +722,12 @@ pub async fn monitor_middleware(
                                 }
                             }
                             Some("message_delta") => {
-                                if let Some(delta) = json.get("delta") {
-                                    if let Some(usage) = delta.get("usage") {
-                                        if let Some(output_tokens) =
-                                            usage.get("output_tokens").and_then(|v| v.as_u64())
-                                        {
-                                            log.output_tokens = Some(output_tokens as u32);
-                                        }
+                                let usage = json
+                                    .get("usage")
+                                    .or_else(|| json.get("delta").and_then(|d| d.get("usage")));
+                                if let Some(usage) = usage {
+                                    if let Some(output_tokens) = extract_output_tokens(usage) {
+                                        log.output_tokens = Some(output_tokens);
                                     }
                                 }
                             }
@@ -782,15 +797,24 @@ pub async fn monitor_middleware(
                         if let Some(usage) = json
                             .get("usage")
                             .or(json.get("usageMetadata"))
+                            .or(json.get("message").and_then(|m| m.get("usage")))
+                            .or(json.get("delta").and_then(|d| d.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                         {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
-                            cached_tokens = cached_tokens.or_else(|| extract_cached_tokens(usage));
-                            log.cached_tokens = log.cached_tokens.or(cached_tokens);
-                            reasoning_tokens =
-                                reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
+                            if let Some(tok) = extract_input_tokens(usage) {
+                                log.input_tokens = Some(tok);
+                            }
+                            if let Some(tok) = extract_output_tokens(usage) {
+                                log.output_tokens = Some(tok);
+                            }
+                            if let Some(tok) = extract_cached_tokens(usage) {
+                                cached_tokens = Some(tok);
+                                log.cached_tokens = Some(tok);
+                            }
+                            if let Some(tok) = extract_reasoning_tokens(usage) {
+                                reasoning_tokens = Some(tok);
+                            }
 
                             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                                 log.output_tokens = usage
@@ -908,7 +932,7 @@ pub async fn monitor_middleware(
             }
 
             // Fallback token extraction from tail if not already extracted
-            if log.input_tokens.is_none() && log.output_tokens.is_none() {
+            if log.input_tokens.is_none() || log.output_tokens.is_none() {
                 if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
                     for line in full_tail.lines().rev() {
                         if line.starts_with("data: ")
@@ -919,14 +943,23 @@ pub async fn monitor_middleware(
                                 if let Some(usage) = json
                                     .get("usage")
                                     .or(json.get("usageMetadata"))
+                                    .or(json.get("message").and_then(|m| m.get("usage")))
+                                    .or(json.get("delta").and_then(|d| d.get("usage")))
                                     .or(json.get("response").and_then(|r| r.get("usage")))
                                     .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                                 {
-                                    log.input_tokens = extract_input_tokens(usage);
-                                    log.output_tokens = extract_output_tokens(usage);
-                                    log.cached_tokens =
-                                        log.cached_tokens.or_else(|| extract_cached_tokens(usage));
-                                    break;
+                                    if let Some(tok) = extract_input_tokens(usage) {
+                                        log.input_tokens = log.input_tokens.or(Some(tok));
+                                    }
+                                    if let Some(tok) = extract_output_tokens(usage) {
+                                        log.output_tokens = log.output_tokens.or(Some(tok));
+                                    }
+                                    if let Some(tok) = extract_cached_tokens(usage) {
+                                        log.cached_tokens = log.cached_tokens.or(Some(tok));
+                                    }
+                                    if log.input_tokens.is_some() && log.output_tokens.is_some() {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -954,17 +987,24 @@ pub async fn monitor_middleware(
             Ok(bytes) => {
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(json) = serde_json::from_str::<Value>(&s) {
-                        // 支持 OpenAI "usage" 或 Gemini "usageMetadata"
+                        // 支持 OpenAI "usage", Gemini "usageMetadata", Claude "message.usage"
                         if let Some(usage) = json
                             .get("usage")
                             .or(json.get("usageMetadata"))
+                            .or(json.get("message").and_then(|m| m.get("usage")))
+                            .or(json.get("delta").and_then(|d| d.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                         {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
-                            log.cached_tokens =
-                                log.cached_tokens.or_else(|| extract_cached_tokens(usage));
+                            if let Some(tok) = extract_input_tokens(usage) {
+                                log.input_tokens = Some(tok);
+                            }
+                            if let Some(tok) = extract_output_tokens(usage) {
+                                log.output_tokens = Some(tok);
+                            }
+                            if let Some(tok) = extract_cached_tokens(usage) {
+                                log.cached_tokens = Some(tok);
+                            }
 
                             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                                 log.output_tokens = usage
@@ -1017,3 +1057,76 @@ pub async fn monitor_middleware(
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_extract_claude_message_start_and_delta() {
+        let start_chunk = json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_123",
+                "type": "message",
+                "role": "assistant",
+                "usage": {
+                    "input_tokens": 1500,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 500,
+                    "output_tokens": 1
+                }
+            }
+        });
+
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let mut cached_tokens = None;
+
+        let usage_start = start_chunk
+            .get("usage")
+            .or(start_chunk.get("usageMetadata"))
+            .or(start_chunk.get("message").and_then(|m| m.get("usage")))
+            .or(start_chunk.get("delta").and_then(|d| d.get("usage")));
+
+        assert!(usage_start.is_some());
+        if let Some(u) = usage_start {
+            if let Some(tok) = extract_input_tokens(u) { input_tokens = Some(tok); }
+            if let Some(tok) = extract_output_tokens(u) { output_tokens = Some(tok); }
+            if let Some(tok) = extract_cached_tokens(u) { cached_tokens = Some(tok); }
+        }
+
+        assert_eq!(input_tokens, Some(1500));
+        assert_eq!(cached_tokens, Some(500));
+
+        let delta_chunk = json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "end_turn",
+                "stop_sequence": null
+            },
+            "usage": {
+                "output_tokens": 350
+            }
+        });
+
+        let usage_delta = delta_chunk
+            .get("usage")
+            .or(delta_chunk.get("usageMetadata"))
+            .or(delta_chunk.get("message").and_then(|m| m.get("usage")))
+            .or(delta_chunk.get("delta").and_then(|d| d.get("usage")));
+
+        assert!(usage_delta.is_some());
+        if let Some(u) = usage_delta {
+            if let Some(tok) = extract_input_tokens(u) { input_tokens = Some(tok); }
+            if let Some(tok) = extract_output_tokens(u) { output_tokens = Some(tok); }
+            if let Some(tok) = extract_cached_tokens(u) { cached_tokens = Some(tok); }
+        }
+
+        assert_eq!(input_tokens, Some(1500), "input_tokens must not be wiped by message_delta");
+        assert_eq!(cached_tokens, Some(500), "cached_tokens must not be wiped by message_delta");
+        assert_eq!(output_tokens, Some(350), "output_tokens must be updated to 350");
+    }
+}
+

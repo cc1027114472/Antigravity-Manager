@@ -365,6 +365,17 @@ where
         }
 
         if !error_occurred {
+            if let Some(ref usage) = final_usage {
+                let usage_chunk = json!({
+                    "id": &stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": &model,
+                    "choices": [],
+                    "usage": serde_json::to_value(usage).unwrap_or(Value::Null)
+                });
+                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap_or_default())));
+            }
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
         }
     };
@@ -471,6 +482,17 @@ where
             }
         }
         if !error_occurred {
+            if let Some(ref usage) = final_usage {
+                let usage_chunk = json!({
+                    "id": &stream_id,
+                    "object": "text_completion",
+                    "created": created_ts,
+                    "model": &model,
+                    "choices": [],
+                    "usage": serde_json::to_value(usage).unwrap_or(Value::Null)
+                });
+                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap_or_default())));
+            }
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
         }
     };
@@ -1631,5 +1653,72 @@ mod tests {
 
         assert!(has_reasoning, "Should stream reasoning_content");
         assert!(has_content, "Should stream content");
+    }
+
+    #[tokio::test]
+    async fn test_openai_streaming_standalone_usage_chunk() {
+        use futures::StreamExt;
+
+        let chunk1_json = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "text": "Answer" }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+
+        let chunk2_json = json!({
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15
+            }
+        });
+
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from(format!("data: {}\n\n", chunk1_json))),
+            Ok(Bytes::from(format!("data: {}\n\n", chunk2_json))),
+        ];
+
+        let gemini_stream = Box::pin(futures::stream::iter(items));
+        let mut openai_stream = create_openai_sse_stream(
+            gemini_stream,
+            "gemini-2.5-pro".to_string(),
+            "test-session-usage".to_string(),
+            0,
+            None,
+        );
+
+        let mut chunks = Vec::new();
+        while let Some(result) = openai_stream.next().await {
+            if let Ok(bytes) = result {
+                let s = String::from_utf8_lossy(&bytes).to_string();
+                for line in s.lines() {
+                    if line.starts_with("data: ") && !line.contains("[DONE]") {
+                        chunks.push(line.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut found_usage_chunk = false;
+        for chunk_str in &chunks {
+            let json_str = chunk_str.trim_start_matches("data: ").trim();
+            let json: Value = serde_json::from_str(json_str).unwrap();
+
+            if let Some(usage) = json.get("usage") {
+                if usage.get("prompt_tokens").and_then(|v| v.as_u64()) == Some(10)
+                    && usage.get("completion_tokens").and_then(|v| v.as_u64()) == Some(5)
+                    && usage.get("total_tokens").and_then(|v| v.as_u64()) == Some(15)
+                {
+                    found_usage_chunk = true;
+                    let choices = json.get("choices").and_then(|c| c.as_array());
+                    assert!(choices.map_or(false, |c| c.is_empty()), "Standalone usage chunk choices should be empty");
+                }
+            }
+        }
+
+        assert!(found_usage_chunk, "Should yield standalone usage chunk before [DONE]");
     }
 }
