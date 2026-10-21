@@ -51,6 +51,7 @@ pub fn is_eligible_for_auto_recovery(reason: &str) -> bool {
     // 必须明确包含限流或配额耗尽标记
     lower.contains("429")
         || lower.contains("rate_limit")
+        || lower.contains("rate limit")
         || lower.contains("resource_exhausted")
         || lower.contains("quotaexhausted")
 }

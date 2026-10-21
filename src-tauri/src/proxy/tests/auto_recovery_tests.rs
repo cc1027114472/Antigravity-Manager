@@ -66,14 +66,18 @@ fn test_auto_recovery_task_lifecycle() {
     assert_eq!(adv3.attempt, 4);
     assert_eq!(scheduler.task_count(), 1);
 
-    // 6. Expiration after 4 attempts: 5th advance removes task and returns None
-    let adv4 = scheduler.advance_task("acc_1");
-    assert!(adv4.is_none());
-    assert_eq!(scheduler.task_count(), 0);
-    assert!(scheduler.get_task("acc_1").is_none());
+    // 6. Capped at 4 attempts: subsequent advance keeps task at attempt 4
+    let adv4 = scheduler.advance_task("acc_1").expect("should stay capped at attempt 4");
+    assert_eq!(adv4.attempt, 4);
+    assert_eq!(scheduler.task_count(), 1);
+    assert!(scheduler.get_task("acc_1").is_some());
 
     // Advance non-existent task returns None
-    assert!(scheduler.advance_task("acc_1").is_none());
+    assert!(scheduler.advance_task("non_existent").is_none());
+
+    // Clean up acc_1
+    assert!(scheduler.remove_task("acc_1").is_some());
+    assert_eq!(scheduler.task_count(), 0);
 
     // 7. Remove task test
     scheduler.enqueue_task("acc_2", "acc2@example.com", "429");
@@ -237,6 +241,8 @@ async fn test_token_manager_set_auto_recovery_scheduler() {
         validation_url: None,
         model_quotas: std::collections::HashMap::new(),
         model_quotas_weekly: std::collections::HashMap::new(),
+        pending_cu_5h: std::collections::HashMap::new(),
+        pending_cu_weekly: std::collections::HashMap::new(),
         model_limits: std::collections::HashMap::new(),
         max_concurrency: None,
     };
