@@ -633,9 +633,12 @@ mod tests {
     }
 
     #[test]
-    fn burn_tiny_nonzero_ceils_to_min() {
+    fn burn_tiny_nonzero_compute_burn_pct_ceils_to_one() {
         let cfg = QuotaLedgerConfig::default();
-        // 10 input tokens Pro → 0.01 CU → ceil(0.004)=1%
+        // Note: compute_burn_pct calculates standalone burn without an accumulator,
+        // so a tiny non-zero delta_cu still ceils to 1%.
+        // In actual usage through TokenManager, accumulate_and_burn_dual accumulates micro-CU
+        // in pending_cu until >= 1% (5 CU sprint / 15 CU weekly) threshold is reached.
         assert_eq!(
             cfg.compute_burn_pct("gemini-3.1-pro", Some(10), Some(0), None),
             1
