@@ -661,6 +661,72 @@ pub async fn monitor_middleware(
                             }
                         }
 
+                        // Gemini format: candidates[0].content.parts
+                        if let Some(candidates) = json.get("candidates").and_then(|c| c.as_array()) {
+                            for cand in candidates {
+                                if let Some(content) = cand.get("content") {
+                                    if let Some(parts) =
+                                        content.get("parts").and_then(|p| p.as_array())
+                                    {
+                                        for part in parts {
+                                            if let Some(text) =
+                                                part.get("text").and_then(|t| t.as_str())
+                                            {
+                                                if part
+                                                    .get("thought")
+                                                    .and_then(|t| t.as_bool())
+                                                    .unwrap_or(false)
+                                                {
+                                                    thinking_content.push_str(text);
+                                                } else {
+                                                    response_content.push_str(text);
+                                                }
+                                            }
+                                            let sig = part
+                                                .get("thoughtSignature")
+                                                .or_else(|| part.get("thought_signature"))
+                                                .or_else(|| part.get("signature"))
+                                                .or_else(|| {
+                                                    part.get("functionCall")
+                                                        .and_then(|fc| fc.get("thoughtSignature"))
+                                                })
+                                                .or_else(|| {
+                                                    part.get("functionCall")
+                                                        .and_then(|fc| fc.get("thought_signature"))
+                                                })
+                                                .and_then(|s| s.as_str());
+                                            if let Some(s) = sig {
+                                                thinking_signature = s.to_string();
+                                            }
+                                            if let Some(fc) = part.get("functionCall") {
+                                                if let Some(name) =
+                                                    fc.get("name").and_then(|n| n.as_str())
+                                                {
+                                                    let call_id = fc
+                                                        .get("id")
+                                                        .and_then(|i| i.as_str())
+                                                        .filter(|s| !s.is_empty())
+                                                        .map(|s| s.to_string())
+                                                        .unwrap_or_else(|| {
+                                                            format!("call_{}", uuid::Uuid::new_v4().simple())
+                                                        });
+                                                    let args = fc
+                                                        .get("args")
+                                                        .map(|a| a.to_string())
+                                                        .unwrap_or_else(|| "{}".to_string());
+                                                    tool_calls.push(serde_json::json!({
+                                                        "id": call_id,
+                                                        "type": "function",
+                                                        "function": { "name": name, "arguments": args }
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Claude/Anthropic format: content_block_start, content_block_delta, etc.
                         let msg_type = json.get("type").and_then(|t| t.as_str());
                         match msg_type {

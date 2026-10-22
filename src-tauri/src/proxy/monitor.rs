@@ -126,6 +126,11 @@ impl ProxyMonitor {
                     log.output_tokens,
                     log.cached_tokens,
                 );
+
+                // Notify frontend to silently sync latest account quotas and usage
+                if let Some(app) = &self.app_handle {
+                    let _ = app.emit("accounts://refreshed", ());
+                }
             }
         }
 
