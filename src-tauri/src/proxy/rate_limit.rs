@@ -100,6 +100,19 @@ impl HumanizedPacer {
         false
     }
 
+    /// 获取账号剩余的拟人化微休眠秒数（若不在休眠中则返回 None）
+    pub fn get_nap_remaining_seconds(&self, account_id: &str) -> Option<u64> {
+        if let Some(entry) = self.account_states.get(account_id) {
+            if let Some(nap_until) = entry.nap_until {
+                let now = std::time::Instant::now();
+                if now < nap_until {
+                    return Some((nap_until - now).as_secs());
+                }
+            }
+        }
+        None
+    }
+
     /// 检查账号距离上次请求还需要等待多少毫秒
     pub fn get_required_wait_ms(&self, account_id: &str) -> u64 {
         if let Some(entry) = self.account_states.get(account_id) {
@@ -921,5 +934,29 @@ mod tests {
         // 第 4 次 429 → 7200 秒
         let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
         assert_eq!(info.unwrap().retry_after_sec, 7200);
+    }
+
+    #[test]
+    fn test_humanized_pacer_nap_countdown() {
+        let pacer = HumanizedPacer::new();
+        assert_eq!(pacer.get_nap_remaining_seconds("non_existent"), None);
+
+        let now = std::time::Instant::now();
+        pacer.account_states.insert(
+            "test_acc".to_string(),
+            AccountPacerState {
+                last_request_time: now,
+                request_counter: 25,
+                current_interval_ms: 2000,
+                nap_until: Some(now + Duration::from_secs(120)),
+                threshold_jitter: 0,
+            },
+        );
+
+        assert!(pacer.is_in_nap("test_acc"));
+        let remaining = pacer.get_nap_remaining_seconds("test_acc");
+        assert!(remaining.is_some());
+        let secs = remaining.unwrap();
+        assert!(secs >= 118 && secs <= 120);
     }
 }
