@@ -118,8 +118,12 @@ struct AccountResponse {
     disabled: bool,
     live_limited_models: HashMap<String, crate::models::account::LiveLimitStatus>,
     quota: Option<QuotaResponse>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    estimated_quotas: HashMap<String, crate::models::EstimatedModelQuota>,
     device_bound: bool,
     last_used: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nap_remaining_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -266,8 +270,10 @@ async fn list_accounts() -> Result<impl IntoResponse, (StatusCode, Json<ErrorRes
                 disabled: acc.disabled,
                 live_limited_models: acc.live_limited_models,
                 quota,
+                estimated_quotas: acc.estimated_quotas,
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
+                nap_remaining_seconds: None,
             }
         })
         .collect();
@@ -310,8 +316,10 @@ async fn get_current_account() -> Result<impl IntoResponse, (StatusCode, Json<Er
             disabled: acc.disabled,
             live_limited_models: acc.live_limited_models,
             quota,
+            estimated_quotas: acc.estimated_quotas,
             device_bound: acc.device_profile.is_some(),
             last_used: acc.last_used,
+            nap_remaining_seconds: None,
         }
     });
 

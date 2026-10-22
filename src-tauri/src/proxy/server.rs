@@ -173,8 +173,12 @@ struct AccountResponse {
     validation_blocked_until: Option<i64>,
     validation_blocked_reason: Option<String>,
     quota: Option<QuotaResponse>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    estimated_quotas: HashMap<String, crate::models::EstimatedModelQuota>,
     device_bound: bool,
     last_used: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nap_remaining_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -275,11 +279,13 @@ fn to_account_response(
                 .as_ref()
                 .map(|groups| groups.iter().map(quota_group_to_dto).collect()),
         }),
+        estimated_quotas: account.estimated_quotas.clone(),
         device_bound: account.device_profile.is_some(),
         last_used: account.last_used,
         validation_blocked: account.validation_blocked,
         validation_blocked_until: account.validation_blocked_until,
         validation_blocked_reason: account.validation_blocked_reason.clone(),
+        nap_remaining_seconds: None,
     }
 }
 
@@ -1012,6 +1018,11 @@ async fn admin_list_accounts(
                     .map(|groups| groups.iter().map(quota_group_to_dto).collect()),
             });
 
+            let nap_remaining_seconds = state
+                .token_manager
+                .pacer
+                .get_nap_remaining_seconds(&acc.id);
+
             AccountResponse {
                 id: acc.id,
                 email: acc.email,
@@ -1029,8 +1040,10 @@ async fn admin_list_accounts(
                 validation_blocked_until: acc.validation_blocked_until,
                 validation_blocked_reason: acc.validation_blocked_reason,
                 quota,
+                estimated_quotas: acc.estimated_quotas,
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
+                nap_remaining_seconds,
             }
         })
         .collect();
@@ -1093,6 +1106,11 @@ async fn admin_get_current_account(
                     .map(|groups| groups.iter().map(quota_group_to_dto).collect()),
             });
 
+            let nap_remaining_seconds = state
+                .token_manager
+                .pacer
+                .get_nap_remaining_seconds(&acc.id);
+
             AccountResponse {
                 id: acc.id,
                 email: acc.email,
@@ -1110,8 +1128,10 @@ async fn admin_get_current_account(
                 validation_blocked_until: acc.validation_blocked_until,
                 validation_blocked_reason: acc.validation_blocked_reason,
                 quota,
+                estimated_quotas: acc.estimated_quotas,
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
+                nap_remaining_seconds,
             }
         })
     } else {

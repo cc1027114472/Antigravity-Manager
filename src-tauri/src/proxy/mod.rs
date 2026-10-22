@@ -34,6 +34,8 @@ pub mod zai_vision_mcp; // Built-in Vision MCP server state
 pub mod zai_vision_tools; // Built-in Vision MCP tools (z.ai vision API) // 调试日志
 
 pub use auto_recovery::AutoRecoveryScheduler;
+pub use config::get_enable_g1_credits;
+pub use config::update_enable_g1_credits;
 pub use config::update_global_system_prompt_config;
 pub use config::update_image_thinking_mode;
 pub use config::update_thinking_budget_config;
@@ -43,6 +45,7 @@ pub use config::ProxyPoolConfig;
 pub use config::SerialPoolConfig;
 pub use config::ZaiConfig;
 pub use config::ZaiDispatchMode;
+pub use rate_limit::{HumanizedPacer, RequestCompletionGuard};
 pub use security::ProxySecurityConfig;
 pub use server::AxumServer;
 pub use signature_cache::SignatureCache;

@@ -529,6 +529,14 @@ pub async fn handle_chat_completions(
             }
         };
 
+        // [NEW] 估算 prompt tokens 用于大上下文 TPM 动态冷却补偿
+        let estimated_prompt_tokens: u32 = openai_req.messages.iter().map(|m| {
+            match &m.content {
+                Some(crate::proxy::mappers::openai::OpenAIContent::String(s)) => (s.len() / 4) as u32,
+                _ => 50,
+            }
+        }).sum();
+
         // [NEW v4.1.29] 获取完整 Token 对象用于动态规格查询
         let proxy_token = token_manager.get_token_by_id(&account_id);
         let mapped_model = token_manager
@@ -859,7 +867,21 @@ pub async fn handle_chat_completions(
                     if let Some(p) = peak {
                         builder = builder.header("X-In-Flight-Peak", p.to_string());
                     }
-                    let body = Body::from_stream(combined_stream);
+                    let pacer_guard = token_manager.begin_request_pacing(&account_id, Some(estimated_prompt_tokens));
+                    let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
+                    let pacer_clone = pacer_arc.clone();
+                    let stream_with_pacer = async_stream::stream! {
+                        let mut inner = combined_stream;
+                        while let Some(item) = inner.next().await {
+                            yield item;
+                        }
+                        if let Ok(mut g) = pacer_clone.lock() {
+                            if let Some(mut guard) = g.take() {
+                                guard.complete();
+                            }
+                        }
+                    };
+                    let body = Body::from_stream(stream_with_pacer);
                     return Ok(builder.body(body).unwrap().into_response());
                 } else {
                     // 客户端请求非流式，但内部强制转为流式
@@ -868,6 +890,7 @@ pub async fn handle_chat_completions(
 
                     match collect_stream_to_json(combined_stream).await {
                         Ok(full_response) => {
+                            token_manager.pacer.mark_request_completed(&account_id, Some(estimated_prompt_tokens));
                             info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
                             if debug_logger::is_enabled(&debug_cfg) {
                                 let converted_response = serde_json::to_value(&full_response)

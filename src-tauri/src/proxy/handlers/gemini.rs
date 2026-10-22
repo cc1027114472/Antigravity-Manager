@@ -510,13 +510,28 @@ pub async fn handle_generate(
                     if let Some(p) = peak {
                         builder = builder.header("X-In-Flight-Peak", p.to_string());
                     }
-                    let body = axum::body::Body::from_stream(stream);
+                    let pacer_guard = token_manager.begin_request_pacing(&account_id, None);
+                    let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
+                    let pacer_clone = pacer_arc.clone();
+                    let stream_with_pacer = async_stream::stream! {
+                        let mut inner = stream;
+                        while let Some(item) = inner.next().await {
+                            yield item;
+                        }
+                        if let Ok(mut g) = pacer_clone.lock() {
+                            if let Some(mut guard) = g.take() {
+                                guard.complete();
+                            }
+                        }
+                    };
+                    let body = axum::body::Body::from_stream(stream_with_pacer);
                     return Ok(builder.body(body).unwrap().into_response());
                 } else {
                     // Collect to JSON
                     use crate::proxy::mappers::gemini::collector::collect_stream_to_json;
                     match collect_stream_to_json(Box::pin(stream), &s_id).await {
                         Ok(gemini_resp) => {
+                            token_manager.pacer.mark_request_completed(&account_id, None);
                             info!(
                                 "[{}] ✓ Stream collected and converted to JSON (Gemini)",
                                 session_id

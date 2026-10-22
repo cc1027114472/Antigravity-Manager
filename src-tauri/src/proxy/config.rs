@@ -147,6 +147,24 @@ pub fn update_image_thinking_mode(mode: Option<String>) {
 }
 
 // ============================================================================
+// 全局 G1 信用额度注入配置存储
+// 控制是否在请求中注入 enabledCreditTypes: ["GOOGLE_ONE_AI"]
+// 默认关闭 (false)，优先使用基础 5 小时免费额度，避免消耗 G1 点数并降低 403 风险
+// ============================================================================
+static GLOBAL_ENABLE_G1_CREDITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn get_enable_g1_credits() -> bool {
+    GLOBAL_ENABLE_G1_CREDITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn update_enable_g1_credits(enabled: bool) {
+    let old = GLOBAL_ENABLE_G1_CREDITS.swap(enabled, std::sync::atomic::Ordering::Relaxed);
+    if old != enabled {
+        tracing::info!("[G1-Credits] Global enable_g1_credits updated: {}", enabled);
+    }
+}
+
+// ============================================================================
 // 全局压缩等级配置存储
 // ============================================================================
 static GLOBAL_COMPRESSION_LEVEL: OnceLock<RwLock<String>> = OnceLock::new();
@@ -698,6 +716,11 @@ pub struct ProxyConfig {
     /// 串行号池（默认关闭；开启后全局单游标，用尽后推进 preferred）
     #[serde(default)]
     pub serial_pool: SerialPoolConfig,
+
+    /// 是否注入 Google One AI 信用额度字段（enabledCreditTypes: ["GOOGLE_ONE_AI"]）
+    /// 默认 false：不注入，完全使用基础 5 小时免费额度，避免消耗 G1 点数并降低 403 风险
+    #[serde(default)]
+    pub enable_g1_credits: bool,
 }
 
 /// 串行号池配置（一期：默认关，不改变现网调度）
@@ -778,6 +801,7 @@ impl Default for ProxyConfig {
             proxy_pool: ProxyPoolConfig::default(),
             image_thinking_mode: None,
             serial_pool: SerialPoolConfig::default(),
+            enable_g1_credits: false,
         }
     }
 }

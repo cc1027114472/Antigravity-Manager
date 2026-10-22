@@ -187,15 +187,15 @@ fn default_tokens_per_cu() -> f64 {
 }
 
 fn default_sprint_capacity_cu() -> f64 {
-    500.0
+    650.0
 }
 
 fn default_marathon_capacity_cu() -> f64 {
-    1500.0 // 7天总量是5小时总量的3倍 (3 * 500.0)
+    2800.0
 }
 
 fn default_conservative_multiplier() -> f64 {
-    1.25 // 本地账本保守放大系数，确保只少不多
+    1.05 // 本地账本保守放大系数，调优后抑制漂移
 }
 
 fn default_cache_is_subset_of_input() -> bool {

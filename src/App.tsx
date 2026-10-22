@@ -89,15 +89,19 @@ function App() {
     }
   }, [config?.language, i18n]);
 
-  // Listen for tray / backend account refresh events (Tauri only).
+  // Listen for tray / backend account refresh events (Tauri) or poll silently (Web).
   // Local ledger display is synced manually via Accounts "Sync Local Ledger" button.
   useEffect(() => {
-    if (!isTauri()) return;
-
     const syncSilent = () => {
       fetchCurrentAccount({ silent: true });
       fetchAccounts({ silent: true });
     };
+
+    if (!isTauri()) {
+      // In Web browser mode, poll accounts state silently every 5 seconds so proxy_disabled updates reflect immediately
+      const interval = setInterval(syncSilent, 5000);
+      return () => clearInterval(interval);
+    }
 
     const unlistenPromises: Promise<() => void>[] = [];
 

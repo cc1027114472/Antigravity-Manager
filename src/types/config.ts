@@ -26,6 +26,7 @@ export interface ProxyConfig {
     thinking_budget?: ThinkingBudgetConfig;
     global_system_prompt?: GlobalSystemPromptConfig;
     image_thinking_mode?: 'enabled' | 'disabled'; // [NEW] 图像思维模式开关
+    enable_g1_credits?: boolean; // [NEW] 是否注入 Google One AI 信用额度 (默认 false，避免扣减 G1 额度及 403 风险)
     proxy_pool?: ProxyPoolConfig;
 }
 

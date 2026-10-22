@@ -41,13 +41,24 @@ pub struct RateLimitInfo {
 /// 连续失败计数过期时间：1小时（超过此时间未失败则重置计数）
 const FAILURE_COUNT_EXPIRY_SECONDS: u64 = 3600;
 
-/// 单账号拟人化节奏状态
+/// 单账号拟人化节奏与风控状态
 #[derive(Debug, Clone)]
 pub struct AccountPacerState {
+    /// 最近一次发起请求时间
     pub last_request_time: std::time::Instant,
+    /// 最近一次流/响应完全结束的时间（EOF/[DONE]）
+    pub last_response_completed_at: Option<std::time::Instant>,
+    /// 下一次允许发起请求的最早时间点 (含 Post-Response Jitter + TPM 扩展)
+    pub next_allowed_request_at: std::time::Instant,
+    /// 过去 60 秒内的请求时间戳历史（用于滚动 60s RPM，压在 10~12 次以内）
+    pub rolling_requests: std::collections::VecDeque<std::time::Instant>,
+    /// 累计请求计数
     pub request_counter: u64,
+    /// 当前波段基础间隔 (ms)
     pub current_interval_ms: u64,
+    /// 微休眠截止时间
     pub nap_until: Option<std::time::Instant>,
+    /// 保护阈值浮动
     pub threshold_jitter: i32,
 }
 
@@ -61,6 +72,23 @@ impl HumanizedPacer {
         Self {
             account_states: DashMap::new(),
         }
+    }
+
+    /// 计算从响应结束（EOF/[DONE]）后的基础冷却时间（1.5s ~ 3.5s 泊松/随机抖动）以及大 Prompt TPM 补偿
+    pub fn compute_cooldown_ms(prompt_tokens: Option<u32>) -> u64 {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        // 基础冷却：1500ms ~ 3500ms (1500ms + 0~2000ms 随机抖动)
+        let base_delay: u64 = rng.gen_range(1500..=3500);
+
+        // TPM 动态保护补偿：如果单次请求携带超大 Prompt（>25K Tokens），额外追加冷却，防止击穿 TPM 闸门
+        let tpm_penalty: u64 = if prompt_tokens.unwrap_or(0) > 25_000 {
+            rng.gen_range(1500..=3000)
+        } else {
+            0
+        };
+
+        base_delay + tpm_penalty
     }
 
     /// 获取账号当前需要的拟人化波段间隔（毫秒，1000ms ~ 5000ms），带有正弦潮汐波与正态随机抖动
@@ -113,24 +141,61 @@ impl HumanizedPacer {
         None
     }
 
-    /// 检查账号距离上次请求还需要等待多少毫秒
+    /// 检查账号距离下一次允许发起请求还需要等待多少毫秒
+    /// 结合了三层速率约束：
+    /// 1. 响应结束后的 Post-Response Delay + Jitter 冷却
+    /// 2. 滚动 60 秒 RPM 漏桶（单账号上限 10 次 / 60 秒）
     pub fn get_required_wait_ms(&self, account_id: &str) -> u64 {
-        if let Some(entry) = self.account_states.get(account_id) {
-            let elapsed = entry.last_request_time.elapsed().as_millis() as u64;
-            if elapsed < entry.current_interval_ms {
-                return entry.current_interval_ms - elapsed;
+        let now = std::time::Instant::now();
+        if let Some(mut entry) = self.account_states.get_mut(account_id) {
+            // 1. Post-Response 冷却检查
+            let cooldown_wait = if entry.next_allowed_request_at > now {
+                (entry.next_allowed_request_at - now).as_millis() as u64
+            } else {
+                0
+            };
+
+            // 2. 滚动 60 秒 RPM 漏桶检查（限制滚动 60s 内最多 10 次请求）
+            let cutoff = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
+            while let Some(&front) = entry.rolling_requests.front() {
+                if front < cutoff {
+                    entry.rolling_requests.pop_front();
+                } else {
+                    break;
+                }
             }
+
+            // 单账号 60 秒上限设为 10 次
+            let rpm_wait = if entry.rolling_requests.len() >= 10 {
+                if let Some(&oldest) = entry.rolling_requests.front() {
+                    let elapsed = now.duration_since(oldest).as_millis() as u64;
+                    if elapsed < 60_000 {
+                        60_000 - elapsed
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            return cooldown_wait.max(rpm_wait);
         }
         0
     }
 
-    /// 记录账号发起了一次请求，推进其计数并生成下一次的波段浮动间隔
+    /// 记录账号发起了一次请求，推进其计数并将其记入 60s 滚动窗口
     pub fn mark_request_started(&self, account_id: &str) {
         use rand::Rng;
         let now = std::time::Instant::now();
         let mut entry = self.account_states.entry(account_id.to_string()).or_insert_with(|| {
             AccountPacerState {
                 last_request_time: now,
+                last_response_completed_at: None,
+                next_allowed_request_at: now,
+                rolling_requests: std::collections::VecDeque::new(),
                 request_counter: 0,
                 current_interval_ms: 2000,
                 nap_until: None,
@@ -140,7 +205,7 @@ impl HumanizedPacer {
 
         entry.last_request_time = now;
         entry.request_counter += 1;
-        entry.current_interval_ms = Self::compute_wave_interval_ms(entry.request_counter, account_id);
+        entry.rolling_requests.push_back(now);
 
         // 连续处理 20~35 次请求后，随机进入一段 2~5 分钟的微休眠，让流量流转到其它账号
         let nap_trigger_count = 20 + ((account_id.len() * 3) % 15) as u64;
@@ -153,6 +218,73 @@ impl HumanizedPacer {
                 nap_secs
             );
         }
+    }
+
+    /// 当响应完全结束（Stream EOF / JSON 聚合完毕）时调用，记录结束时间并计算下一次随机冷却时长
+    pub fn mark_request_completed(&self, account_id: &str, prompt_tokens: Option<u32>) {
+        let now = std::time::Instant::now();
+        let cooldown_ms = Self::compute_cooldown_ms(prompt_tokens);
+        let next_allowed = now + Duration::from_millis(cooldown_ms);
+
+        let mut entry = self.account_states.entry(account_id.to_string()).or_insert_with(|| {
+            AccountPacerState {
+                last_request_time: now,
+                last_response_completed_at: Some(now),
+                next_allowed_request_at: next_allowed,
+                rolling_requests: std::collections::VecDeque::new(),
+                request_counter: 1,
+                current_interval_ms: cooldown_ms,
+                nap_until: None,
+                threshold_jitter: Self::get_threshold_jitter(account_id),
+            }
+        });
+
+        entry.last_response_completed_at = Some(now);
+        entry.next_allowed_request_at = next_allowed;
+        entry.current_interval_ms = cooldown_ms;
+
+        tracing::debug!(
+            "[HumanizedPacer] Account {} response completed, cooldown set to {}ms (next allowed at +{}ms)",
+            account_id,
+            cooldown_ms,
+            cooldown_ms
+        );
+    }
+}
+
+/// 请求生命周期看门狗：无论是正常完成还是客户端异常断连（Drop），均在结束瞬间触发 mark_request_completed
+pub struct RequestCompletionGuard {
+    pacer: std::sync::Arc<HumanizedPacer>,
+    account_id: String,
+    prompt_tokens: Option<u32>,
+    completed: bool,
+}
+
+impl RequestCompletionGuard {
+    pub fn new(
+        pacer: std::sync::Arc<HumanizedPacer>,
+        account_id: String,
+        prompt_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            pacer,
+            account_id,
+            prompt_tokens,
+            completed: false,
+        }
+    }
+
+    pub fn complete(&mut self) {
+        if !self.completed {
+            self.pacer.mark_request_completed(&self.account_id, self.prompt_tokens);
+            self.completed = true;
+        }
+    }
+}
+
+impl Drop for RequestCompletionGuard {
+    fn drop(&mut self) {
+        self.complete();
     }
 }
 
@@ -946,6 +1078,9 @@ mod tests {
             "test_acc".to_string(),
             AccountPacerState {
                 last_request_time: now,
+                last_response_completed_at: None,
+                next_allowed_request_at: now,
+                rolling_requests: std::collections::VecDeque::new(),
                 request_counter: 25,
                 current_interval_ms: 2000,
                 nap_until: Some(now + Duration::from_secs(120)),
@@ -958,5 +1093,33 @@ mod tests {
         assert!(remaining.is_some());
         let secs = remaining.unwrap();
         assert!(secs >= 118 && secs <= 120);
+    }
+
+    #[test]
+    fn test_humanized_pacer_cooldown_and_rolling_rpm() {
+        let pacer = HumanizedPacer::new();
+        let acc = "test_pacer_acc";
+
+        // 1. 完成请求后，应该有至少 1500ms 的冷却延迟
+        pacer.mark_request_completed(acc, None);
+        let wait = pacer.get_required_wait_ms(acc);
+        assert!(wait >= 1400 && wait <= 3600);
+
+        // 2. 超大 Prompt 应追加额外的 TPM 保护惩罚
+        pacer.mark_request_completed(acc, Some(35_000));
+        let wait_large = pacer.get_required_wait_ms(acc);
+        assert!(wait_large >= 2900 && wait_large <= 6600);
+
+        // 3. 模拟 10 次请求打满 60s 滚动 RPM
+        let now = std::time::Instant::now();
+        if let Some(mut entry) = pacer.account_states.get_mut(acc) {
+            entry.next_allowed_request_at = now; // 清空冷却以便测试 RPM
+            entry.rolling_requests.clear();
+            for _ in 0..10 {
+                entry.rolling_requests.push_back(now);
+            }
+        }
+        let rpm_wait = pacer.get_required_wait_ms(acc);
+        assert!(rpm_wait > 58_000 && rpm_wait <= 60_000);
     }
 }

@@ -1445,8 +1445,22 @@ pub async fn handle_messages(
                             if let Some(p) = peak {
                                 builder = builder.header("X-In-Flight-Peak", p.to_string());
                             }
+                            let pacer_guard = token_manager.begin_request_pacing(&account_id, Some(raw_estimated as u32));
+                            let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
+                            let pacer_clone = pacer_arc.clone();
+                            let stream_with_pacer = async_stream::stream! {
+                                let mut inner = combined_stream;
+                                while let Some(item) = inner.next().await {
+                                    yield item;
+                                }
+                                if let Ok(mut g) = pacer_clone.lock() {
+                                    if let Some(mut guard) = g.take() {
+                                        guard.complete();
+                                    }
+                                }
+                            };
                             return builder
-                                .body(Body::from_stream(combined_stream))
+                                .body(Body::from_stream(stream_with_pacer))
                                 .unwrap();
                         } else {
                             // 客户端要非 Stream，需要收集完整响应并转换为 JSON
@@ -1454,6 +1468,7 @@ pub async fn handle_messages(
 
                             match collect_stream_to_json(Box::pin(combined_stream)).await {
                                 Ok(full_response) => {
+                                    token_manager.pacer.mark_request_completed(&account_id, Some(raw_estimated as u32));
                                     info!(
                                         "[{}] ✓ Stream collected and converted to JSON",
                                         trace_id

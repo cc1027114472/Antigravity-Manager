@@ -157,6 +157,19 @@ impl TokenManager {
         self.account_inflight.begin(account_id)
     }
 
+    /// 创建单账号请求生命周期看门狗，在流/非流完全结束或断连时自动记录冷却时间点
+    pub fn begin_request_pacing(
+        &self,
+        account_id: &str,
+        prompt_tokens: Option<u32>,
+    ) -> crate::proxy::rate_limit::RequestCompletionGuard {
+        crate::proxy::rate_limit::RequestCompletionGuard::new(
+            self.pacer.clone(),
+            account_id.to_string(),
+            prompt_tokens,
+        )
+    }
+
     /// Replace an existing in-flight guard when rotating accounts (unlimited).
     pub fn replace_inflight(
         &self,
@@ -2095,8 +2108,9 @@ impl TokenManager {
                             && preferred_token.protected_models.contains(&billing_target);
                         let is_concurrency_full =
                             self.is_concurrency_full(&preferred_token.account_id);
+                        let is_napping = self.pacer.is_in_nap(&preferred_token.account_id);
 
-                        if !is_rate_limited && !is_quota_protected && !is_concurrency_full {
+                        if !is_rate_limited && !is_quota_protected && !is_concurrency_full && !is_napping {
                             tracing::info!(
                                 "🔒 [FIX #820] Using preferred account: {} (fixed mode)",
                                 preferred_token.email
@@ -2210,13 +2224,20 @@ impl TokenManager {
                             let wait_ms = self.pacer.get_required_wait_ms(&token.account_id);
                             if wait_ms > 0 {
                                 tracing::info!(
-                                    "[HumanizedPacer] Pacing request on {}: waiting {}ms (1~5s wave interval)",
+                                    "[HumanizedPacer] Pacing request on {}: waiting {}ms (post-response jitter cooldown or rolling 60s rpm quota)",
                                     token.email,
                                     wait_ms
                                 );
                                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                             }
                             self.pacer.mark_request_started(&token.account_id);
+                            if self.pacer.is_in_nap(&token.account_id) {
+                                self.session_accounts.retain(|_, bound_id| bound_id != &token.account_id);
+                                tracing::info!(
+                                    "[HumanizedPacer] Preferred account {} entered micro-nap: actively unbound all sticky sessions",
+                                    token.email
+                                );
+                            }
 
                             return Ok((
                                 token.access_token,
@@ -2273,47 +2294,61 @@ impl TokenManager {
 
                 // 1. 检查会话是否已绑定账号
                 if let Some(bound_id) = self.session_accounts.get(sid).map(|v| v.clone()) {
-                    // 【修复】先通过 account_id 找到对应的账号，获取其 email
-                    // 2. 转换 email -> account_id 检查绑定的账号是否限流
                     if let Some(bound_token) =
                         tokens_snapshot.iter().find(|t| t.account_id == bound_id)
                     {
-                        let key = self
-                            .email_to_account_id(&bound_token.email)
-                            .unwrap_or_else(|| bound_token.account_id.clone());
-                        // [FIX] Pass None for specific model wait time if not applicable
-                        let reset_sec = self.rate_limit_tracker.get_remaining_wait(&key, None);
-                        if reset_sec > 0 {
-                            // 【修复 Issue #284】立即解绑并切换账号，不再阻塞等待
-                            // 原因：阻塞等待会导致并发请求时客户端 socket 超时 (UND_ERR_SOCKET)
-                            tracing::debug!(
-                                "Sticky Session: Bound account {} is rate-limited ({}s), unbinding and switching.",
-                                bound_token.email, reset_sec
+                        let acc_id = &bound_token.account_id;
+                        // [FIX] 检查是否受限：传入具体模型，同时检查全局锁与模型级锁
+                        let reset_sec = self
+                            .rate_limit_tracker
+                            .get_remaining_wait(acc_id, Some(&normalized_target));
+                        let is_limited = reset_sec > 0
+                            || self.is_rate_limited(acc_id, Some(&normalized_target)).await;
+
+                        if is_limited {
+                            tracing::info!(
+                                "Sticky Session: Bound account {} is rate-limited ({}s) for model {}, unbinding and switching.",
+                                bound_token.email,
+                                reset_sec,
+                                normalized_target
                             );
                             self.session_accounts.remove(sid);
-                        } else if self.is_concurrency_full(&bound_id) {
+                        } else if self.pacer.is_in_nap(acc_id) {
+                            tracing::info!(
+                                "Sticky Session: Bound account {} is in micro-nap, unbinding and switching.",
+                                bound_token.email
+                            );
+                            self.session_accounts.remove(sid);
+                        } else if self.is_concurrency_full(acc_id) {
                             tracing::debug!(
                                 "Sticky Session: Bound account {} at concurrency cap, unbinding and switching.",
                                 bound_token.email
                             );
                             self.session_accounts.remove(sid);
-                        } else if !attempted.contains(&bound_id)
-                            && !(quota_protection_enabled
-                                && bound_token.protected_models.contains(&normalized_target))
-                        {
-                            // 3. 账号可用且未被标记为尝试失败，优先复用
-                            tracing::debug!("Sticky Session: Successfully reusing bound account {} for session {}", bound_token.email, sid);
-                            target_token = Some(bound_token.clone());
                         } else if quota_protection_enabled
                             && bound_token.protected_models.contains(&normalized_target)
                         {
-                            tracing::debug!("Sticky Session: Bound account {} is quota-protected for model {} [{}], unbinding and switching.", bound_token.email, normalized_target, target_model);
+                            tracing::debug!(
+                                "Sticky Session: Bound account {} is quota-protected for model {} [{}], unbinding and switching.",
+                                bound_token.email,
+                                normalized_target,
+                                target_model
+                            );
                             self.session_accounts.remove(sid);
+                        } else if !attempted.contains(acc_id) {
+                            // 账号可用且未被标记为尝试失败，优先复用
+                            tracing::debug!(
+                                "Sticky Session: Successfully reusing bound account {} for session {}",
+                                bound_token.email,
+                                sid
+                            );
+                            target_token = Some(bound_token.clone());
                         }
                     } else {
-                        // 绑定的账号已不存在（可能被删除），解绑
-                        tracing::debug!(
-                            "Sticky Session: Bound account not found for session {}, unbinding",
+                        // 绑定的账号已不在可用快照中（已被禁用或删除），解绑
+                        tracing::info!(
+                            "Sticky Session: Bound account {} not in available pool for session {}, unbinding",
+                            bound_id,
                             sid
                         );
                         self.session_accounts.remove(sid);
@@ -2335,10 +2370,11 @@ impl TokenManager {
                         if let Some(found) =
                             tokens_snapshot.iter().find(|t| &t.account_id == account_id)
                         {
-                            // 【修复】检查限流状态和配额保护，避免复用已被锁定的账号
-                            if !self
-                                .is_rate_limited(&found.account_id, Some(&normalized_target))
-                                .await
+                            // 【修复】检查限流状态、小憩状态和配额保护，避免复用已被锁定的账号
+                            if !self.pacer.is_in_nap(&found.account_id)
+                                && !self
+                                    .is_rate_limited(&found.account_id, Some(&normalized_target))
+                                    .await
                                 && !(quota_protection_enabled
                                     && found.protected_models.contains(&normalized_target))
                                 && !self.is_concurrency_full(&found.account_id)
@@ -2435,6 +2471,19 @@ impl TokenManager {
 
                     if rotate {
                         tracing::debug!("Force Rotation: Switched to account: {}", selected.email);
+                    }
+
+                    // [FIX] 发生切号或重新选号后，若当前属于粘性会话模式，自动把会话重新绑定到新的健康账号
+                    if let Some(sid) = session_id {
+                        if scheduling.mode != SchedulingMode::PerformanceFirst {
+                            self.session_accounts
+                                .insert(sid.to_string(), selected.account_id.clone());
+                            tracing::info!(
+                                "Sticky Session: Re-bound new healthy account {} to session {}",
+                                selected.email,
+                                sid
+                            );
+                        }
                     }
                 }
             }
@@ -2752,13 +2801,20 @@ impl TokenManager {
             let wait_ms = self.pacer.get_required_wait_ms(&token.account_id);
             if wait_ms > 0 {
                 tracing::info!(
-                    "[HumanizedPacer] Pacing request on {}: waiting {}ms (1~5s wave interval)",
+                    "[HumanizedPacer] Pacing request on {}: waiting {}ms (post-response jitter cooldown or rolling 60s rpm quota)",
                     token.email,
                     wait_ms
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
             }
             self.pacer.mark_request_started(&token.account_id);
+            if self.pacer.is_in_nap(&token.account_id) {
+                self.session_accounts.retain(|_, bound_id| bound_id != &token.account_id);
+                tracing::info!(
+                    "[HumanizedPacer] Account {} entered micro-nap: actively unbound all sticky sessions",
+                    token.email
+                );
+            }
 
             return Ok((
                 token.access_token,
@@ -3054,13 +3110,29 @@ impl TokenManager {
         self.rate_limit_tracker.cleanup_expired();
     }
 
-    /// 【替代方案】通过 email 查找对应的 account_id
-    /// 用于将 handlers 传入的 email 转换为 tracker 使用的 account_id
-    fn email_to_account_id(&self, email: &str) -> Option<String> {
-        self.tokens
-            .iter()
-            .find(|entry| entry.value().email == email)
-            .map(|entry| entry.value().account_id.clone())
+    /// 【替代方案】通过 email 或 account_id 查找对应的 account_id
+    /// 用于将 handlers 传入的标识稳健转换为磁盘持久化与 tracker 使用的 account_id
+    fn email_to_account_id(&self, email_or_id: &str) -> Option<String> {
+        // 1. 如果 self.tokens 中本身就存在以该 id 命名的 entry，直接返回
+        if self.tokens.contains_key(email_or_id) {
+            return Some(email_or_id.to_string());
+        }
+        // 2. 尝试从 self.tokens 中按 email（忽略大小写）匹配或按 account_id 匹配
+        if let Some(entry) = self.tokens.iter().find(|entry| {
+            entry.value().email.eq_ignore_ascii_case(email_or_id)
+                || entry.value().account_id == email_or_id
+        }) {
+            return Some(entry.value().account_id.clone());
+        }
+        // 3. 兜底方案：从磁盘账户索引 load_account_index 中查找
+        if let Ok(index) = crate::modules::account::load_account_index() {
+            if let Some(acc) = index.accounts.into_iter().find(|a| {
+                a.id == email_or_id || a.email.eq_ignore_ascii_case(email_or_id)
+            }) {
+                return Some(acc.id);
+            }
+        }
+        None
     }
 
     /// 清除指定账号的限流记录
@@ -3462,6 +3534,19 @@ impl TokenManager {
         }
 
         self.tokens.remove(account_id);
+        // [FIX] 立即清除所有绑定了该 account_id 的粘性会话映射，防止后续相同会话继续死锁在已被禁用的账号上
+        self.session_accounts.retain(|sid, bound_id| {
+            if bound_id == account_id {
+                tracing::info!(
+                    "[StickySession] Unbound session {} from 429-disabled account {}",
+                    sid,
+                    account_id
+                );
+                false
+            } else {
+                true
+            }
+        });
         tracing::warn!(
             "🚫 Account {} proxy-disabled after 429 {:?} and removed from pool",
             account_id,

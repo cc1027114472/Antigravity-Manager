@@ -811,10 +811,10 @@ pub fn wrap_request_v2(
         }
     }
 
-    // [NEW] 3. 条件注入 enabledCreditTypes
-    // 这是官方 Worker 极高权重的一个指纹字段。
-    // 只有在非图像生成请求（即 agent 类型请求）时注入，避免图像生成场景出现 Credit 判定异常。
-    // 特别注意：这是 Google 识别“官方客户端”的重要凭证之一。
+    // [CONFIGURABLE] 条件注入 enabledCreditTypes
+    // 默认关闭 (false)。只有在用户主动开启 G1 信用额度支持且非图像生成请求时注入。
+    // 默认关闭可确保仅消耗 5 小时基础免费配额，杜绝 G1 钱包扣减，并避免账号因未配置 Overages 导致 403 / 429。
+    let enable_g1_credits = crate::proxy::config::get_enable_g1_credits();
     let is_agent_request = config.request_type != "image_gen";
 
     // [CACHE] 重建 inner_request 字段顺序——稳定前缀在前，动态内容在后
@@ -868,9 +868,9 @@ pub fn wrap_request_v2(
         "requestId": official_request_id,
     });
 
-    if is_agent_request {
+    if is_agent_request && enable_g1_credits {
         if let Some(obj) = final_request_obj.as_object_mut() {
-            // 强制注入 Google One AI 信用额度支持标号
+            // 注入 Google One AI 信用额度支持标号
             obj.insert("enabledCreditTypes".to_string(), json!(["GOOGLE_ONE_AI"]));
         }
     }
@@ -1775,5 +1775,45 @@ mod tests {
 
         let text_5 = contents[4]["parts"][0]["text"].as_str().unwrap();
         assert!(text_5.contains("Please"));
+    }
+
+    #[test]
+    fn test_enabled_credit_types_configurable() {
+        // 保证起始状态为默认的关闭 (false)
+        crate::proxy::config::update_enable_g1_credits(false);
+
+        let body = json!({
+            "model": "gemini-3.8-flash-high",
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": "Hello"}]
+            }]
+        });
+
+        // 1. 默认关闭状态：不注入 enabledCreditTypes
+        let wrapped_off = wrap_request(&body, "test-proj", "gemini-3.8-flash-high", None, None, None);
+        assert_eq!(
+            wrapped_off.get("enabledCreditTypes"),
+            None,
+            "Default should NOT inject enabledCreditTypes"
+        );
+
+        // 2. 开启状态：注入 ["GOOGLE_ONE_AI"]
+        crate::proxy::config::update_enable_g1_credits(true);
+        let wrapped_on = wrap_request(&body, "test-proj", "gemini-3.8-flash-high", None, None, None);
+        assert_eq!(
+            wrapped_on.get("enabledCreditTypes"),
+            Some(&json!(["GOOGLE_ONE_AI"])),
+            "When enabled, should inject enabledCreditTypes: [GOOGLE_ONE_AI]"
+        );
+
+        // 3. 复原为默认关闭
+        crate::proxy::config::update_enable_g1_credits(false);
+        let wrapped_restored = wrap_request(&body, "test-proj", "gemini-3.8-flash-high", None, None, None);
+        assert_eq!(
+            wrapped_restored.get("enabledCreditTypes"),
+            None,
+            "Restored should NOT inject enabledCreditTypes"
+        );
     }
 }

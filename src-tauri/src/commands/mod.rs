@@ -451,6 +451,8 @@ pub async fn save_config(
         crate::proxy::update_global_system_prompt_config(config.proxy.global_system_prompt.clone());
         // [NEW] 更新全局图像思维模式配置
         crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
+        // [NEW] 更新 G1 信用额度注入开关
+        crate::proxy::update_enable_g1_credits(config.proxy.enable_g1_credits);
         // [NEW] 更新全局压缩等级配置
         crate::proxy::config::update_global_compression_level(
             config.proxy.experimental.compression_level.clone(),

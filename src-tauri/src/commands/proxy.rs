@@ -306,6 +306,8 @@ pub async fn ensure_admin_server(
     crate::proxy::update_global_system_prompt_config(config.global_system_prompt.clone());
     // [NEW] 初始化全局图像思维模式配置
     crate::proxy::update_image_thinking_mode(config.image_thinking_mode.clone());
+    // [NEW] 初始化 G1 信用额度注入开关 (默认关闭)
+    crate::proxy::update_enable_g1_credits(config.enable_g1_credits);
     // [NEW] 初始化全局压缩等级配置
     crate::proxy::config::update_global_compression_level(
         config.experimental.compression_level.clone(),
