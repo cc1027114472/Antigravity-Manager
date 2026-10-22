@@ -155,6 +155,8 @@
     "disabled_tooltip": "Account is disabled (e.g. refresh_token revoked/expired). Reauthorize or update token to re-enable.",
     "proxy_disabled": "Proxy Disabled",
     "proxy_disabled_tooltip": "This account has proxy disabled manually, it will not handle API requests but remains usable in the app.",
+    "humanized_napping": "Napping {{mins}}m",
+    "humanized_napping_tooltip": "Humanized micro-nap for anti-risk pacing, approx {{mins}}m remaining. Traffic prefers other rested accounts; will wake up automatically if all accounts are busy.",
     "enable_proxy": "Enable Proxy",
     "disable_proxy": "Disable Proxy",
     "enable_proxy_selected": "Enable ({{count}})",

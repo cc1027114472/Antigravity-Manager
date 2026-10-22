@@ -25,6 +25,8 @@ export interface Account {
     validation_url?: string;
     /** Runtime-only: current auto-recovery attempt (1–4). Absent when not in queue. */
     auto_recovery_attempt?: number;
+    /** Runtime-only: remaining seconds of humanized micro-nap. Absent when not in nap. */
+    nap_remaining_seconds?: number;
     created_at: number;
     last_used: number;
 }

@@ -152,6 +152,8 @@
     "disabled_tooltip": "账号已被禁用（例如 refresh_token 被撤销/过期）。重新授权或更新 Token 后可恢复。",
     "proxy_disabled": "反代已禁用",
     "proxy_disabled_tooltip": "此账号已被手动禁用反代功能,不参与 API 请求,但仍可在应用中使用",
+    "humanized_napping": "小憩中 {{mins}}m",
+    "humanized_napping_tooltip": "拟人化防风控微小憩中，剩余约 {{mins}} 分钟。期间流量优先走其他账号；若无其他可用账号，系统会自动唤醒响应。",
     "enable_proxy": "启用反代",
     "disable_proxy": "禁用反代",
     "enable_proxy_selected": "启用 ({{count}})",

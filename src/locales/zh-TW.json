@@ -135,6 +135,8 @@
     "disabled_tooltip": "帳號已被停用（例如 refresh_token 被撤銷/過期）。重新授權或更新 Token 後可恢復。",
     "proxy_disabled": "反向代理已停用",
     "proxy_disabled_tooltip": "此帳號已被手動停用反向代理功能,不參與 API 請求,但仍可在應用程式中使用",
+    "humanized_napping": "小憩中 {{mins}}m",
+    "humanized_napping_tooltip": "擬人化防風控微小憩中，剩餘約 {{mins}} 分鐘。期間流量優先走其他帳號；若無其他可用帳號，系統會自動喚醒響應。",
     "enable_proxy": "啟用反向代理",
     "disable_proxy": "停用反向代理",
     "enable_proxy_selected": "啟用 ({{count}})",
