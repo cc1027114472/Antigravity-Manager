@@ -74,7 +74,8 @@ impl ProxyMonitor {
                 Err(e) => tracing::error!("Startup cleanup task panicked: {}", e),
             }
 
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+            // High-frequency capacity patrol: check DB size and prune oldest success logs every 2 minutes
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2 * 60));
             loop {
                 ticker.tick().await;
                 let result = tokio::task::spawn_blocking(move || {
@@ -84,7 +85,7 @@ impl ProxyMonitor {
                 match result {
                     Ok(Ok(deleted)) => {
                         if deleted > 0 {
-                            tracing::info!("Periodic 30m tiered cleanup: purged {} stale log rows", deleted);
+                            tracing::info!("Periodic 2m tiered cleanup: purged {} stale log rows", deleted);
                         }
                     }
                     Ok(Err(e)) => tracing::error!("Periodic tiered cleanup failed: {}", e),

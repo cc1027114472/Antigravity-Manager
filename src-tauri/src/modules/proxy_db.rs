@@ -89,43 +89,13 @@ pub fn init_db() -> Result<(), String> {
     Ok(())
 }
 
-/// Max body length to persist for successful (200..400) requests to prevent DB ballooning.
-/// Error requests (4xx/5xx) are NEVER truncated.
-const MAX_SUCCESS_REQ_BODY_BYTES: usize = 4096;
-const MAX_SUCCESS_RESP_BODY_BYTES: usize = 8192;
-
-fn truncate_body(s: Option<String>, max_len: usize) -> Option<String> {
-    s.map(|text| {
-        if text.len() > max_len {
-            let mut truncated = text;
-            let mut end = max_len;
-            while end > 0 && !truncated.is_char_boundary(end) {
-                end -= 1;
-            }
-            truncated.truncate(end);
-            truncated.push_str("... [truncated for storage optimization]");
-            truncated
-        } else {
-            text
-        }
-    })
-}
-
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let conn = connect_db()?;
 
-    // Tiered storage optimization:
-    // Error responses (status < 200 or status >= 400) keep 100% full original bodies.
-    // Successful responses are capped to lightweight summaries to prevent multi-GB ballooning.
-    let is_error = log.status < 200 || log.status >= 400;
-    let (req_body, resp_body) = if is_error {
-        (log.request_body.clone(), log.response_body.clone())
-    } else {
-        (
-            truncate_body(log.request_body.clone(), MAX_SUCCESS_REQ_BODY_BYTES),
-            truncate_body(log.response_body.clone(), MAX_SUCCESS_RESP_BODY_BYTES),
-        )
-    };
+    // Do NOT truncate request/response bodies: preserve 100% full payloads for audit.
+    // Capacity management is enforced dynamically by frequent sliding-window cleanup (pruning oldest success logs).
+    let req_body = log.request_body.clone();
+    let resp_body = log.response_body.clone();
 
     conn.execute(
         "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak)
@@ -277,11 +247,13 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
 
 /// Tiered log retention constants
 const SUCCESS_MAX_AGE_HOURS: i64 = 12;
-const SUCCESS_MAX_ROWS: usize = 5_000;
+const SUCCESS_MAX_ROWS: usize = 3_000;
 
 const ERROR_MAX_AGE_DAYS: i64 = 30;
 const ERROR_MAX_ROWS: usize = 50_000;
 
+/// Soft target size for proxy_logs.db: if exceeded, prune oldest success logs progressively
+const DB_TARGET_SIZE_BYTES: u64 = 500 * 1024 * 1024; // 500 MB soft limit
 const DB_FUSE_SIZE_BYTES: u64 = 1536 * 1024 * 1024; // 1.5 GB hard circuit-breaker
 
 /// Get total physical size on disk of proxy_logs.db (+ wal/shm)
@@ -400,17 +372,19 @@ pub fn cleanup_tiered_logs() -> Result<usize, String> {
     // 4. Keep newest ERROR_MAX_ROWS error logs (index-cutoff, batched)
     total_deleted += delete_beyond_keep(&conn, ERROR_CLAUSE, ERROR_MAX_ROWS, BATCH);
 
-    // 5. Circuit-breaker: If DB size exceeds 1.5GB, apply emergency pressure relief
+    // 5. Capacity adaptive management:
+    // If DB size exceeds target threshold (500MB), progressively trim oldest success logs.
+    // If DB size exceeds hard fuse (1.5GB), apply emergency pressure relief.
     if let Ok(size) = get_proxy_db_disk_size() {
         if size > DB_FUSE_SIZE_BYTES {
             tracing::warn!(
                 "Proxy DB size ({} MB) exceeded 1.5GB circuit-breaker. Triggering emergency prune!",
                 size / 1024 / 1024
             );
-            // Emergency: only keep 2 hours of success logs, 1,000 success rows
+            // Emergency: only keep 2 hours of success logs, 500 success rows
             let emergency_success_cutoff = now_ms - (2 * 3600 * 1000);
             total_deleted += delete_batched(&conn, SUCCESS_CLAUSE, emergency_success_cutoff, BATCH);
-            total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, 1_000, BATCH);
+            total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, 500, BATCH);
             // Emergency error limit: keep newest 10,000
             total_deleted += delete_beyond_keep(&conn, ERROR_CLAUSE, 10_000, BATCH);
             // Force vacuum on emergency (only if enough free disk for the copy)
@@ -418,12 +392,22 @@ pub fn cleanup_tiered_logs() -> Result<usize, String> {
             if free_bytes > 2u64 * 1024 * 1024 * 1024 {
                 let _ = conn.execute("VACUUM", []);
             }
-        } else if total_deleted > 100_000 {
-            // Only VACUUM when a lot of rows were deleted AND the DB is big;
-            // otherwise let SQLite reuse freed pages (VACUUM takes an exclusive
-            // lock and rewrites the whole file — dangerous on a busy node).
+        } else if size > DB_TARGET_SIZE_BYTES {
+            tracing::info!(
+                "Proxy DB size ({} MB) exceeded soft target ({} MB). Pruning oldest success logs to preserve disk space...",
+                size / 1024 / 1024,
+                DB_TARGET_SIZE_BYTES / 1024 / 1024
+            );
+            // Prune down to 1,000 most recent success logs
+            total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, 1_000, BATCH);
+            let free_bytes = free_disk_bytes();
+            if free_bytes > 2u64 * 1024 * 1024 * 1024 {
+                let _ = conn.execute("VACUUM", []);
+            }
+        } else if total_deleted > 10_000 {
+            // Reclaim space when a large batch of rows was pruned
             let size_mb = size / 1024 / 1024;
-            if size_mb > 300 {
+            if size_mb > 200 {
                 let free_bytes = free_disk_bytes();
                 if free_bytes > 2u64 * 1024 * 1024 * 1024 {
                     let _ = conn.execute("VACUUM", []);
