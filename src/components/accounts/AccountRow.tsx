@@ -1,4 +1,4 @@
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint } from 'lucide-react';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Moon } from 'lucide-react';
 import { Account } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
@@ -97,6 +97,16 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             <span className="px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-red-200/50" title={t('accounts.forbidden_tooltip')}>
                                 <Lock className="w-2.5 h-2.5" />
                                 <span>{t('accounts.forbidden')}</span>
+                            </span>
+                        )}
+
+                        {account.nap_remaining_seconds != null && account.nap_remaining_seconds > 0 && !isDisabled && !account.proxy_disabled && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-indigo-200/50"
+                                title={t('accounts.humanized_napping_tooltip', { mins: Math.ceil(account.nap_remaining_seconds / 60) })}
+                            >
+                                <Moon className="w-2.5 h-2.5" />
+                                <span>{t('accounts.humanized_napping', { mins: Math.ceil(account.nap_remaining_seconds / 60) })}</span>
                             </span>
                         )}
 

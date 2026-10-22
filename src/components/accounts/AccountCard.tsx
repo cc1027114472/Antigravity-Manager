@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Repeat2, Terminal } from 'lucide-react';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Repeat2, Terminal, Moon } from 'lucide-react';
 import { Account } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
@@ -172,6 +172,15 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                 <span className="px-1.5 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-amber-200/50">
                                     <Clock className="w-2.5 h-2.5" />
                                     {validationBlockedLabel.toUpperCase()}
+                                </span>
+                            )}
+                            {account.nap_remaining_seconds != null && account.nap_remaining_seconds > 0 && !isDisabled && !account.proxy_disabled && (
+                                <span
+                                    className="px-1.5 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 text-[9px] font-bold flex items-center gap-1 shadow-sm border border-indigo-200/50"
+                                    title={t('accounts.humanized_napping_tooltip', { mins: Math.ceil(account.nap_remaining_seconds / 60) })}
+                                >
+                                    <Moon className="w-2.5 h-2.5" />
+                                    {t('accounts.humanized_napping', { mins: Math.ceil(account.nap_remaining_seconds / 60) })}
                                 </span>
                             )}
                             {/* 订阅类型徽章 */}
