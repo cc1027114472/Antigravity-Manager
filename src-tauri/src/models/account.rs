@@ -90,6 +90,9 @@ pub struct Account {
     /// None = not in recovery queue; Some(n) = currently on attempt n (1–4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_recovery_attempt: Option<u8>,
+    /// [UI] Runtime-only: remaining seconds of humanized micro-nap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nap_remaining_seconds: Option<u64>,
 }
 
 impl Account {
@@ -123,6 +126,7 @@ impl Account {
             custom_label: None,
             max_concurrency: None,
             auto_recovery_attempt: None,
+            nap_remaining_seconds: None,
         }
     }
 

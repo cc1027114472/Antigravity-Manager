@@ -60,6 +60,11 @@ pub async fn list_accounts(
                     }
                 }
             }
+
+            // [UI] Inject humanized micro-nap countdown if currently napping
+            if let Some(nap_secs) = instance.token_manager.pacer.get_nap_remaining_seconds(&account.id) {
+                account.nap_remaining_seconds = Some(nap_secs);
+            }
         }
     }
 
