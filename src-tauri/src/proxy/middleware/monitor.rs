@@ -342,6 +342,19 @@ fn extract_output_tokens(usage: &Value) -> Option<u32> {
     }
 }
 
+/// Check if the request is a metadata probe/model list query (purely local, 0 tokens, no upstream call)
+/// that should be bypassed from traffic logging to avoid log pollution.
+pub(crate) fn is_metadata_probe(method: &str, uri: &str) -> bool {
+    if method != "GET" {
+        return false;
+    }
+    let path = uri.split('?').next().unwrap_or(uri);
+    path == "/v1beta/models"
+        || path.starts_with("/v1beta/models/")
+        || path == "/v1/models"
+        || path.starts_with("/v1/models/")
+}
+
 pub async fn monitor_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -353,6 +366,12 @@ pub async fn monitor_middleware(
     let uri = request.uri().to_string();
 
     if uri.contains("event_logging") || uri.contains("/api/") || uri.starts_with("/internal/") {
+        return next.run(request).await;
+    }
+
+    // Bypass local metadata / model list queries (GET /v1beta/models, GET /v1/models, etc.)
+    // These never call upstream, consume 0 tokens/quota, and create unnecessary log noise.
+    if is_metadata_probe(&method, &uri) {
         return next.run(request).await;
     }
 
@@ -1127,6 +1146,27 @@ mod tests {
         assert_eq!(input_tokens, Some(1500), "input_tokens must not be wiped by message_delta");
         assert_eq!(cached_tokens, Some(500), "cached_tokens must not be wiped by message_delta");
         assert_eq!(output_tokens, Some(350), "output_tokens must be updated to 350");
+    }
+
+    #[test]
+    fn test_is_metadata_probe() {
+        // GET model queries should be bypassed (no logging, no upstream token cost)
+        assert!(is_metadata_probe("GET", "/v1beta/models"));
+        assert!(is_metadata_probe("GET", "/v1beta/models?key=test_api_key"));
+        assert!(is_metadata_probe("GET", "/v1beta/models/gemini-2.0-flash"));
+        assert!(is_metadata_probe("GET", "/v1/models"));
+        assert!(is_metadata_probe("GET", "/v1/models?limit=100"));
+        assert!(is_metadata_probe("GET", "/v1/models/claude"));
+
+        // POST inference requests must NEVER be bypassed
+        assert!(!is_metadata_probe("POST", "/v1beta/models/gemini-2.0-flash:generateContent"));
+        assert!(!is_metadata_probe("POST", "/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse"));
+        assert!(!is_metadata_probe("POST", "/v1/chat/completions"));
+        assert!(!is_metadata_probe("POST", "/v1/messages"));
+        assert!(!is_metadata_probe("POST", "/v1/models/detect"));
+
+        // Other non-model GET routes should not be bypassed
+        assert!(!is_metadata_probe("GET", "/v1/other"));
     }
 }
 
