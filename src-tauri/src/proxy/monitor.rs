@@ -29,6 +29,9 @@ pub struct ProxyRequestLog {
     /// Peak overlapping in-flight requests for the account during this request (errors).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_flight_peak: Option<u32>,
+    /// Response source: "remote" (upstream) or "local" (intercepted/local logic)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -227,6 +230,7 @@ impl ProxyMonitor {
                 protocol: log.protocol.clone(),
                 username: log.username.clone(),
                 in_flight_peak: log.in_flight_peak,
+                response_source: log.response_source.clone(),
             };
             let _ = app.emit("proxy://request", &log_summary);
         }
@@ -275,13 +279,14 @@ impl ProxyMonitor {
         page_size: usize,
         search_text: Option<String>,
         level: Option<String>,
+        source: Option<String>,
     ) -> Result<Vec<ProxyRequestLog>, String> {
         let offset = (page.max(1) - 1) * page_size;
         let errors_only = level.as_deref() == Some("error");
         let search = search_text.unwrap_or_default();
 
         let res = tokio::task::spawn_blocking(move || {
-            crate::modules::proxy_db::get_logs_filtered(&search, errors_only, page_size, offset)
+            crate::modules::proxy_db::get_logs_filtered(&search, errors_only, source.as_deref(), page_size, offset)
         })
         .await;
 

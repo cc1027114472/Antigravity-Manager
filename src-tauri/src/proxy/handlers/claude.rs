@@ -1125,11 +1125,12 @@ pub async fn handle_messages(
             }
             Err(e) => {
                 let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
-                let headers = crate::proxy::account_inflight::account_headers(
+                let headers = crate::proxy::account_inflight::account_headers_with_source(
                     &email,
                     Some(&account_id),
                     Some(request_with_mapped.model.as_str()),
                     peak,
+                    crate::proxy::account_inflight::SOURCE_LOCAL,
                 );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1441,6 +1442,10 @@ pub async fn handle_messages(
                                 .header(
                                     "X-Context-Purified",
                                     if is_purified { "true" } else { "false" },
+                                )
+                                .header(
+                                    crate::proxy::account_inflight::HEADER_RESPONSE_SOURCE,
+                                    crate::proxy::account_inflight::SOURCE_REMOTE,
                                 );
                             if let Some(p) = peak {
                                 builder = builder.header("X-In-Flight-Peak", p.to_string());
@@ -1449,7 +1454,7 @@ pub async fn handle_messages(
                             let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
                             let pacer_clone = pacer_arc.clone();
                             let stream_with_pacer = async_stream::stream! {
-                                let mut inner = combined_stream;
+                                let mut inner = Box::pin(combined_stream);
                                 while let Some(item) = inner.next().await {
                                     yield item;
                                 }
@@ -1485,6 +1490,10 @@ pub async fn handle_messages(
                                         .header(
                                             "X-Context-Purified",
                                             if is_purified { "true" } else { "false" },
+                                        )
+                                        .header(
+                                            crate::proxy::account_inflight::HEADER_RESPONSE_SOURCE,
+                                            crate::proxy::account_inflight::SOURCE_REMOTE,
                                         );
                                     if let Some(p) = peak {
                                         builder = builder.header("X-In-Flight-Peak", p.to_string());

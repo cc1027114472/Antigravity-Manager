@@ -268,6 +268,7 @@ pub async fn handle_warmup(
                 protocol: Some("warmup".to_string()),
                 username: None,
                 in_flight_peak: None,
+                response_source: Some("remote".to_string()),
             };
             state.monitor.log_request(log).await;
 
@@ -368,6 +369,7 @@ pub async fn handle_warmup(
                 protocol: Some("warmup".to_string()),
                 username: None,
                 in_flight_peak: None,
+                response_source: Some("local".to_string()),
             };
             state.monitor.log_request(log).await;
 

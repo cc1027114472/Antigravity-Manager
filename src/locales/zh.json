@@ -1200,7 +1200,11 @@
       "images": "绘图",
       "reset": "重置",
       "by_account": "按账号筛选",
-      "all_accounts": "全部账号"
+      "all_accounts": "全部账号",
+      "by_source": "按来源筛选",
+      "all_sources": "全部来源",
+      "source_remote": "远端上游",
+      "source_local": "本地拦截"
     },
     "table": {
       "status": "状态",
@@ -1213,7 +1217,8 @@
       "duration": "耗时",
       "time": "时间",
       "in_flight_peak": "并发峰值",
-      "empty": "暂无请求记录"
+      "empty": "暂无请求记录",
+      "source": "来源"
     },
     "details": {
       "title": "请求详情",
@@ -1228,11 +1233,20 @@
       "account_used": "使用账号",
       "in_flight_peak": "出错时并发峰值",
       "id": "请求 ID",
-      "payload_empty": "无数据"
+      "payload_empty": "无数据",
+      "source": "响应来源",
+      "source_remote_desc": "已实际发送至服务商上游接口并获得响应",
+      "source_local_desc": "未打到上游，由本地代理策略或保护机制直接返回"
     },
     "dialog": {
       "clear_title": "清除监控日志",
       "clear_msg": "确定要清除所有监控记录吗？此操作无法撤销。"
+    },
+    "source": {
+      "remote": "远端",
+      "local": "本地",
+      "remote_full": "远端上游",
+      "local_full": "本地拦截"
     }
   },
   "update_notification": {

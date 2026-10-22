@@ -1470,6 +1470,8 @@ struct LogsRequest {
     filter: String,
     #[serde(default)]
     errors_only: bool,
+    #[serde(default, alias = "source_filter")]
+    source: Option<String>,
 }
 
 #[allow(dead_code)] // 预留日志接口
@@ -1478,14 +1480,14 @@ async fn admin_get_logs(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let limit = if params.limit == 0 { 50 } else { params.limit };
     let total =
-        proxy_db::get_logs_count_filtered(&params.filter, params.errors_only).map_err(|e| {
+        proxy_db::get_logs_count_filtered(&params.filter, params.errors_only, params.source.as_deref()).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { error: e }),
             )
         })?;
     let logs =
-        proxy_db::get_logs_filtered(&params.filter, params.errors_only, limit, params.offset)
+        proxy_db::get_logs_filtered(&params.filter, params.errors_only, params.source.as_deref(), limit, params.offset)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2069,7 +2071,7 @@ async fn admin_get_proxy_logs_count_filtered(
     Query(params): Query<LogsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let res = tokio::task::spawn_blocking(move || {
-        proxy_db::get_logs_count_filtered(&params.filter, params.errors_only)
+        proxy_db::get_logs_count_filtered(&params.filter, params.errors_only, params.source.as_deref())
     })
     .await;
 
@@ -2129,6 +2131,8 @@ struct LogsFilterQuery {
     #[serde(default)]
     errors_only: bool,
     #[serde(default)]
+    source_filter: Option<String>,
+    #[serde(default)]
     limit: usize,
     #[serde(default)]
     offset: usize,
@@ -2141,6 +2145,7 @@ async fn admin_get_proxy_logs_filtered(
         crate::modules::proxy_db::get_logs_filtered(
             &params.filter,
             params.errors_only,
+            params.source_filter.as_deref(),
             params.limit,
             params.offset,
         )

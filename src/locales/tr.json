@@ -939,7 +939,11 @@
       "images": "Görseller",
       "reset": "Sıfırla",
       "by_account": "Hesaba göre filtrele",
-      "all_accounts": "Tüm Hesaplar"
+      "all_accounts": "Tüm Hesaplar",
+      "by_source": "Kaynağa göre filtrele",
+      "all_sources": "Tüm Kaynaklar",
+      "source_remote": "Uzak Yukarı Akış",
+      "source_local": "Yerel Müdahale"
     },
     "table": {
       "status": "Durum",
@@ -951,7 +955,8 @@
       "usage": "Token'lar",
       "duration": "Süre",
       "time": "Zaman",
-      "empty": "Kayıtlı istek yok"
+      "empty": "Kayıtlı istek yok",
+      "source": "Kaynak"
     },
     "details": {
       "title": "İstek Detayları",
@@ -967,11 +972,20 @@
       "protocol": "Protokol",
       "mapped_model": "Eşlenen Model",
       "account_used": "Kullanılan Hesap",
-      "payload_empty": "Yük Yok"
+      "payload_empty": "Yük Yok",
+      "source": "Yanıt Kaynağı",
+      "source_remote_desc": "Sağlayıcının yukarı akış API'sine iletildi ve yanıt alındı",
+      "source_local_desc": "Yukarı akışa ulaşmadı; yerel proxy politikası veya koruma mekanizması tarafından doğrudan döndürüldü"
     },
     "dialog": {
       "clear_title": "Proxy Loglarını Temizle",
       "clear_msg": "Tüm proxy loglarını temizlemek istediğinizden emin misiniz? Bu işlem geri alınamaz."
+    },
+    "source": {
+      "remote": "Uzak",
+      "local": "Yerel",
+      "remote_full": "Uzak Yukarı Akış",
+      "local_full": "Yerel Müdahale"
     }
   },
   "update_notification": {

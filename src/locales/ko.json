@@ -1149,7 +1149,11 @@
       "images": "이미지",
       "reset": "초기화",
       "by_account": "계정별 필터",
-      "all_accounts": "모든 계정"
+      "all_accounts": "모든 계정",
+      "by_source": "소스별 필터링",
+      "all_sources": "모든 소스",
+      "source_remote": "원격 업스트림",
+      "source_local": "로컬 차단"
     },
     "table": {
       "status": "상태",
@@ -1161,7 +1165,8 @@
       "usage": "토큰",
       "duration": "소요 시간",
       "time": "시간",
-      "empty": "기록된 요청 없음"
+      "empty": "기록된 요청 없음",
+      "source": "소스"
     },
     "details": {
       "title": "요청 상세",
@@ -1175,7 +1180,10 @@
       "protocol": "프로토콜",
       "account_used": "사용된 계정",
       "id": "요청 ID",
-      "payload_empty": "데이터 없음"
+      "payload_empty": "데이터 없음",
+      "source": "응답 소스",
+      "source_remote_desc": "제공업체 업스트림 API로 전달되어 응답을 수신함",
+      "source_local_desc": "업스트림에 도달하지 않고 로컬 프록시 정책 또는 보호 메커니즘에서 직접 반환됨"
     },
     "dialog": {
       "clear_title": "프록시 로그 지우기",
@@ -1208,6 +1216,12 @@
         "start_time": "시작 시간",
         "duration": "소요 시간"
       }
+    },
+    "source": {
+      "remote": "원격",
+      "local": "로컬",
+      "remote_full": "원격 업스트림",
+      "local_full": "로컬 차단"
     }
   },
   "update_notification": {

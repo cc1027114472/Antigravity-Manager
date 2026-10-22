@@ -1207,7 +1207,11 @@
       "images": "Images",
       "reset": "Reset",
       "by_account": "Filter by account",
-      "all_accounts": "All Accounts"
+      "all_accounts": "All Accounts",
+      "by_source": "Filter by source",
+      "all_sources": "All Sources",
+      "source_remote": "Remote Upstream",
+      "source_local": "Local Intercept"
     },
     "table": {
       "status": "Status",
@@ -1220,7 +1224,8 @@
       "duration": "Duration",
       "time": "Time",
       "in_flight_peak": "In-flight Peak",
-      "empty": "No requests recorded"
+      "empty": "No requests recorded",
+      "source": "Source"
     },
     "details": {
       "title": "Request Details",
@@ -1235,7 +1240,10 @@
       "account_used": "Account Used",
       "in_flight_peak": "In-flight Peak at Error",
       "id": "Request ID",
-      "payload_empty": "No data"
+      "payload_empty": "No data",
+      "source": "Response Source",
+      "source_remote_desc": "Forwarded to upstream provider API and received a response",
+      "source_local_desc": "Did not reach upstream; intercepted locally by proxy policy or protection"
     },
     "dialog": {
       "clear_title": "Clear Proxy Logs",
@@ -1268,6 +1276,12 @@
         "start_time": "Start Time",
         "duration": "Duration"
       }
+    },
+    "source": {
+      "remote": "Remote",
+      "local": "Local",
+      "remote_full": "Remote Upstream",
+      "local_full": "Local Intercept"
     }
   },
   "update_notification": {

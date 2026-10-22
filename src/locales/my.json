@@ -963,7 +963,11 @@
       "images": "Imej",
       "reset": "Reset",
       "by_account": "Tapis mengikut akaun",
-      "all_accounts": "Semua Akaun"
+      "all_accounts": "Semua Akaun",
+      "by_source": "အရင်းအမြစ်အရ စစ်ထုတ်ရန်",
+      "all_sources": "အရင်းအမြစ်အားလုံး",
+      "source_remote": "အဝေးအထက်ပိုင်း",
+      "source_local": "ဒေသတွင်း ကြားဖြတ်မှု"
     },
     "table": {
       "status": "Status",
@@ -975,7 +979,8 @@
       "usage": "Token",
       "duration": "Tempoh",
       "time": "Masa",
-      "empty": "Tiada permintaan direkod"
+      "empty": "Tiada permintaan direkod",
+      "source": "အရင်းအမြစ်"
     },
     "details": {
       "title": "Butiran Permintaan",
@@ -989,11 +994,20 @@
       "protocol": "Protokol",
       "account_used": "Akaun Digunakan",
       "id": "ID Permintaan",
-      "payload_empty": "Tiada data"
+      "payload_empty": "Tiada data",
+      "source": "တုံ့ပြန်မှု အရင်းအမြစ်",
+      "source_remote_desc": "ပံ့ပိုးပေးသူထံ တိုက်ရိုက်ပေးပို့ပြီး တုံ့ပြန်မှုရရှိခဲ့သည်",
+      "source_local_desc": "အထက်ပိုင်းသို့ မရောက်ရှိဘဲ ဒေသတွင်း ပရောက်စီစည်းမျဉ်းဖြင့် တိုက်ရိုက်တုံ့ပြန်ခဲ့သည်"
     },
     "dialog": {
       "clear_title": "Kosongkan Log Proksi",
       "clear_msg": "Adakah anda pasti mahu mengosongkan semua log proksi? Tindakan ini tidak boleh dibatalkan."
+    },
+    "source": {
+      "remote": "အဝေး",
+      "local": "ဒေသတွင်း",
+      "remote_full": "အဝေးအထက်ပိုင်း",
+      "local_full": "ဒေသတွင်း ကြားဖြတ်မှု"
     }
   },
   "update_notification": {

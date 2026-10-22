@@ -219,6 +219,8 @@ struct LogsRequest {
     filter: String,
     #[serde(default)]
     errors_only: bool,
+    #[serde(default, alias = "source_filter", alias = "sourceFilter")]
+    source: Option<String>,
 }
 
 // ============================================================================
@@ -452,7 +454,7 @@ async fn get_logs(
     let limit = if params.limit == 0 { 50 } else { params.limit };
 
     let total =
-        proxy_db::get_logs_count_filtered(&params.filter, params.errors_only).map_err(|e| {
+        proxy_db::get_logs_count_filtered(&params.filter, params.errors_only, params.source.as_deref()).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { error: e }),
@@ -460,7 +462,7 @@ async fn get_logs(
         })?;
 
     let logs =
-        proxy_db::get_logs_filtered(&params.filter, params.errors_only, limit, params.offset)
+        proxy_db::get_logs_filtered(&params.filter, params.errors_only, params.source.as_deref(), limit, params.offset)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,

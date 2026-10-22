@@ -485,8 +485,9 @@ pub async fn export_proxy_logs_json(file_path: String, json_data: String) -> Res
 pub async fn get_proxy_logs_count_filtered(
     filter: String,
     errors_only: bool,
+    source_filter: Option<String>,
 ) -> Result<u64, String> {
-    crate::modules::proxy_db::get_logs_count_filtered(&filter, errors_only)
+    crate::modules::proxy_db::get_logs_count_filtered(&filter, errors_only, source_filter.as_deref())
 }
 
 /// 获取带搜索条件的分页日志
@@ -494,10 +495,11 @@ pub async fn get_proxy_logs_count_filtered(
 pub async fn get_proxy_logs_filtered(
     filter: String,
     errors_only: bool,
+    source_filter: Option<String>,
     limit: usize,
     offset: usize,
 ) -> Result<Vec<crate::proxy::monitor::ProxyRequestLog>, String> {
-    crate::modules::proxy_db::get_logs_filtered(&filter, errors_only, limit, offset)
+    crate::modules::proxy_db::get_logs_filtered(&filter, errors_only, source_filter.as_deref(), limit, offset)
 }
 
 /// 生成 API Key

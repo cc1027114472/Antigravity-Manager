@@ -506,7 +506,8 @@ pub async fn handle_generate(
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
                         .header("X-Account-Id", &account_id)
-                        .header("X-Mapped-Model", &mapped_model);
+                        .header("X-Mapped-Model", &mapped_model)
+                        .header(crate::proxy::account_inflight::HEADER_RESPONSE_SOURCE, crate::proxy::account_inflight::SOURCE_REMOTE);
                     if let Some(p) = peak {
                         builder = builder.header("X-In-Flight-Peak", p.to_string());
                     }
@@ -514,7 +515,7 @@ pub async fn handle_generate(
                     let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
                     let pacer_clone = pacer_arc.clone();
                     let stream_with_pacer = async_stream::stream! {
-                        let mut inner = stream;
+                        let mut inner = Box::pin(stream);
                         while let Some(item) = inner.next().await {
                             yield item;
                         }
@@ -799,7 +800,13 @@ pub async fn handle_generate(
     if let Some(email) = last_email {
         let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
         let headers =
-            crate::proxy::account_inflight::account_headers(&email, None, None, peak);
+            crate::proxy::account_inflight::account_headers_with_source(
+                &email,
+                None,
+                None,
+                peak,
+                crate::proxy::account_inflight::SOURCE_LOCAL,
+            );
         Ok((
             StatusCode::TOO_MANY_REQUESTS,
             headers,

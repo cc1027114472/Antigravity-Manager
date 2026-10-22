@@ -504,6 +504,20 @@ pub async fn monitor_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // Extract response source (remote upstream vs local interceptor)
+    let response_source = response
+        .headers()
+        .get(crate::proxy::account_inflight::HEADER_RESPONSE_SOURCE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            if status < 400 && account_email.is_some() {
+                Some("remote".to_string())
+            } else {
+                Some("local".to_string())
+            }
+        });
+
     // Determine protocol from URL path
     let protocol = if uri.contains("/v1/messages") {
         Some("anthropic".to_string())
@@ -545,6 +559,7 @@ pub async fn monitor_middleware(
         protocol,
         username,
         in_flight_peak,
+        response_source,
     };
 
     if content_type.contains("text/event-stream") {

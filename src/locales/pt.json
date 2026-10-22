@@ -963,7 +963,11 @@
       "images": "Imagens",
       "reset": "Redefinir",
       "by_account": "Filtrar por conta",
-      "all_accounts": "Todas as Contas"
+      "all_accounts": "Todas as Contas",
+      "by_source": "Filtrar por origem",
+      "all_sources": "Todas as origens",
+      "source_remote": "Remoto upstream",
+      "source_local": "Interceptação local"
     },
     "table": {
       "status": "Status",
@@ -975,7 +979,8 @@
       "usage": "Tokens",
       "duration": "Duração",
       "time": "Tempo",
-      "empty": "Nenhuma solicitação registrada"
+      "empty": "Nenhuma solicitação registrada",
+      "source": "Origem"
     },
     "details": {
       "title": "Detalhes da Solicitação",
@@ -989,11 +994,20 @@
       "protocol": "Protocolo",
       "mapped_model": "Modelo Mapeado",
       "account_used": "Conta Utilizada",
-      "payload_empty": "Sem Carga"
+      "payload_empty": "Sem Carga",
+      "source": "Origem da resposta",
+      "source_remote_desc": "Enviado com sucesso à API upstream do provedor com resposta obtida",
+      "source_local_desc": "Não atingiu o upstream; interceptado localmente pela política do proxy"
     },
     "dialog": {
       "clear_title": "Limpar Logs do Proxy",
       "clear_msg": "Tem certeza de que deseja limpar todos os logs do proxy? Esta ação não pode ser desfeita."
+    },
+    "source": {
+      "remote": "Remoto",
+      "local": "Local",
+      "remote_full": "Remoto upstream",
+      "local_full": "Interceptação local"
     }
   },
   "update_notification": {

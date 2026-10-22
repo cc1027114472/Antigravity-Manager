@@ -30,6 +30,7 @@ interface ProxyRequestLog {
     account_email?: string;
     protocol?: string;  // "openai" | "anthropic" | "gemini"
     in_flight_peak?: number;
+    response_source?: 'remote' | 'local' | string;
 }
 
 interface ProxyStats {
@@ -64,12 +65,13 @@ const LogTable: React.FC<LogTableProps> = ({
                 <thead className="bg-gray-50 dark:bg-base-200 text-gray-500 sticky top-0 z-10">
                     <tr>
                         <th style={{ width: '60px' }}>{t('monitor.table.status')}</th>
+                        <th style={{ width: '70px' }}>{t('monitor.table.source')}</th>
                         <th style={{ width: '60px' }}>{t('monitor.table.method')}</th>
-                        <th style={{ width: '220px' }}>{t('monitor.table.model')}</th>
+                        <th style={{ width: '210px' }}>{t('monitor.table.model')}</th>
                         <th style={{ width: '70px' }}>{t('monitor.table.protocol')}</th>
-                        <th style={{ width: '140px' }}>{t('monitor.table.account')}</th>
+                        <th style={{ width: '130px' }}>{t('monitor.table.account')}</th>
                         <th style={{ width: '70px' }}>{t('monitor.table.in_flight_peak')}</th>
-                        <th style={{ width: '180px' }}>{t('monitor.table.path')}</th>
+                        <th style={{ width: '170px' }}>{t('monitor.table.path')}</th>
                         <th className="text-right" style={{ width: '90px' }}>{t('monitor.table.usage')}</th>
                         <th className="text-right" style={{ width: '80px' }}>{t('monitor.table.duration')}</th>
                         <th className="text-right" style={{ width: '80px' }}>{t('monitor.table.time')}</th>
@@ -86,6 +88,19 @@ const LogTable: React.FC<LogTableProps> = ({
                                 <span className={`badge badge-xs text-white border-none ${log.status >= 200 && log.status < 400 ? 'badge-success' : 'badge-error'}`}>
                                     {log.status}
                                 </span>
+                            </td>
+                            <td style={{ width: '70px' }}>
+                                {log.response_source === 'remote' ? (
+                                    <span className="badge badge-xs badge-info text-white border-none font-bold">
+                                        {t('monitor.source.remote')}
+                                    </span>
+                                ) : log.response_source === 'local' ? (
+                                    <span className="badge badge-xs badge-warning text-white border-none font-bold">
+                                        {t('monitor.source.local')}
+                                    </span>
+                                ) : (
+                                    <span className="text-gray-400 text-[10px]">—</span>
+                                )}
                             </td>
                             <td className="font-bold" style={{ width: '60px' }}>{log.method}</td>
                             <td className="text-blue-600 truncate" style={{ width: '220px', maxWidth: '220px' }}>
@@ -150,9 +165,11 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const [stats, setStats] = useState<ProxyStats>({ total_requests: 0, success_count: 0, error_count: 0 });
     const [filter, setFilter] = useState('');
     const [accountFilter, setAccountFilter] = useState('');
+    const [sourceFilter, setSourceFilter] = useState('');
     // [FIX] 使用 ref 存储最新的筛选条件，避免 setInterval 闭包问题
     const filterRef = useRef(filter);
     const accountFilterRef = useRef(accountFilter);
+    const sourceFilterRef = useRef(sourceFilter);
     const currentPageRef = useRef(1);
     const [selectedLog, setSelectedLog] = useState<ProxyRequestLog | null>(null);
     const [isLoggingEnabled, setIsLoggingEnabled] = useState(false);
@@ -182,7 +199,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         return Array.from(emailSet).sort();
     }, [logs, accounts]);
 
-    const loadData = async (page = 1, searchFilter = filter, accountEmailFilter = accountFilter) => {
+    const loadData = async (page = 1, searchFilter = filter, accountEmailFilter = accountFilter, currentSourceFilter = sourceFilter) => {
         if (loading) return;
         setLoading(true);
 
@@ -208,11 +225,14 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                 ? (baseFilter ? `${baseFilter} ${accountEmailFilter}` : accountEmailFilter)
                 : baseFilter;
 
+            const sourceParam = currentSourceFilter ? currentSourceFilter : null;
+
             // Get count with filter
             const count = await Promise.race([
                 invoke<number>('get_proxy_logs_count_filtered', {
                     filter: actualFilter,
-                    errorsOnly: errorsOnly
+                    errorsOnly: errorsOnly,
+                    sourceFilter: sourceParam,
                 }),
                 timeoutPromise
             ]) as number;
@@ -224,6 +244,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                 invoke<ProxyRequestLog[]>('get_proxy_logs_filtered', {
                     filter: actualFilter,
                     errorsOnly: errorsOnly,
+                    sourceFilter: sourceParam,
                     limit: pageSize,
                     offset: offset
                 }),
@@ -261,7 +282,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         if (page >= 1 && page <= totalPages && page !== currentPage) {
             setCurrentPage(page);
             currentPageRef.current = page; // [FIX] 同步 ref
-            loadData(page, filter, accountFilter);
+            loadData(page, filter, accountFilter, sourceFilter);
         }
     };
 
@@ -330,21 +351,46 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
                     const currentPending = pendingLogsRef.current;
                     if (currentPending.length > 0) {
-                        setLogs(prev => {
-                            // Deduplicate by id
-                            const existingIds = new Set(prev.map(log => log.id));
-                            const uniqueNewLogs = currentPending.filter(log => !existingIds.has(log.id));
-                            // Merge and sort by timestamp descending (newest first)
-                            const merged = [...uniqueNewLogs, ...prev];
-                            merged.sort((a, b) => b.timestamp - a.timestamp);
-                            return merged.slice(0, 100);
-                        });
+                        const isFirstPage = currentPageRef.current === 1;
+                        if (isFirstPage) {
+                            const currentSourceFilter = sourceFilterRef.current;
+                            const currentFilter = filterRef.current;
+                            const currentAccountFilter = accountFilterRef.current;
 
-                        // Fetch stats and total count from backend instead of local calculation
+                            setLogs(prev => {
+                                // Deduplicate by id
+                                const existingIds = new Set(prev.map(log => log.id));
+                                const uniqueNewLogs = currentPending.filter(log => {
+                                    if (existingIds.has(log.id)) return false;
+                                    if (currentSourceFilter && log.response_source !== currentSourceFilter) return false;
+                                    if (currentAccountFilter && log.account_email !== currentAccountFilter) return false;
+                                    if (currentFilter) {
+                                        const lower = currentFilter.toLowerCase();
+                                        const matchUrl = log.url && log.url.toLowerCase().includes(lower);
+                                        const matchModel = log.model && log.model.toLowerCase().includes(lower);
+                                        const matchEmail = log.account_email && log.account_email.toLowerCase().includes(lower);
+                                        if (!matchUrl && !matchModel && !matchEmail) return false;
+                                    }
+                                    return true;
+                                });
+                                // Merge and sort by timestamp descending (newest first)
+                                const merged = [...uniqueNewLogs, ...prev];
+                                merged.sort((a, b) => b.timestamp - a.timestamp);
+                                return merged.slice(0, pageSize);
+                            });
+                        }
+
+                        // Fetch stats and total count from backend with current filters
                         try {
+                            const actualFilter = [filterRef.current, accountFilterRef.current].filter(Boolean).join(' ');
+                            const sourceParam = sourceFilterRef.current || undefined;
                             const [currentStats, count] = await Promise.all([
                                 invoke<ProxyStats>('get_proxy_stats'),
-                                invoke<number>('get_proxy_logs_count_filtered', { filter: '', errorsOnly: false })
+                                invoke<number>('get_proxy_logs_count_filtered', {
+                                    filter: actualFilter,
+                                    errorsOnly: false,
+                                    sourceFilter: sourceParam,
+                                })
                             ]);
                             if (isMountedRef.current) {
                                 if (currentStats) setStats(currentStats);
@@ -368,7 +414,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             pollInterval = window.setInterval(() => {
                 if (isMountedRef.current && !loading) {
                     // [FIX] 使用 ref.current 获取最新的筛选条件
-                    loadData(currentPageRef.current, filterRef.current, accountFilterRef.current);
+                    loadData(currentPageRef.current, filterRef.current, accountFilterRef.current, sourceFilterRef.current);
                 }
             }, 10000);
         }
@@ -389,18 +435,19 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     // Reload when pageSize changes
     useEffect(() => {
         setCurrentPage(1);
-        loadData(1, filter, accountFilter);
+        loadData(1, filter, accountFilter, sourceFilter);
     }, [pageSize]);
 
     // Reload when filter changes (search based on all logs)
     useEffect(() => {
         setCurrentPage(1);
-        loadData(1, filter, accountFilter);
+        loadData(1, filter, accountFilter, sourceFilter);
         // [FIX] 同步 ref 值，供 setInterval 使用
         filterRef.current = filter;
         accountFilterRef.current = accountFilter;
+        sourceFilterRef.current = sourceFilter;
         currentPageRef.current = 1;
-    }, [filter, accountFilter]);
+    }, [filter, accountFilter, sourceFilter]);
 
     // Logs are already filtered and sorted by backend
     // Apply account filter on frontend
@@ -497,13 +544,26 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                         </select>
                     </div>
 
+                    <div className="relative">
+                        <select
+                            className="select select-sm select-bordered text-xs min-w-[110px]"
+                            value={sourceFilter}
+                            onChange={(e) => setSourceFilter(e.target.value)}
+                            title={t('monitor.filters.by_source')}
+                        >
+                            <option value="">{t('monitor.filters.all_sources')}</option>
+                            <option value="remote">{t('monitor.filters.source_remote')}</option>
+                            <option value="local">{t('monitor.filters.source_local')}</option>
+                        </select>
+                    </div>
+
                     <div className="hidden lg:flex gap-4 text-[10px] font-bold uppercase">
                         <span className="text-blue-500">{formatCompactNumber(stats.total_requests)} {t('monitor.stats.total')}</span>
                         <span className="text-green-500">{formatCompactNumber(stats.success_count)} {t('monitor.stats.ok')}</span>
                         <span className="text-red-500">{formatCompactNumber(stats.error_count)} {t('monitor.stats.err')}</span>
                     </div>
 
-                    <button onClick={() => loadData(currentPage, filter)} className="btn btn-sm btn-ghost text-gray-400" title={t('common.refresh')}>
+                    <button onClick={() => loadData(currentPage, filter, accountFilter, sourceFilter)} className="btn btn-sm btn-ghost text-gray-400" title={t('common.refresh')}>
                         <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
                     </button>
                     <button onClick={clearLogs} className="btn btn-sm btn-ghost text-gray-400">
@@ -518,7 +578,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                             {q.label}
                         </button>
                     ))}
-                    {(filter || accountFilter) && <button onClick={() => { setFilter(''); setAccountFilter(''); }} className="text-[10px] text-blue-500"> {t('monitor.filters.reset')} </button>}
+                    {(filter || accountFilter || sourceFilter) && <button onClick={() => { setFilter(''); setAccountFilter(''); setSourceFilter(''); }} className="text-[10px] text-blue-500"> {t('monitor.filters.reset')} </button>}
                 </div>
             </div>
 
@@ -617,6 +677,23 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                 </div>
                                 <div className="mt-5 pt-5 border-t border-gray-200 dark:border-base-300">
                                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                                        <div className="space-y-1.5">
+                                            <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest">{t('monitor.details.source')}</span>
+                                            <div>
+                                                <span className={`inline-block px-2.5 py-1 rounded-md font-mono font-black text-xs uppercase ${
+                                                    selectedLog.response_source === 'remote'
+                                                        ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400 border border-blue-200 dark:border-blue-800/50'
+                                                        : 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400 border border-amber-200 dark:border-amber-800/50'
+                                                }`}>
+                                                    {selectedLog.response_source === 'remote' ? t('monitor.source.remote_full') : t('monitor.source.local_full')}
+                                                </span>
+                                            </div>
+                                            <span className="block text-[11px] text-gray-500 dark:text-gray-400">
+                                                {selectedLog.response_source === 'remote'
+                                                    ? t('monitor.details.source_remote_desc')
+                                                    : t('monitor.details.source_local_desc')}
+                                            </span>
+                                        </div>
                                         {selectedLog.protocol && (
                                             <div className="space-y-1.5">
                                                 <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest">{t('monitor.details.protocol')}</span>

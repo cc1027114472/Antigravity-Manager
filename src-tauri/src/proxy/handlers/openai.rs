@@ -863,7 +863,11 @@ pub async fn handle_chat_completions(
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
                         .header("X-Account-Id", &account_id)
-                        .header("X-Mapped-Model", &mapped_model);
+                        .header("X-Mapped-Model", &mapped_model)
+                        .header(
+                            crate::proxy::account_inflight::HEADER_RESPONSE_SOURCE,
+                            crate::proxy::account_inflight::SOURCE_REMOTE,
+                        );
                     if let Some(p) = peak {
                         builder = builder.header("X-In-Flight-Peak", p.to_string());
                     }
@@ -871,7 +875,7 @@ pub async fn handle_chat_completions(
                     let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
                     let pacer_clone = pacer_arc.clone();
                     let stream_with_pacer = async_stream::stream! {
-                        let mut inner = combined_stream;
+                        let mut inner = Box::pin(combined_stream);
                         while let Some(item) = inner.next().await {
                             yield item;
                         }
@@ -1230,11 +1234,12 @@ pub async fn handle_chat_completions(
     if let Some(email) = last_email {
         Ok((
             StatusCode::TOO_MANY_REQUESTS,
-            crate::proxy::account_inflight::account_headers(
+            crate::proxy::account_inflight::account_headers_with_source(
                 &email,
                 None,
                 Some(mapped_model.as_str()),
                 crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+                crate::proxy::account_inflight::SOURCE_LOCAL,
             ),
             format!("All accounts exhausted. Last error: {}", last_error),
         )
@@ -2490,7 +2495,11 @@ pub async fn handle_completions(
                         .header("Connection", "keep-alive")
                         .header("X-Account-Email", &email)
                         .header("X-Account-Id", &account_id)
-                        .header("X-Mapped-Model", &mapped_model);
+                        .header("X-Mapped-Model", &mapped_model)
+                        .header(
+                            crate::proxy::account_inflight::HEADER_RESPONSE_SOURCE,
+                            crate::proxy::account_inflight::SOURCE_REMOTE,
+                        );
                     if let Some(p) = peak {
                         builder = builder.header("X-In-Flight-Peak", p.to_string());
                     }
@@ -2989,11 +2998,12 @@ pub async fn handle_completions(
     if let Some(email) = last_email {
         (
             StatusCode::TOO_MANY_REQUESTS,
-            crate::proxy::account_inflight::account_headers(
+            crate::proxy::account_inflight::account_headers_with_source(
                 &email,
                 None,
                 Some(mapped_model.as_str()),
                 crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+                crate::proxy::account_inflight::SOURCE_LOCAL,
             ),
             format!("All accounts exhausted. Last error: {}", last_error),
         )
@@ -3142,7 +3152,11 @@ async fn intercept_chat_to_image(
                 let mut builder = Response::builder()
                     .header("Content-Type", "text/event-stream")
                     .header("Cache-Control", "no-cache")
-                    .header("X-Account-Email", email);
+                    .header("X-Account-Email", email)
+                    .header(
+                        crate::proxy::account_inflight::HEADER_RESPONSE_SOURCE,
+                        crate::proxy::account_inflight::SOURCE_REMOTE,
+                    );
                 if let Some(p) = peak {
                     builder = builder.header("X-In-Flight-Peak", p.to_string());
                 }

@@ -970,7 +970,11 @@
       "images": "Ảnh",
       "reset": "Đặt lại",
       "by_account": "Lọc theo tài khoản",
-      "all_accounts": "Tất cả tài khoản"
+      "all_accounts": "Tất cả tài khoản",
+      "by_source": "Lọc theo nguồn",
+      "all_sources": "Tất cả nguồn",
+      "source_remote": "Thượng nguồn từ xa",
+      "source_local": "Chặn cục bộ"
     },
     "table": {
       "status": "Trạng thái",
@@ -982,7 +986,8 @@
       "usage": "Tokens",
       "duration": "Thời gian",
       "time": "Thời điểm",
-      "empty": "Chưa có request nào được ghi lại"
+      "empty": "Chưa có request nào được ghi lại",
+      "source": "Nguồn"
     },
     "details": {
       "title": "Chi tiết Request",
@@ -997,7 +1002,10 @@
       "protocol": "Giao thức",
       "mapped_model": "Model Đã Ánh xạ",
       "account_used": "Tài khoản Sử dụng",
-      "payload_empty": "Không có Payload"
+      "payload_empty": "Không có Payload",
+      "source": "Nguồn phản hồi",
+      "source_remote_desc": "Đã gửi đến API nhà cung cấp thượng nguồn và nhận phản hồi",
+      "source_local_desc": "Không đến thượng nguồn; bị chặn bởi chính sách hoặc cơ chế bảo vệ proxy cục bộ"
     },
     "token_stats": {
       "title": "Token Usage Stats",
@@ -1021,6 +1029,12 @@
     "dialog": {
       "clear_title": "Xóa Logs Proxy",
       "clear_msg": "Bạn có chắc muốn xóa tất cả logs proxy? Hành động này không thể hoàn tác."
+    },
+    "source": {
+      "remote": "Từ xa",
+      "local": "Cục bộ",
+      "remote_full": "Thượng nguồn từ xa",
+      "local_full": "Chặn cục bộ"
     }
   },
   "update_notification": {

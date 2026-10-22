@@ -27,7 +27,8 @@ interface ProxyRequestLog {
     timestamp: number;
     status: number;
     duration: number;
-    mapped_model?: string
+    mapped_model?: string;
+    response_source?: string;
 }
 
 export default function MiniView() {

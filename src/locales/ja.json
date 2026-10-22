@@ -1087,7 +1087,11 @@
       "images": "画像",
       "reset": "リセット",
       "by_account": "アカウントでフィルタ",
-      "all_accounts": "すべてのアカウント"
+      "all_accounts": "すべてのアカウント",
+      "by_source": "ソースで絞り込み",
+      "all_sources": "すべてのソース",
+      "source_remote": "リモート上流",
+      "source_local": "ローカル遮断"
     },
     "table": {
       "status": "ステータス",
@@ -1099,7 +1103,8 @@
       "usage": "トークン",
       "duration": "所要時間",
       "time": "時間",
-      "empty": "記録されたリクエストはありません"
+      "empty": "記録されたリクエストはありません",
+      "source": "ソース"
     },
     "details": {
       "title": "リクエスト詳細",
@@ -1113,7 +1118,10 @@
       "protocol": "プロトコル",
       "mapped_model": "マッピング後のモデル",
       "account_used": "使用アカウント",
-      "payload_empty": "ペイロードなし"
+      "payload_empty": "ペイロードなし",
+      "source": "応答ソース",
+      "source_remote_desc": "実際にプロバイダー上流APIへ送信され応答を受信",
+      "source_local_desc": "上流には到達せず、ローカルプロキシポリシーまたは保護機能により直接返却"
     },
     "dialog": {
       "clear_title": "プロキシログをクリア",
@@ -1146,6 +1154,12 @@
         "start_time": "開始時刻",
         "duration": "所要時間"
       }
+    },
+    "source": {
+      "remote": "リモート",
+      "local": "ローカル",
+      "remote_full": "リモート上流",
+      "local_full": "ローカル遮断"
     }
   },
   "update_notification": {

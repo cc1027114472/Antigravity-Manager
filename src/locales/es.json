@@ -963,7 +963,11 @@
       "images": "Imágenes",
       "reset": "Restablecer",
       "by_account": "Filtrar por cuenta",
-      "all_accounts": "Todas las Cuentas"
+      "all_accounts": "Todas las Cuentas",
+      "by_source": "Filtrar por origen",
+      "all_sources": "Todos los orígenes",
+      "source_remote": "Remoto aguas arriba",
+      "source_local": "Intercepción local"
     },
     "table": {
       "status": "Estado",
@@ -975,7 +979,8 @@
       "usage": "Tokens",
       "duration": "Duración",
       "time": "Hora",
-      "empty": "No hay solicitudes registradas"
+      "empty": "No hay solicitudes registradas",
+      "source": "Origen"
     },
     "details": {
       "title": "Detalles de Solicitud",
@@ -989,11 +994,20 @@
       "protocol": "Protocolo",
       "account_used": "Cuenta Usada",
       "id": "ID de Solicitud",
-      "payload_empty": "Sin datos"
+      "payload_empty": "Sin datos",
+      "source": "Origen de respuesta",
+      "source_remote_desc": "Enviado efectivamente a la API del proveedor aguas arriba y se recibió respuesta",
+      "source_local_desc": "No llegó al proveedor aguas arriba; interceptado por políticas locales del proxy"
     },
     "dialog": {
       "clear_title": "Limpiar Registros de Proxy",
       "clear_msg": "¿Está seguro de que desea limpiar todos los registros del proxy? Esta acción no se puede deshacer."
+    },
+    "source": {
+      "remote": "Remoto",
+      "local": "Local",
+      "remote_full": "Remoto aguas arriba",
+      "local_full": "Intercepción local"
     }
   },
   "update_notification": {

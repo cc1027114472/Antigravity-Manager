@@ -72,12 +72,18 @@ pub fn init_db() -> Result<(), String> {
         "ALTER TABLE request_logs ADD COLUMN in_flight_peak INTEGER",
         [],
     );
+    let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN response_source TEXT", []);
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_timestamp ON request_logs (timestamp DESC)",
         [],
     )
     .map_err(|e| e.to_string())?;
+
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_response_source ON request_logs (response_source)",
+        [],
+    );
 
     // Add status index for faster stats queries
     conn.execute(
@@ -98,8 +104,8 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let resp_body = log.response_body.clone();
 
     conn.execute(
-        "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak, response_source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             log.id,
             log.timestamp,
@@ -120,6 +126,7 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.client_ip,
             log.username,
             log.in_flight_peak,
+            log.response_source,
         ],
     ).map_err(|e| e.to_string())?;
 
@@ -134,7 +141,7 @@ pub fn get_logs_summary(limit: usize, offset: usize) -> Result<Vec<ProxyRequestL
         .prepare(
             "SELECT id, timestamp, method, url, status, duration, model, error,
                 NULL as request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak
+                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak, response_source
          FROM request_logs 
          ORDER BY timestamp DESC 
          LIMIT ?1 OFFSET ?2",
@@ -164,6 +171,7 @@ pub fn get_logs_summary(limit: usize, offset: usize) -> Result<Vec<ProxyRequestL
                 client_ip: row.get(16).unwrap_or(None),
                 username: row.get(17).unwrap_or(None),
                 in_flight_peak: row.get(18).unwrap_or(None),
+                response_source: row.get(19).unwrap_or(None),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -212,7 +220,7 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
         .prepare(
             "SELECT id, timestamp, method, url, status, duration, model, error,
                 request_body, response_body, input_tokens, output_tokens,
-                cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak
+                cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak, response_source
          FROM request_logs
          WHERE id = ?1",
         )
@@ -240,6 +248,7 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
             client_ip: row.get(16).unwrap_or(None),
             username: row.get(17).unwrap_or(None),
             in_flight_peak: row.get(18).unwrap_or(None),
+            response_source: row.get(19).unwrap_or(None),
         })
     })
     .map_err(|e| e.to_string())
@@ -461,161 +470,155 @@ pub fn get_logs_count() -> Result<u64, String> {
     Ok(count)
 }
 
-/// Get count of logs matching search filter
+/// Get count of logs matching search filter and source filter
 /// filter: search text to match in url, method, model, or status
 /// errors_only: if true, only count logs with status < 200 or >= 400
-pub fn get_logs_count_filtered(filter: &str, errors_only: bool) -> Result<u64, String> {
+/// source_filter: optional "all", "remote", or "local"
+pub fn get_logs_count_filtered(
+    filter: &str,
+    errors_only: bool,
+    source_filter: Option<&str>,
+) -> Result<u64, String> {
     let conn = connect_db()?;
 
-    let filter_pattern = format!("%{}%", filter);
+    let mut conditions = Vec::new();
+    let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
 
-    let sql = if errors_only {
-        "SELECT COUNT(*) FROM request_logs WHERE (status < 200 OR status >= 400)"
-    } else if filter.is_empty() {
-        "SELECT COUNT(*) FROM request_logs"
+    if errors_only {
+        conditions.push("(status < 200 OR status >= 400)".to_string());
+    }
+
+    if !filter.is_empty() {
+        conditions.push("(url LIKE ? OR method LIKE ? OR model LIKE ? OR CAST(status AS TEXT) LIKE ? OR account_email LIKE ? OR client_ip LIKE ?)".to_string());
+        let pattern = format!("%{}%", filter);
+        for _ in 0..6 {
+            params_vec.push(rusqlite::types::Value::Text(pattern.clone()));
+        }
+    }
+
+    if let Some(src) = source_filter {
+        match src {
+            "remote" => {
+                conditions.push("response_source = 'remote'".to_string());
+            }
+            "local" => {
+                conditions.push("(response_source = 'local' OR (response_source IS NULL AND (status < 200 OR status >= 400)))".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
     } else {
-        "SELECT COUNT(*) FROM request_logs WHERE
-            (url LIKE ?1 OR method LIKE ?1 OR model LIKE ?1 OR CAST(status AS TEXT) LIKE ?1 OR account_email LIKE ?1)"
+        format!("WHERE {}", conditions.join(" AND "))
     };
 
-    let count: u64 = if filter.is_empty() && !errors_only {
-        conn.query_row(sql, [], |row| row.get(0))
-    } else if errors_only {
-        conn.query_row(sql, [], |row| row.get(0))
-    } else {
-        conn.query_row(sql, [&filter_pattern], |row| row.get(0))
-    }
-    .map_err(|e| e.to_string())?;
+    let sql = format!("SELECT COUNT(*) FROM request_logs {}", where_clause);
+    let count: u64 = conn
+        .query_row(&sql, rusqlite::params_from_iter(&params_vec), |row| {
+            row.get(0)
+        })
+        .map_err(|e| e.to_string())?;
 
     Ok(count)
 }
 
-/// Get logs with search filter and pagination
+/// Get logs with search filter, source filter, and pagination
 /// filter: search text to match in url, method, model, or status
 /// errors_only: if true, only return logs with status < 200 or >= 400
+/// source_filter: optional "all", "remote", or "local"
 pub fn get_logs_filtered(
     filter: &str,
     errors_only: bool,
+    source_filter: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> Result<Vec<ProxyRequestLog>, String> {
     let conn = connect_db()?;
 
-    let filter_pattern = format!("%{}%", filter);
+    let mut conditions = Vec::new();
+    let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
 
-    let sql = if errors_only {
-        "SELECT id, timestamp, method, url, status, duration, model, error,
-                NULL as request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak
-         FROM request_logs
-         WHERE (status < 200 OR status >= 400)
-         ORDER BY timestamp DESC
-         LIMIT ?1 OFFSET ?2"
-    } else if filter.is_empty() {
-        "SELECT id, timestamp, method, url, status, duration, model, error,
-                NULL as request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak
-         FROM request_logs
-         ORDER BY timestamp DESC
-         LIMIT ?1 OFFSET ?2"
+    if errors_only {
+        conditions.push("(status < 200 OR status >= 400)".to_string());
+    }
+
+    if !filter.is_empty() {
+        conditions.push("(url LIKE ? OR method LIKE ? OR model LIKE ? OR CAST(status AS TEXT) LIKE ? OR account_email LIKE ? OR client_ip LIKE ?)".to_string());
+        let pattern = format!("%{}%", filter);
+        for _ in 0..6 {
+            params_vec.push(rusqlite::types::Value::Text(pattern.clone()));
+        }
+    }
+
+    if let Some(src) = source_filter {
+        match src {
+            "remote" => {
+                conditions.push("response_source = 'remote'".to_string());
+            }
+            "local" => {
+                conditions.push("(response_source = 'local' OR (response_source IS NULL AND (status < 200 OR status >= 400)))".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
     } else {
-        "SELECT id, timestamp, method, url, status, duration, model, error,
-                NULL as request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak
-         FROM request_logs
-         WHERE (url LIKE ?3 OR method LIKE ?3 OR model LIKE ?3 OR CAST(status AS TEXT) LIKE ?3 OR account_email LIKE ?3 OR client_ip LIKE ?3)
-         ORDER BY timestamp DESC
-         LIMIT ?1 OFFSET ?2"
+        format!("WHERE {}", conditions.join(" AND "))
     };
 
-    let logs: Vec<ProxyRequestLog> = if filter.is_empty() && !errors_only {
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let logs_iter = stmt
-            .query_map([limit, offset], |row| {
-                Ok(ProxyRequestLog {
-                    id: row.get(0)?,
-                    timestamp: row.get(1)?,
-                    method: row.get(2)?,
-                    url: row.get(3)?,
-                    status: row.get(4)?,
-                    duration: row.get(5)?,
-                    model: row.get(6)?,
-                    error: row.get(7)?,
-                    request_body: None,
-                    response_body: None,
-                    input_tokens: row.get(10).unwrap_or(None),
-                    output_tokens: row.get(11).unwrap_or(None),
-                    cached_tokens: row.get(12).unwrap_or(None),
-                    account_email: row.get(13).unwrap_or(None),
-                    account_id: None,
-                    mapped_model: row.get(14).unwrap_or(None),
-                    protocol: row.get(15).unwrap_or(None),
-                    client_ip: row.get(16).unwrap_or(None),
-                    username: row.get(17).unwrap_or(None),
-                    in_flight_peak: row.get(18).unwrap_or(None),
-                })
+    params_vec.push(rusqlite::types::Value::Integer(limit as i64));
+    params_vec.push(rusqlite::types::Value::Integer(offset as i64));
+
+    let sql = format!(
+        "SELECT id, timestamp, method, url, status, duration, model, error,
+                NULL as request_body, NULL as response_body,
+                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak, response_source
+         FROM request_logs
+         {}
+         ORDER BY timestamp DESC
+         LIMIT ? OFFSET ?",
+        where_clause
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let logs_iter = stmt
+        .query_map(rusqlite::params_from_iter(&params_vec), |row| {
+            Ok(ProxyRequestLog {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                method: row.get(2)?,
+                url: row.get(3)?,
+                status: row.get(4)?,
+                duration: row.get(5)?,
+                model: row.get(6)?,
+                error: row.get(7)?,
+                request_body: None,
+                response_body: None,
+                input_tokens: row.get(10).unwrap_or(None),
+                output_tokens: row.get(11).unwrap_or(None),
+                cached_tokens: row.get(12).unwrap_or(None),
+                account_email: row.get(13).unwrap_or(None),
+                account_id: None,
+                mapped_model: row.get(14).unwrap_or(None),
+                protocol: row.get(15).unwrap_or(None),
+                client_ip: row.get(16).unwrap_or(None),
+                username: row.get(17).unwrap_or(None),
+                in_flight_peak: row.get(18).unwrap_or(None),
+                response_source: row.get(19).unwrap_or(None),
             })
-            .map_err(|e| e.to_string())?;
-        logs_iter.filter_map(|r| r.ok()).collect()
-    } else if errors_only {
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let logs_iter = stmt
-            .query_map([limit, offset], |row| {
-                Ok(ProxyRequestLog {
-                    id: row.get(0)?,
-                    timestamp: row.get(1)?,
-                    method: row.get(2)?,
-                    url: row.get(3)?,
-                    status: row.get(4)?,
-                    duration: row.get(5)?,
-                    model: row.get(6)?,
-                    error: row.get(7)?,
-                    request_body: None,
-                    response_body: None,
-                    input_tokens: row.get(10).unwrap_or(None),
-                    output_tokens: row.get(11).unwrap_or(None),
-                    cached_tokens: row.get(12).unwrap_or(None),
-                    account_email: row.get(13).unwrap_or(None),
-                    account_id: None,
-                    mapped_model: row.get(14).unwrap_or(None),
-                    protocol: row.get(15).unwrap_or(None),
-                    client_ip: row.get(16).unwrap_or(None),
-                    username: row.get(17).unwrap_or(None),
-                    in_flight_peak: row.get(18).unwrap_or(None),
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        logs_iter.filter_map(|r| r.ok()).collect()
-    } else {
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let logs_iter = stmt
-            .query_map(rusqlite::params![limit, offset, filter_pattern], |row| {
-                Ok(ProxyRequestLog {
-                    id: row.get(0)?,
-                    timestamp: row.get(1)?,
-                    method: row.get(2)?,
-                    url: row.get(3)?,
-                    status: row.get(4)?,
-                    duration: row.get(5)?,
-                    model: row.get(6)?,
-                    error: row.get(7)?,
-                    request_body: None,
-                    response_body: None,
-                    input_tokens: row.get(10).unwrap_or(None),
-                    output_tokens: row.get(11).unwrap_or(None),
-                    cached_tokens: row.get(12).unwrap_or(None),
-                    account_email: row.get(13).unwrap_or(None),
-                    account_id: None,
-                    mapped_model: row.get(14).unwrap_or(None),
-                    protocol: row.get(15).unwrap_or(None),
-                    client_ip: row.get(16).unwrap_or(None),
-                    username: row.get(17).unwrap_or(None),
-                    in_flight_peak: row.get(18).unwrap_or(None),
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        logs_iter.filter_map(|r| r.ok()).collect()
-    };
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut logs = Vec::new();
+    for log in logs_iter {
+        if let Ok(l) = log {
+            logs.push(l);
+        }
+    }
 
     Ok(logs)
 }
@@ -628,7 +631,7 @@ pub fn get_all_logs_for_export() -> Result<Vec<ProxyRequestLog>, String> {
         .prepare(
             "SELECT id, timestamp, method, url, status, duration, model, error,
                 request_body, response_body, input_tokens, output_tokens,
-                cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak
+                cached_tokens, account_email, mapped_model, protocol, client_ip, username, in_flight_peak, response_source
          FROM request_logs
          ORDER BY timestamp DESC",
         )
@@ -657,6 +660,7 @@ pub fn get_all_logs_for_export() -> Result<Vec<ProxyRequestLog>, String> {
                 client_ip: row.get(16).unwrap_or(None),
                 username: row.get(17).unwrap_or(None),
                 in_flight_peak: row.get(18).unwrap_or(None),
+                response_source: row.get(19).unwrap_or(None),
             })
         })
         .map_err(|e| e.to_string())?;

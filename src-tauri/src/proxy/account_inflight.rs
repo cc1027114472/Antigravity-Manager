@@ -78,12 +78,26 @@ pub fn try_replace_guard(
     }
 }
 
+pub const HEADER_RESPONSE_SOURCE: &str = "X-Response-Source";
+pub const SOURCE_REMOTE: &str = "remote";
+pub const SOURCE_LOCAL: &str = "local";
+
 /// Build account-related response headers including optional in-flight peak.
 pub fn account_headers(
     email: &str,
     account_id: Option<&str>,
     mapped_model: Option<&str>,
     peak: Option<u32>,
+) -> HeaderMap {
+    account_headers_with_source(email, account_id, mapped_model, peak, SOURCE_REMOTE)
+}
+
+pub fn account_headers_with_source(
+    email: &str,
+    account_id: Option<&str>,
+    mapped_model: Option<&str>,
+    peak: Option<u32>,
+    source: &str,
 ) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if let Ok(v) = HeaderValue::from_str(email) {
@@ -100,6 +114,9 @@ pub fn account_headers(
         }
     }
     insert_peak_header(&mut headers, peak);
+    if let Ok(v) = HeaderValue::from_str(source) {
+        headers.insert(HEADER_RESPONSE_SOURCE, v);
+    }
     headers
 }
 
