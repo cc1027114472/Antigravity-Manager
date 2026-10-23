@@ -1,6 +1,7 @@
 
 
 import {
+  ArrowUpDown,
   Database,
   Download,
   LayoutGrid,
@@ -34,7 +35,34 @@ import { useTranslation } from "react-i18next";
 
 type FilterType = "all" | "pro" | "ultra" | "free";
 type ViewMode = "list" | "grid";
+export type AccountSortMode = "health" | "quota" | "recent" | "default";
 
+function getAccountHealthScore(account: Account): number {
+  if (account.disabled || account.quota?.is_forbidden || account.validation_blocked || account.proxy_disabled) {
+    return 0; // 彻底失效/封号/禁用，沉底
+  }
+  if (account.live_limited_models && Object.keys(account.live_limited_models).length > 0) {
+    return 100; // 429 冷却中
+  }
+  if (account.protected_models && account.protected_models.length > 0) {
+    return 200; // 部分受限或配额保护中
+  }
+  return 300; // 完全健康可用
+}
+
+function getAccountTotalQuota(account: Account): number {
+  let total = 0;
+  if (account.estimated_quotas) {
+    for (const k of Object.keys(account.estimated_quotas)) {
+      total += account.estimated_quotas[k]?.percentage ?? 0;
+    }
+  } else if (account.quota?.models) {
+    for (const m of account.quota.models) {
+      total += m.percentage ?? 0;
+    }
+  }
+  return total;
+}
 
 function Accounts() {
   const { t } = useTranslation();
@@ -71,6 +99,17 @@ function Accounts() {
   useEffect(() => {
     localStorage.setItem('accounts_view_mode', viewMode);
   }, [viewMode]);
+
+  const [sortMode, setSortMode] = useState<AccountSortMode>(() => {
+    const saved = localStorage.getItem('accounts_sort_mode');
+    return (saved === 'health' || saved === 'quota' || saved === 'recent' || saved === 'default')
+      ? (saved as AccountSortMode)
+      : 'health';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('accounts_sort_mode', sortMode);
+  }, [sortMode]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deviceAccount, setDeviceAccount] = useState<Account | null>(null);
   const [detailsAccount, setDetailsAccount] = useState<Account | null>(null);
@@ -347,8 +386,37 @@ function Accounts() {
       });
     }
 
-    return result;
-  }, [searchedAccounts, filter]);
+    // 智能排序
+    const sorted = [...result];
+    if (sortMode === 'health') {
+      sorted.sort((a, b) => {
+        const isCurrentA = currentAccount?.id === a.id;
+        const isCurrentB = currentAccount?.id === b.id;
+        if (isCurrentA && !isCurrentB) return -1;
+        if (!isCurrentA && isCurrentB) return 1;
+
+        const scoreA = getAccountHealthScore(a);
+        const scoreB = getAccountHealthScore(b);
+        if (scoreA !== scoreB) {
+          return scoreB - scoreA; // 健康得分高者优先
+        }
+
+        const quotaA = getAccountTotalQuota(a);
+        const quotaB = getAccountTotalQuota(b);
+        if (quotaA !== quotaB) {
+          return quotaB - quotaA; // 剩余配额高者优先
+        }
+
+        return a.email.localeCompare(b.email);
+      });
+    } else if (sortMode === 'quota') {
+      sorted.sort((a, b) => getAccountTotalQuota(b) - getAccountTotalQuota(a));
+    } else if (sortMode === 'recent') {
+      sorted.sort((a, b) => (b.last_used || 0) - (a.last_used || 0));
+    }
+
+    return sorted;
+  }, [searchedAccounts, filter, sortMode, currentAccount?.id]);
 
   // Pagination Logic
   const paginatedAccounts = useMemo(() => {
@@ -878,6 +946,22 @@ function Accounts() {
               </div>
             </div>
           )}
+        </div>
+
+        {/* 排序模式选择 */}
+        <div className="flex items-center gap-1.5 bg-gray-100/90 dark:bg-base-200 px-2 py-1.5 rounded-lg shrink-0 border border-gray-200/50 dark:border-white/5">
+          <ArrowUpDown className="w-3.5 h-3.5 text-gray-500 dark:text-gray-400 shrink-0" />
+          <select
+            value={sortMode}
+            onChange={(e) => setSortMode(e.target.value as AccountSortMode)}
+            className="bg-transparent text-gray-700 dark:text-base-content text-xs font-semibold focus:outline-none cursor-pointer"
+            title={t('accounts.sort_title', '账号列表排序方式')}
+          >
+            <option value="health" className="bg-white dark:bg-base-100">{t('accounts.sort.health', '健康优先')}</option>
+            <option value="quota" className="bg-white dark:bg-base-100">{t('accounts.sort.quota', '配额从高到低')}</option>
+            <option value="recent" className="bg-white dark:bg-base-100">{t('accounts.sort.recent', '最近使用优先')}</option>
+            <option value="default" className="bg-white dark:bg-base-100">{t('accounts.sort.default', '默认顺序')}</option>
+          </select>
         </div>
 
         {/* 视图切换按钮组 */}

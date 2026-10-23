@@ -1,4 +1,5 @@
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Moon } from 'lucide-react';
+import { useState } from 'react';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Moon, Copy, Check } from 'lucide-react';
 import { Account } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
@@ -9,6 +10,7 @@ import { QuotaItem } from './QuotaItem';
 import { Gemini, Claude } from '@lobehub/icons';
 import { MODEL_CONFIG } from '../../config/modelConfig';
 import { MaxConcurrencyInput } from './MaxConcurrencyInput';
+import { showToast } from '../common/ToastContainer';
 
 interface AccountRowProps {
     account: Account;
@@ -30,11 +32,20 @@ interface AccountRowProps {
 function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onUpdateMaxConcurrency }: AccountRowProps) {
     const { t } = useTranslation();
     const { config, showAllQuotas } = useConfigStore();
+    const [copied, setCopied] = useState(false);
     const displayModels = getListQuotaDisplays(account, {
         showAll: showAllQuotas,
         pinnedModels: config?.pinned_quota_models?.models,
     });
     const isDisabled = Boolean(account.disabled);
+
+    const handleCopyEmail = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(account.email);
+        setCopied(true);
+        showToast(t('accounts.copied_email', '已复制账号: ') + account.email, 'success');
+        setTimeout(() => setCopied(false), 1500);
+    };
 
     return (
         <tr className={cn(
@@ -54,12 +65,22 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
 
             <td className="px-4 py-1">
                 <div className="flex items-center gap-3">
-                    <span className={cn(
-                        "font-medium text-sm truncate max-w-[180px] xl:max-w-none transition-colors",
-                        isCurrent ? "text-blue-700 dark:text-blue-400" : "text-gray-900 dark:text-base-content"
-                    )} title={account.email}>
-                        {account.email}
-                    </span>
+                    <button
+                        type="button"
+                        onClick={handleCopyEmail}
+                        className={cn(
+                            "group/copy flex items-center gap-1.5 font-medium text-sm truncate max-w-[180px] xl:max-w-none text-left transition-all rounded hover:text-blue-600 dark:hover:text-blue-400 focus:outline-none cursor-pointer",
+                            isCurrent ? "text-blue-700 dark:text-blue-400" : "text-gray-900 dark:text-base-content"
+                        )}
+                        title={`${account.email} (${t('common.click_to_copy', '点击复制账号')})`}
+                    >
+                        <span className="truncate">{account.email}</span>
+                        {copied ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                        ) : (
+                            <Copy className="w-3.5 h-3.5 opacity-0 group-hover/copy:opacity-70 transition-opacity text-gray-400 shrink-0" />
+                        )}
+                    </button>
 
                     <div className="flex items-center gap-1.5 shrink-0">
                         {isCurrent && (

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Repeat2, Terminal, Moon } from 'lucide-react';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Repeat2, Terminal, Moon, Copy } from 'lucide-react';
 import { Account } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
@@ -17,6 +17,7 @@ import {
     type ProxyEgressUsage,
 } from '../../utils/proxyUsageStatus';
 import { MaxConcurrencyInput } from './MaxConcurrencyInput';
+import { showToast } from '../common/ToastContainer';
 
 interface AccountCardProps {
     account: Account;
@@ -49,6 +50,15 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
     // 自定义标签编辑状态
     const [isEditingLabel, setIsEditingLabel] = useState(false);
     const [labelInput, setLabelInput] = useState(account.custom_label || '');
+    const [copied, setCopied] = useState(false);
+
+    const handleCopyEmail = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(account.email);
+        setCopied(true);
+        showToast(t('accounts.copied_email', '已复制账号: ') + account.email, 'success');
+        setTimeout(() => setCopied(false), 1500);
+    };
 
     // Use the prop directly from parent component
     const isCurrent = propIsCurrent;
@@ -117,12 +127,22 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                     onClick={(e) => e.stopPropagation()}
                 />
                 <div className="flex-1 min-w-0 flex flex-col gap-1.5">
-                    <h3 className={cn(
-                        "font-semibold text-sm truncate w-full",
-                        isCurrent ? "text-blue-700 dark:text-blue-400" : "text-gray-900 dark:text-base-content"
-                    )} title={account.email}>
-                        {account.email}
-                    </h3>
+                    <button
+                        type="button"
+                        onClick={handleCopyEmail}
+                        className={cn(
+                            "group/copy flex items-center gap-1.5 font-semibold text-sm truncate w-full text-left transition-all rounded hover:text-blue-600 dark:hover:text-blue-400 focus:outline-none cursor-pointer",
+                            isCurrent ? "text-blue-700 dark:text-blue-400" : "text-gray-900 dark:text-base-content"
+                        )}
+                        title={`${account.email} (${t('common.click_to_copy', '点击复制账号')})`}
+                    >
+                        <span className="truncate">{account.email}</span>
+                        {copied ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                        ) : (
+                            <Copy className="w-3.5 h-3.5 opacity-0 group-hover/copy:opacity-70 transition-opacity text-gray-400 shrink-0" />
+                        )}
+                    </button>
                     <div className="flex items-center justify-between w-full gap-2">
                         <div className="flex items-center gap-1.5 flex-wrap">
                             {isCurrent && (
