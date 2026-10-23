@@ -31,7 +31,7 @@
 
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// 代码块保护正则：隔离多行围栏代码块 ```...``` 与行内反引号 `...`
 static RE_CODE_BLOCK: Lazy<Regex> =

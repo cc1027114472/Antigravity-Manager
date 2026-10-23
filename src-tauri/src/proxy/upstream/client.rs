@@ -384,17 +384,17 @@ impl UpstreamClient {
         }
 
         // [OVERHEAD] 自适应上下文开销平衡：对 3.8 超短请求注入官方环境上下文骨架
-        let model_opt = body.get("model").and_then(Value::as_str);
+        let model_owned = body.get("model").and_then(Value::as_str).map(|s| s.to_string());
         if method == "streamGenerateContent" || method == "generateContent" {
             if let Some(inner) = body.get_mut("request") {
                 crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::adapt_context_overhead(
                     inner,
-                    model_opt,
+                    model_owned.as_deref(),
                 );
             } else {
                 crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::adapt_context_overhead(
                     &mut body,
-                    model_opt,
+                    model_owned.as_deref(),
                 );
             }
         }
