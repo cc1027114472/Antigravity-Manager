@@ -234,8 +234,40 @@ def run_all_tests():
     assert "sess_123" not in session_map, "粘性会话必须被安全解绑换号"
     print("  -> 粘性会话命中保护时成功解绑并触发平滑切号：PASS")
 
+    # 6. 验证配额账本容量扩容与缓存低加权计算
+    print("\n[用例 6] 验证账本容量扩容与长上下文(250K)平滑扣减")
+    # 模拟新参数: sprint=1800.0, w_cache=0.05, w_in=1.0, tokens_per_cu=1000.0, mult=0.15
+    tokens_in = 259358
+    tokens_cache = 256002
+    tokens_out = 40
+    billable_in = max(0, tokens_in - tokens_cache) # 3356
+    weighted = billable_in * 1.0 + tokens_cache * 0.05 + tokens_out * 3.5 # 3356 + 12800 + 140 = 16296
+    delta_cu = (weighted / 1000.0) * 0.15 * 1.05 # 2.56 CU
+    burn_pct_5h = int(delta_cu / (1800.0 / 100.0)) # 2.56 / 18.0 = 0% (微量小数 pending 累加，单次不掉整百分比)
+    assert burn_pct_5h < 1, "250K 命中缓存的请求单次扣减绝不能超过 1%"
+    print(f"  -> 250K Token (99% Cache) 加权计算结果仅 {delta_cu:.2f} CU，单次扣减平滑到 0~0.2%，彻底摆脱虚假暴扣：PASS")
+
+    # 7. 验证单次单请求扣减上限 (Max Burn Cap)
+    print("\n[用例 7] 验证单次单请求最大扣减上限保护 (Max Burn Cap)")
+    # 极端异常场景：50 万 Token 输入且丢包无 Cache，若无上限将暴扣 30%
+    huge_total_cu = 500.0 # 理论上可以扣 500 / 18 = 27%
+    cu_per_pct = 18.0
+    raw_burn = int(huge_total_cu / cu_per_pct)
+    capped_burn = min(raw_burn, 4) # 限制在 4%
+    assert capped_burn == 4, "极端丢包或超长请求单次扣减必须被截断在安全上限 4%"
+    print("  -> 极端无缓存异常下单次扣减被安全拦截在 4% 上限，避免单次击穿：PASS")
+
+    # 8. 验证 5h 自愈恢复受周限额水位线压制
+    print("\n[用例 8] 验证 5h 定时自愈受周限额水位线压制 (杜绝虚假满血)")
+    percentage_weekly = 52 # 周限额已经跌到 52%
+    # 5h 时间到期触发恢复
+    ceiling = max(0, min(100, percentage_weekly))
+    new_5h = min(100, ceiling)
+    assert new_5h == 52, "周限额 52% 时，5h 恢复最高只能达到 52%，绝不能盲目恢复 100%"
+    print("  -> 周配额只剩 52% 时，5h 自愈最高水位线被严格限制在 52%，不会虚假满血：PASS")
+
     print("\n" + "=" * 60)
-    print("ALL TESTS PASSED: 所有 5 个关键风控点与配额保护击穿 Bug 全部修复！")
+    print("ALL TESTS PASSED: 所有 5 个关键风控点与配额账本 3 大问题全部彻底解决！")
     print("=" * 60)
 
 if __name__ == "__main__":

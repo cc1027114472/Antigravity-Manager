@@ -101,13 +101,19 @@ pub fn check_time_recovery(account: &mut Account, now: i64) -> bool {
         // 5h 恢复
         if let Some(r5h) = est.reset_time_5h {
             if now >= r5h && est.percentage_5h < 100 {
-                crate::modules::logger::log_info(&format!(
-                    "[QuotaLedger] 5h window reset reached for {} ({}): auto-recovering 5h to 100%",
-                    account.email, billing
-                ));
-                est.percentage_5h = 100;
+                // [DEFENSE] 周限额水位线压制：5h 窗口恢复时，最高不可超过当前周限额水位线（总水库约束分水池）
+                // 防止周限额只剩 50% 时 5h 盲目报满 100% 造成调度误判和虚假满血
+                let ceiling = est.percentage_weekly.clamp(0, 100);
+                let new_5h = 100.min(ceiling);
+                if est.percentage_5h < new_5h {
+                    crate::modules::logger::log_info(&format!(
+                        "[QuotaLedger] 5h window reset reached for {} ({}): recovering 5h to {}% (capped by weekly {}%)",
+                        account.email, billing, new_5h, ceiling
+                    ));
+                    est.percentage_5h = new_5h;
+                    modified = true;
+                }
                 est.reset_time_5h = Some(now + 5 * 3600);
-                modified = true;
             }
         }
         // 周限额恢复

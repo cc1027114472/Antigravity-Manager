@@ -175,7 +175,7 @@ fn default_w_in() -> f64 {
 }
 
 fn default_w_cache() -> f64 {
-    0.15
+    0.05
 }
 
 fn default_w_out() -> f64 {
@@ -187,11 +187,11 @@ fn default_tokens_per_cu() -> f64 {
 }
 
 fn default_sprint_capacity_cu() -> f64 {
-    650.0
+    1800.0
 }
 
 fn default_marathon_capacity_cu() -> f64 {
-    2800.0
+    7200.0
 }
 
 fn default_conservative_multiplier() -> f64 {
@@ -209,6 +209,8 @@ fn default_model_multipliers() -> HashMap<String, f64> {
     m.insert("gemini-2.5-flash-lite".into(), 0.1);
     m.insert("gemini-3.5-flash".into(), 0.25);
     m.insert("gemini-3.6-flash".into(), 0.15);
+    m.insert("gemini-3.8-flash-medium".into(), 0.15);
+    m.insert("gemini-3.8-flash-high".into(), 0.15);
     m.insert("gemini-3.1-pro-high".into(), 1.0);
     m.insert("gemini-3.1-pro-low".into(), 1.0);
     m.insert("gemini-3.1-pro-preview".into(), 1.0);
@@ -365,8 +367,12 @@ impl QuotaLedgerConfig {
         if cu_per_pct <= 0.0 {
             return (0, 0.0);
         }
-        let burn_pct = (total_cu / cu_per_pct).floor() as i32;
-        let remainder = total_cu - (burn_pct as f64 * cu_per_pct);
+        let mut burn_pct = (total_cu / cu_per_pct).floor() as i32;
+        // [DEFENSE] 单次请求最大扣减上限保护：防止因 SSE 丢包导致 cached_tokens 缺失引起单次暴扣
+        if burn_pct > 4 {
+            burn_pct = 4;
+        }
+        let remainder = (total_cu - (burn_pct as f64 * cu_per_pct)).min(cu_per_pct * 0.99);
         (burn_pct, remainder)
     }
 
@@ -385,8 +391,12 @@ impl QuotaLedgerConfig {
         if cu_per_pct <= 0.0 {
             return (0, 0.0);
         }
-        let burn_pct = (total_cu / cu_per_pct).floor() as i32;
-        let remainder = total_cu - (burn_pct as f64 * cu_per_pct);
+        let mut burn_pct = (total_cu / cu_per_pct).floor() as i32;
+        // [DEFENSE] 单次周请求最大扣减上限保护为 2%
+        if burn_pct > 2 {
+            burn_pct = 2;
+        }
+        let remainder = (total_cu - (burn_pct as f64 * cu_per_pct)).min(cu_per_pct * 0.99);
         (burn_pct, remainder)
     }
 
