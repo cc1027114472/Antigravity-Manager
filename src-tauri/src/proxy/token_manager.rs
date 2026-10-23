@@ -1846,8 +1846,22 @@ impl TokenManager {
             .filter(|t| self.pacer.get_required_wait_ms(&t.account_id) == 0)
             .collect();
         let final_candidates = if !well_rested.is_empty() {
+            // 有完全冷却完成的账号：直接进入 P2C 零等待挑选
             well_rested
         } else {
+            // [NEW] 最佳流派规则：全场都在冷却中时，精准挑选“剩余冷却时间最短”的账号进行微等，避免随机抽中超大 TPM 冷却号
+            if let Some(min_wait_token) = pool
+                .iter()
+                .copied()
+                .min_by_key(|t| self.pacer.get_required_wait_ms(&t.account_id))
+            {
+                tracing::debug!(
+                    "⏳ [P2C] All accounts in cooldown. Selected shortest-wait account: {} (wait: {}ms)",
+                    min_wait_token.email,
+                    self.pacer.get_required_wait_ms(&min_wait_token.account_id)
+                );
+                return Some(min_wait_token);
+            }
             pool
         };
 
@@ -2402,6 +2416,7 @@ impl TokenManager {
                             .get_remaining_wait(acc_id, Some(&normalized_target));
                         let is_limited = reset_sec > 0
                             || self.is_rate_limited(acc_id, Some(&normalized_target)).await;
+                        let pacer_wait = self.pacer.get_required_wait_ms(acc_id);
 
                         if is_limited {
                             tracing::info!(
@@ -2432,12 +2447,21 @@ impl TokenManager {
                                 target_model
                             );
                             self.session_accounts.remove(sid);
-                        } else if !attempted.contains(acc_id) {
-                            // 账号可用且未被标记为尝试失败，优先复用
-                            tracing::debug!(
-                                "Sticky Session: Successfully reusing bound account {} for session {}",
+                        } else if pacer_wait > 2000 {
+                            // [NEW] 最佳流派规则：粘性账号冷却时间超过阈值 (2s)，长等容易导致客户端超时，解绑并切换到空闲账号
+                            tracing::info!(
+                                "Sticky Session: Bound account {} requires long cooldown ({}ms > 2000ms), unbinding and switching.",
                                 bound_token.email,
-                                sid
+                                pacer_wait
+                            );
+                            self.session_accounts.remove(sid);
+                        } else if !attempted.contains(acc_id) {
+                            // 账号可用且未被标记为尝试失败，优先复用（若 wait <= 2000ms 会在返回前微等以保 Prompt Cache）
+                            tracing::debug!(
+                                "Sticky Session: Successfully reusing bound account {} for session {} (pacer_wait: {}ms)",
+                                bound_token.email,
+                                sid,
+                                pacer_wait
                             );
                             target_token = Some(bound_token.clone());
                         }
@@ -2467,7 +2491,10 @@ impl TokenManager {
                         if let Some(found) =
                             tokens_snapshot.iter().find(|t| &t.account_id == account_id)
                         {
+                            let pacer_wait = self.pacer.get_required_wait_ms(&found.account_id);
+                            let is_pacer_overlong = pacer_wait > 2000;
                             // 【修复】检查限流状态、小憩状态和配额保护，避免复用已被锁定的账号
+                            // [NEW] 最佳流派规则：如果上一次使用的账号冷却时间超过 2s，且号池中有其他已就绪账号，不强行锁定，放行给 P2C
                             if !self.pacer.is_in_nap(&found.account_id)
                                 && !self
                                     .is_rate_limited(&found.account_id, Some(&normalized_target))
@@ -2475,10 +2502,12 @@ impl TokenManager {
                                 && !(quota_protection_enabled
                                     && Self::is_model_quota_protected(&found.protected_models, target_model))
                                 && !self.is_concurrency_full(&found.account_id)
+                                && !is_pacer_overlong
                             {
                                 tracing::debug!(
-                                    "60s Window: Force reusing last account: {}",
-                                    found.email
+                                    "60s Window: Force reusing last account: {} (pacer_wait: {}ms)",
+                                    found.email,
+                                    pacer_wait
                                 );
                                 target_token = Some(found.clone());
                             } else {
@@ -2494,6 +2523,12 @@ impl TokenManager {
                                     tracing::debug!(
                                         "60s Window: Last account {} at concurrency cap, skipping",
                                         found.email
+                                    );
+                                } else if is_pacer_overlong {
+                                    tracing::debug!(
+                                        "60s Window: Last account {} cooldown overlong ({}ms > 2000ms), skipping to allow P2C rotation",
+                                        found.email,
+                                        pacer_wait
                                     );
                                 } else {
                                     tracing::debug!("60s Window: Last account {} is quota-protected for model {} [{}], skipping", found.email, normalized_target, target_model);

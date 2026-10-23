@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
 set -e
 
+export PATH="$HOME/.cargo/bin:$PATH"
+
 BUILD_DIR="/tmp/abv-build"
 SRC_DIR="/mnt/d/GOWorks/fanzhongli/Antigravity-Manager"
 
-echo "=== 同步源码 ==="
+mkdir -p "$BUILD_DIR"
+mkdir -p "$BUILD_DIR/src"
+
+echo "=== 同步源码与依赖 ==="
 rsync -a \
   --exclude 'node_modules' \
   --exclude 'dist' \
   --exclude 'target' \
   --exclude '.git' \
   "$SRC_DIR/src-tauri/" "$BUILD_DIR/src-tauri/"
+
+rsync -a "$SRC_DIR/src/locales" "$BUILD_DIR/src/"
+rsync -a "$SRC_DIR/dist" "$BUILD_DIR/"
 
 echo "=== 增量编译 Rust 二进制 ==="
 cd "$BUILD_DIR/src-tauri"

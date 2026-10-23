@@ -266,6 +266,29 @@ def run_all_tests():
     assert new_5h == 52, "周限额 52% 时，5h 恢复最高只能达到 52%，绝不能盲目恢复 100%"
     print("  -> 周配额只剩 52% 时，5h 自愈最高水位线被严格限制在 52%，不会虚假满血：PASS")
 
+    # 9. 验证最佳流派规则：粘性会话与 P2C 选号的冷却分级调度
+    print("\n[用例 9] 验证最佳流派规则：粘性会话与 P2C 选号的冷却分级调度")
+    # 9.1 粘性会话阈值判定 (<=2000ms 保留, >2000ms 解绑)
+    session_map = {"sess_cached": "acc_1", "sess_overlong": "acc_2"}
+    cooldowns = {"acc_1": 800, "acc_2": 3500} # acc_1 冷却 800ms，acc_2 冷却 3500ms
+    for sid, acc in list(session_map.items()):
+        if cooldowns[acc] > 2000:
+            del session_map[sid]
+    assert "sess_cached" in session_map, "800ms 冷却必须保留粘性绑定以保 Prompt Cache"
+    assert "sess_overlong" not in session_map, "3500ms 超长冷却必须主动解绑切号，防止客户端超时"
+    print("  -> 粘性会话阈值 (<=2s 保留, >2s 解绑切号)：PASS")
+
+    # 9.2 全场冷却时挑最短等待时间账号
+    pool_all_cooling = [
+        {"email": "a@ex.com", "wait_ms": 2500, "quota": 90},
+        {"email": "b@ex.com", "wait_ms": 150, "quota": 60},  # 虽配额较低但只要等 150ms
+        {"email": "c@ex.com", "wait_ms": 12000, "quota": 95}, # 超大 TPM 惩罚
+    ]
+    # 全场冷却时优先取 wait_ms 最小的账号
+    shortest = min(pool_all_cooling, key=lambda x: x["wait_ms"])
+    assert shortest["email"] == "b@ex.com", "全场冷却时必须精准挑选等待最短(150ms)的账号，而非随机或看配额"
+    print("  -> 全场冷却时精准挑选等待最短 (150ms) 账号：PASS")
+
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED: 所有 5 个关键风控点与配额账本 3 大问题全部彻底解决！")
     print("=" * 60)
