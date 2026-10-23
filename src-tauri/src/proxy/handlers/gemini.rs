@@ -85,6 +85,10 @@ pub async fn handle_generate(
         // debug!("[AutoConverter] Converting non-stream request to stream");
     }
 
+    // [TPM Protection] 预估输入 Token 规模，用于拟人化流控与大上下文阶梯延时降频
+    let estimated_prompt_tokens =
+        crate::proxy::mappers::context_manager::ContextManager::estimate_gemini_token_usage(&body);
+
     // 2. 获取 UpstreamClient 和 TokenManager
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
@@ -511,7 +515,7 @@ pub async fn handle_generate(
                     if let Some(p) = peak {
                         builder = builder.header("X-In-Flight-Peak", p.to_string());
                     }
-                    let pacer_guard = token_manager.begin_request_pacing(&account_id, None);
+                    let pacer_guard = token_manager.begin_request_pacing(&account_id, Some(estimated_prompt_tokens));
                     let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
                     let pacer_clone = pacer_arc.clone();
                     let stream_with_pacer = async_stream::stream! {
@@ -532,7 +536,7 @@ pub async fn handle_generate(
                     use crate::proxy::mappers::gemini::collector::collect_stream_to_json;
                     match collect_stream_to_json(Box::pin(stream), &s_id).await {
                         Ok(gemini_resp) => {
-                            token_manager.pacer.mark_request_completed(&account_id, None);
+                            token_manager.pacer.mark_request_completed(&account_id, Some(estimated_prompt_tokens));
                             info!(
                                 "[{}] ✓ Stream collected and converted to JSON (Gemini)",
                                 session_id
@@ -610,6 +614,7 @@ pub async fn handle_generate(
             }
 
             let unwrapped = unwrap_response(&gemini_resp);
+            token_manager.pacer.mark_request_completed(&account_id, Some(estimated_prompt_tokens));
             let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
             let headers = crate::proxy::account_inflight::account_headers(
                 &email,
