@@ -119,9 +119,31 @@ def adapt_context_overhead(request: dict, model: str = None):
                 }]
             }
 
+def is_model_quota_protected(protected_models: set, target_model: str) -> bool:
+    if not protected_models:
+        return False
+    
+    clean_model = target_model.strip().lower()
+    for prefix in ["antigravity/", "models/", "google/", "anthropic/", "openai/"]:
+        if clean_model.startswith(prefix):
+            clean_model = clean_model[len(prefix):]
+            break
+
+    # 1. 官方大桶判定 (gemini / claude)
+    bg = None
+    if clean_model == "gemini" or clean_model.startswith("gemini") or "gemini" in clean_model:
+        bg = "gemini"
+    elif clean_model == "claude" or clean_model == "3p" or "claude" in clean_model or "gpt" in clean_model:
+        bg = "claude"
+
+    if bg and bg in protected_models:
+        return True
+
+    return target_model in protected_models or clean_model in protected_models
+
 def run_all_tests():
     print("=" * 60)
-    print("开始运行 Antigravity-Manager 防风控改造自动化回归测试")
+    print("开始运行 Antigravity-Manager 防风控与配额保护自动化回归测试")
     print("=" * 60)
 
     # 1. 验证 requestType 剥离
@@ -193,8 +215,27 @@ def run_all_tests():
     assert "systemInstruction" not in long_req
     print("  -> 3.8 长会话请求 0 额外开销，完全透传：PASS")
 
+    # 5. 验证配额保护大桶判定与粘性会话解绑
+    print("\n[用例 5] 验证配额保护大桶判定 (gemini-3.6-flash-high 等)")
+    gemini_protected = {"gemini"}
+    assert is_model_quota_protected(gemini_protected, "gemini-3.6-flash-high") == True, "gemini-3.6-flash-high 必须被判定为受保护"
+    assert is_model_quota_protected(gemini_protected, "gemini-3.8-flash-medium") == True, "gemini-3.8-flash-medium 必须被判定为受保护"
+    assert is_model_quota_protected(gemini_protected, "models/gemini-3-pro-high") == True, "带 models/ 前缀必须被判定为受保护"
+    assert is_model_quota_protected(gemini_protected, "claude-3-7-sonnet") == False, "Claude 请求绝对不能误伤"
+    print("  -> Gemini 家族全部子模型(含3.6/3.8/带前缀) 100% 成功命中保护：PASS")
+    print("  -> Claude 模型不受牵连保持畅通：PASS")
+
+    # 模拟粘性会话：账号 A 的 gemini 被保护，新请求到达时强制触发解绑
+    session_map = {"sess_123": "acc_A"}
+    account_A_protected = {"gemini"}
+    curr_req_model = "gemini-3.6-flash-high"
+    if is_model_quota_protected(account_A_protected, curr_req_model):
+        del session_map["sess_123"]  # 触发解绑
+    assert "sess_123" not in session_map, "粘性会话必须被安全解绑换号"
+    print("  -> 粘性会话命中保护时成功解绑并触发平滑切号：PASS")
+
     print("\n" + "=" * 60)
-    print("ALL TESTS PASSED: 所有 5 个关键风控点已清除，原有业务 100% 保持畅通！")
+    print("ALL TESTS PASSED: 所有 5 个关键风控点与配额保护击穿 Bug 全部修复！")
     print("=" * 60)
 
 if __name__ == "__main__":

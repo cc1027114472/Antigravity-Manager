@@ -1691,6 +1691,41 @@ impl TokenManager {
         Ok(false)
     }
 
+    /// 权威判定：请求的目标模型是否属于受配额保护的大桶（gemini/claude）或具体模型
+    /// 自动剥离常见厂商路径前缀（如 models/，google/，antigravity/），支持三层梯级命中
+    pub fn is_model_quota_protected(
+        protected_models: &HashSet<String>,
+        target_model: &str,
+    ) -> bool {
+        if protected_models.is_empty() {
+            return false;
+        }
+
+        let mut clean_model = target_model.trim().to_lowercase();
+        for prefix in ["antigravity/", "models/", "google/", "anthropic/", "openai/"] {
+            if let Some(rest) = clean_model.strip_prefix(prefix) {
+                clean_model = rest.to_string();
+            }
+        }
+
+        // 1. 获取官方大桶 ID ("gemini" 或 "claude")
+        if let Some(bg) = crate::proxy::common::model_mapping::normalize_to_billing_group(&clean_model) {
+            if protected_models.contains(&bg) {
+                return true;
+            }
+        }
+
+        // 2. 获取标准规格 ID ("gemini-3-flash", "gemini-3-pro-high" 等)
+        if let Some(sid) = crate::proxy::common::model_mapping::normalize_to_standard_id(&clean_model) {
+            if protected_models.contains(&sid) {
+                return true;
+            }
+        }
+
+        // 3. 原始模型名 / 清洗后模型名直接命中
+        protected_models.contains(target_model) || protected_models.contains(&clean_model)
+    }
+
     /// P2C 算法的候选池大小 - 从前 N 个最优候选中随机选择
     const P2C_POOL_SIZE: usize = 5;
 
@@ -1717,7 +1752,7 @@ impl TokenManager {
             .iter()
             .filter(|t| !attempted.contains(&t.account_id))
             .filter(|t| {
-                !quota_protection_enabled || !t.protected_models.contains(normalized_target)
+                !quota_protection_enabled || !Self::is_model_quota_protected(&t.protected_models, normalized_target)
             })
             .collect();
 
@@ -2105,7 +2140,7 @@ impl TokenManager {
                             .is_rate_limited(&preferred_token.account_id, Some(&fine_target))
                             .await;
                         let is_quota_protected = quota_protection_enabled
-                            && preferred_token.protected_models.contains(&billing_target);
+                            && Self::is_model_quota_protected(&preferred_token.protected_models, target_model);
                         let is_concurrency_full =
                             self.is_concurrency_full(&preferred_token.account_id);
                         let is_napping = self.pacer.is_in_nap(&preferred_token.account_id);
@@ -2326,12 +2361,11 @@ impl TokenManager {
                             );
                             self.session_accounts.remove(sid);
                         } else if quota_protection_enabled
-                            && bound_token.protected_models.contains(&normalized_target)
+                            && Self::is_model_quota_protected(&bound_token.protected_models, target_model)
                         {
                             tracing::debug!(
-                                "Sticky Session: Bound account {} is quota-protected for model {} [{}], unbinding and switching.",
+                                "Sticky Session: Bound account {} is quota-protected for model {}, unbinding and switching.",
                                 bound_token.email,
-                                normalized_target,
                                 target_model
                             );
                             self.session_accounts.remove(sid);
@@ -2376,7 +2410,7 @@ impl TokenManager {
                                     .is_rate_limited(&found.account_id, Some(&normalized_target))
                                     .await
                                 && !(quota_protection_enabled
-                                    && found.protected_models.contains(&normalized_target))
+                                    && Self::is_model_quota_protected(&found.protected_models, target_model))
                                 && !self.is_concurrency_full(&found.account_id)
                             {
                                 tracing::debug!(
@@ -2527,7 +2561,7 @@ impl TokenManager {
                                         Some(&normalized_target),
                                     )
                                     && !(quota_protection_enabled
-                                        && t.protected_models.contains(&normalized_target))
+                                        && Self::is_model_quota_protected(&t.protected_models, target_model))
                             });
 
                             if let Some(t) = retry_token {
@@ -2546,11 +2580,11 @@ impl TokenManager {
                                 // 清除所有限流记录
                                 self.rate_limit_tracker.clear_all();
 
-                                // 再次尝试选择账号
+                                // 再次尝试选择账号（配额保护绝对不可被乐观重置绕过！）
                                 let final_token = tokens_snapshot.iter().find(|t| {
                                     !attempted.contains(&t.account_id)
                                         && !(quota_protection_enabled
-                                            && t.protected_models.contains(&normalized_target))
+                                            && Self::is_model_quota_protected(&t.protected_models, target_model))
                                 });
 
                                 if let Some(t) = final_token {
@@ -3193,11 +3227,8 @@ impl TokenManager {
             }
 
             // 2. 检查是否被配额保护(如果启用) — billing group keys
-            let billing = crate::proxy::common::model_mapping::normalize_to_billing_group(target_model)
-                .unwrap_or_else(|| target_model.to_string());
             if quota_protection_enabled
-                && (token.protected_models.contains(&billing)
-                    || token.protected_models.contains(target_model))
+                && Self::is_model_quota_protected(&token.protected_models, target_model)
             {
                 tracing::debug!(
                     "[Fallback Check] Account {} is quota-protected for model {}, skipping",
@@ -3848,8 +3879,7 @@ impl TokenManager {
             return false;
         }
         if quota_protection_enabled
-            && (token.protected_models.contains(&billing)
-                || token.protected_models.contains(model))
+            && Self::is_model_quota_protected(&token.protected_models, model)
         {
             return false;
         }
@@ -4143,7 +4173,7 @@ impl TokenManager {
                 .is_rate_limited(&token.account_id, Some(&normalized_target))
                 .await;
             let quota_protected =
-                quota_protection_enabled && token.protected_models.contains(&normalized_target);
+                quota_protection_enabled && Self::is_model_quota_protected(&token.protected_models, target_model);
             if rate_limited {
                 "rate_limit"
             } else if quota_protected {
