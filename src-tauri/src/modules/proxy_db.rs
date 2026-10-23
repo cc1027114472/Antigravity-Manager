@@ -15,11 +15,8 @@ fn connect_db() -> Result<Connection, String> {
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
 
-    // Set busy timeout to 1000ms: on a busy node, concurrent writers should
-    // fail fast and drop the log rather than pile up in the blocking pool
-    // (a 5s timeout under lock contention starved the spawn_blocking pool
-    // and hung the whole service on high-traffic nodes).
-    conn.pragma_update(None, "busy_timeout", 1000)
+    // Set busy timeout to 5000ms: give concurrent writers enough time to resolve
+    conn.pragma_update(None, "busy_timeout", 5000)
         .map_err(|e| e.to_string())?;
 
     // Synchronous NORMAL is faster and safe enough for WAL
@@ -454,8 +451,14 @@ pub fn limit_max_logs(max_count: usize) -> Result<usize, String> {
 
 pub fn clear_logs() -> Result<(), String> {
     let conn = connect_db()?;
-    conn.execute("DELETE FROM request_logs", [])
-        .map_err(|e| e.to_string())?;
+    // 优先采用 DROP TABLE + init_db：对已膨胀至数百MB或GB级的大库比逐行 DELETE 快数万倍，且避免锁死
+    conn.execute("DROP TABLE IF EXISTS request_logs", [])
+        .map_err(|e| format!("Failed to drop request_logs table: {}", e))?;
+    init_db()?;
+    // 强制截断 WAL 预写日志文件，彻底释放磁盘
+    let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+    // 释放未使用的空间
+    let _ = conn.execute("VACUUM", []);
     Ok(())
 }
 

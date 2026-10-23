@@ -476,8 +476,10 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             setLogs([]);
             setStats({ total_requests: 0, success_count: 0, error_count: 0 });
             setTotalCount(0);
-        } catch (e) {
+            pendingLogsRef.current = [];
+        } catch (e: any) {
             console.error("Failed to clear logs", e);
+            alert((t('monitor.dialog.clear_failed', { defaultValue: '清除日志失败: ' }) as string) + (e?.message || e));
         }
     };
 

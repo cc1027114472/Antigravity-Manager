@@ -296,17 +296,15 @@ impl ProxyMonitor {
         }
     }
 
-    pub async fn clear(&self) {
+    pub async fn clear(&self) -> Result<(), String> {
         let mut logs = self.logs.write().await;
         logs.clear();
         let mut stats = self.stats.write().await;
         *stats = ProxyStats::default();
 
-        let _ = tokio::task::spawn_blocking(|| {
-            if let Err(e) = crate::modules::proxy_db::clear_logs() {
-                tracing::error!("Failed to clear logs in DB: {}", e);
-            }
-        })
-        .await;
+        let res = tokio::task::spawn_blocking(crate::modules::proxy_db::clear_logs)
+            .await
+            .map_err(|e| format!("Spawn blocking failed: {}", e))?;
+        res
     }
 }

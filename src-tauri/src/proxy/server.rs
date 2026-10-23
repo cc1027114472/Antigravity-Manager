@@ -2090,15 +2090,22 @@ async fn admin_get_proxy_logs_count_filtered(
     }
 }
 
-async fn admin_clear_proxy_logs() -> impl IntoResponse {
-    let _ = tokio::task::spawn_blocking(|| {
-        if let Err(e) = proxy_db::clear_logs() {
-            logger::log_error(&format!("[API] 清除反代日志失败: {}", e));
+async fn admin_clear_proxy_logs(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    match state.monitor.clear().await {
+        Ok(()) => {
+            logger::log_info("[API] 已成功清除所有反代日志及 WAL 文件");
+            Ok(StatusCode::OK)
         }
-    })
-    .await;
-    logger::log_info("[API] 已清除所有反代日志");
-    StatusCode::OK
+        Err(e) => {
+            logger::log_error(&format!("[API] 清除反代日志失败: {}", e));
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            ))
+        }
+    }
 }
 
 async fn admin_get_proxy_log_detail(

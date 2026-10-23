@@ -1088,6 +1088,7 @@ impl TokenManager {
         let mut new_pct_5h = 0;
         let mut new_pct_weekly = 0;
         let mut should_protect = false;
+        let mut should_calibrate = false;
         let threshold = app_config.quota_protection.threshold_percentage as i32;
         let protection_on = app_config.quota_protection.enabled
             && app_config.quota_protection.monitored_models.iter().any(|m| {
@@ -1133,10 +1134,33 @@ impl TokenManager {
                 entry.model_quotas_weekly.insert(k, new_pct_weekly);
             }
 
-            // 双窗口检查：5小时 或 周限额 任一触及保护阈值，立刻触发保护（周限额优先）
+            // 双窗口检查：5小时 或 周限额 任一触及保护阈值
             let hit_5h = new_pct_5h <= threshold;
             let hit_weekly = new_pct_weekly <= threshold;
-            should_protect = protection_on && (hit_5h || hit_weekly);
+            let crossed_5h = current_5h > threshold && hit_5h;
+            let crossed_weekly = current_weekly > threshold && hit_weekly;
+            let crossed = crossed_5h || crossed_weekly;
+
+            let cooldown_key =
+                crate::modules::quota_ledger::threshold_calibrate_cooldown_key(&account_id, &std_id);
+            let now_ts = chrono::Utc::now().timestamp();
+            let in_cooldown = crate::modules::quota_ledger::is_calibrate_cooldown_active(
+                self.threshold_calibrate_cooldown
+                    .get(&cooldown_key)
+                    .map(|v| *v),
+                now_ts,
+                crate::modules::quota_ledger::THRESHOLD_CALIBRATE_COOLDOWN_SECS,
+            );
+
+            if protection_on && (hit_5h || hit_weekly) {
+                if crossed && !in_cooldown {
+                    // 首次跌破保护阈值且未冷却：延迟本地立即打死，立即触发官方在线校准获取真实额度
+                    should_calibrate = true;
+                    should_protect = false;
+                } else {
+                    should_protect = true;
+                }
+            }
 
             if should_protect {
                 entry.protected_models.insert(std_id.clone());
@@ -1156,14 +1180,15 @@ impl TokenManager {
             entry.remaining_quota = Some(new_pct_5h.min(new_pct_weekly));
 
             tracing::debug!(
-                "[QuotaLedger] burn account={} model={} -5h:{}% (->{}%) -weekly:{}% (->{}%) protect={}",
+                "[QuotaLedger] burn account={} model={} -5h:{}% (->{}%) -weekly:{}% (->{}%) protect={} calibrate={}",
                 account_id,
                 std_id,
                 burn_5h,
                 new_pct_5h,
                 burn_weekly,
                 new_pct_weekly,
-                should_protect
+                should_protect,
+                should_calibrate
             );
         } else {
             return;
@@ -1185,6 +1210,42 @@ impl TokenManager {
                 tracing::debug!("[QuotaLedger] persist burn failed: {}", e);
             }
         });
+
+        if should_calibrate {
+            let cooldown_key =
+                crate::modules::quota_ledger::threshold_calibrate_cooldown_key(&account_id, &std_id);
+            let now_ts = chrono::Utc::now().timestamp();
+            self.threshold_calibrate_cooldown
+                .insert(cooldown_key, now_ts);
+
+            tracing::info!(
+                "[QuotaLedger] Threshold cross → online calibrate: account={} group={} local_5h={}% local_weekly={}% threshold={}%",
+                account_id,
+                std_id,
+                new_pct_5h,
+                new_pct_weekly,
+                threshold
+            );
+
+            let account_id_c = account_id.clone();
+            let billing_c = std_id.clone();
+            let fallback_5h = new_pct_5h;
+            let fallback_w = new_pct_weekly;
+
+            if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                tauri::async_runtime::spawn(async move {
+                    tm.calibrate_on_threshold_cross(&account_id_c, &billing_c, fallback_5h, fallback_w)
+                        .await;
+                });
+            } else {
+                tracing::warn!(
+                    "[QuotaLedger] No shared TokenManager; falling back to local protect for {} / {}",
+                    account_id,
+                    std_id
+                );
+                self.apply_threshold_cross_protect_fallback(&account_id, &std_id, new_pct_5h, new_pct_weekly);
+            }
+        }
     }
 
     /// Apply local protect after a failed / unavailable threshold-cross calibrate.
@@ -1233,7 +1294,8 @@ impl TokenManager {
         &self,
         account_id: &str,
         billing_group: &str,
-        fallback_local_pct: i32,
+        fallback_5h: i32,
+        fallback_weekly: i32,
     ) {
         let (access_token, email) = match self.tokens.get(account_id) {
             Some(entry) => (entry.access_token.clone(), entry.email.clone()),
@@ -1245,8 +1307,8 @@ impl TokenManager {
                 self.apply_threshold_cross_protect_fallback(
                     account_id,
                     billing_group,
-                    fallback_local_pct,
-                    fallback_local_pct,
+                    fallback_5h,
+                    fallback_weekly,
                 );
                 return;
             }
@@ -1268,11 +1330,12 @@ impl TokenManager {
                                 .get(account_id)
                                 .and_then(|e| e.model_quotas.get(billing_group).copied());
                             tracing::info!(
-                                "[QuotaLedger] Threshold calibrate OK: account={} group={} official_pct={:?} (was local {}%)",
+                                "[QuotaLedger] Threshold calibrate OK: account={} group={} official_pct={:?} (was local 5h:{}% w:{}%)",
                                 account_id,
                                 billing_group,
                                 official,
-                                fallback_local_pct
+                                fallback_5h,
+                                fallback_weekly
                             );
                         }
                     }
@@ -1285,8 +1348,8 @@ impl TokenManager {
                         self.apply_threshold_cross_protect_fallback(
                             account_id,
                             billing_group,
-                            fallback_local_pct,
-                            fallback_local_pct,
+                            fallback_5h,
+                            fallback_weekly,
                         );
                     }
                 }
@@ -1301,8 +1364,8 @@ impl TokenManager {
                 self.apply_threshold_cross_protect_fallback(
                     account_id,
                     billing_group,
-                    fallback_local_pct,
-                    fallback_local_pct,
+                    fallback_5h,
+                    fallback_weekly,
                 );
             }
         }

@@ -423,7 +423,11 @@ pub async fn set_proxy_monitor_enabled(
 pub async fn clear_proxy_logs(state: State<'_, ProxyServiceState>) -> Result<(), String> {
     let monitor_lock = state.monitor.read().await;
     if let Some(monitor) = monitor_lock.as_ref() {
-        monitor.clear().await;
+        monitor.clear().await?;
+    } else {
+        tokio::task::spawn_blocking(crate::modules::proxy_db::clear_logs)
+            .await
+            .map_err(|e| format!("Spawn blocking failed: {}", e))??;
     }
     Ok(())
 }

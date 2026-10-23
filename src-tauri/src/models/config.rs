@@ -187,11 +187,11 @@ fn default_tokens_per_cu() -> f64 {
 }
 
 fn default_sprint_capacity_cu() -> f64 {
-    1800.0
+    2500.0
 }
 
 fn default_marathon_capacity_cu() -> f64 {
-    7200.0
+    12000.0
 }
 
 fn default_conservative_multiplier() -> f64 {
