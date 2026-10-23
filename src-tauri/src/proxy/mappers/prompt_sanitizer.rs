@@ -47,6 +47,7 @@ static RE_WAF_TRIGGER_HEADERS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
         r"(?im)^\s*(?:x-[a-z0-9_-]*billing[a-z0-9_-]*|[a-z0-9_-]+-billing-(?:header|metadata|token|info)):\s*[^\r\n]*(\r?\n)?",
         r"|^\s*x-[a-z0-9_-]+:\s*[^\r\n]*(?:cc_version|cc_entrypoint|cc_workload|cc_is_subagent|cc_prev_req|cc_prompt_id|cc_turn_origin|cch=)[^\r\n]*(\r?\n)?",
+        r"|(?im)^\s*(?:x-opencode|x-omp)-[a-z0-9_-]*:\s*[^\r\n]*(\r?\n)?",
         r"|(?i)x-anthropic-billing-header:\s*[^\r\n]*",
         r"|(?i)You are a Claude agent, built on Anthropic's Claude Agent SDK\.(\r?\n)?",
         r"|(?i)You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK\.(\r?\n)?"
@@ -116,18 +117,20 @@ static RE_IDENTITY_DECLARATION: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
-/// 知名特定客户端开场白正则（如 Claude Code CLI 开场白，仅在系统提示词头部窗口内生效）
+/// 知名特定客户端开场白正则（如 Claude Code CLI、OpenCode、Oh-My-Pi 开场白，仅在系统提示词头部窗口内生效）
 static RE_KNOWN_CLIENT_DECLARATION: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
         r"(?i)\b(?:you\s+are|you're)\s+claude\s+code[\s,，]+(?:anthropic's\s+)?official\s+cli\s+for\s+claude",
         r"(?:[\s,，]+running\s+within\s+(?:the\s+)?claude\s+agent\s+sdk)?",
+        r"|(?i)\b(?:you\s+are|you're)\s+opencode[\s,，]+(?:an?\s+)?(?:open\s+source\s+)?(?:ai\s+)?(?:coding\s+)?(?:agent|assistant)",
+        r"|(?i)\b(?:you\s+are|you're)\s+(?:oh[-_\s]my[-_\s]pi|omp)[\s,，]+(?:an?\s+)?(?:interactive\s+)?(?:ai\s+)?(?:coding\s+)?(?:agent|assistant)",
         r"([.,，。!?！？;；]?)"
     ))
     .unwrap()
 });
 
 /// 身份声明归一化的快速前置特征（命中任一才进入正则流程，规避 33k 级提示词的全量正则开销）
-const IDENTITY_FAST_MARKERS: [&str; 16] = [
+const IDENTITY_FAST_MARKERS: [&str; 20] = [
     "created by",
     "built by",
     "built on",
@@ -144,6 +147,10 @@ const IDENTITY_FAST_MARKERS: [&str; 16] = [
     "claude code",
     "claude agent",
     "anthropic",
+    "opencode",
+    "oh-my-pi",
+    "oh my pi",
+    "omp",
 ];
 
 /// Claude Agent SDK 注入的独立身份块（整串等值匹配）
@@ -458,6 +465,91 @@ impl PromptSanitizer {
             if idx != 0 {
                 let thought_part = parts.remove(idx);
                 parts.insert(0, thought_part);
+            }
+        }
+    }
+
+    /// 官方 Antigravity IDE 标准工作区环境上下文骨架
+    pub const OFFICIAL_WORKSPACE_CONTEXT_BLOCK: &str = concat!(
+        "\n<environment_permissions>\n",
+        "Execution of local read, write, and command inspection tools is granted within current workspace.\n",
+        "Absolute path formatting and atomic patch applications are enforced.\n",
+        "</environment_permissions>\n",
+        "<app_context>\n",
+        "Language Server: Active\n",
+        "Workspace Sync: Indexing Complete\n",
+        "</app_context>"
+    );
+
+    /// [OVERHEAD] 自适应上下文开销平衡：
+    /// 仅针对 3.8 / 3 系列模型且总字符数极小（< 1500 字符，约 300~400 Tokens）的超短冷启动请求，
+    /// 在 systemInstruction 中自适应注入轻量官方环境骨架，平滑流量画像，消除"裸 API 调度"行为特征。
+    /// 长会话或已有丰富上下文的请求 100% 原始透传，0 额外开销。
+    pub fn adapt_context_overhead(request: &mut Value, model: Option<&str>) {
+        let is_gemini_3 = model.map_or(false, |m| {
+            let lower = m.to_lowercase();
+            lower.contains("3.8") || lower.contains("gemini-3") || lower.contains("claude-3-5")
+        });
+
+        if !is_gemini_3 {
+            return;
+        }
+
+        let mut total_chars = 0;
+        if let Some(contents) = request.get("contents").and_then(Value::as_array) {
+            for c in contents {
+                if let Some(parts) = c.get("parts").and_then(Value::as_array) {
+                    for p in parts {
+                        if let Some(txt) = p.get("text").and_then(Value::as_str) {
+                            total_chars += txt.len();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 若总字符数超过 1500（属于正常长会话/已有上下文），绝对不注入，保持零开销
+        if total_chars > 1500 {
+            return;
+        }
+
+        // 若 systemInstruction 已经包含了官方环境块，不再重复注入
+        let mut need_injection = true;
+        if let Some(si) = request.get("systemInstruction") {
+            if let Some(parts) = si.get("parts").and_then(Value::as_array) {
+                for p in parts {
+                    if let Some(txt) = p.get("text").and_then(Value::as_str) {
+                        if txt.contains("<environment_permissions>") || txt.contains("<app_context>") {
+                            need_injection = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if need_injection {
+            if let Some(si) = request.get_mut("systemInstruction") {
+                if let Some(parts) = si.get_mut("parts").and_then(Value::as_array_mut) {
+                    if let Some(first_part) = parts.first_mut() {
+                        if let Some(txt) = first_part.get_mut("text") {
+                            if let Some(s) = txt.as_str() {
+                                *txt = json!(format!("{}{}", s, Self::OFFICIAL_WORKSPACE_CONTEXT_BLOCK));
+                            }
+                        }
+                    }
+                }
+            } else if let Some(req_obj) = request.as_object_mut() {
+                // 如果本来没有 systemInstruction，注入包含官方身份与环境骨架的 systemInstruction
+                req_obj.insert(
+                    "systemInstruction".to_string(),
+                    json!({
+                        "role": "system",
+                        "parts": [{
+                            "text": format!("{}{}", OFFICIAL_ANTIGRAVITY_IDENTITY, Self::OFFICIAL_WORKSPACE_CONTEXT_BLOCK)
+                        }]
+                    }),
+                );
             }
         }
     }
@@ -1188,5 +1280,89 @@ mod tests {
         );
         let normalized = PromptSanitizer::normalize_system_identity(raw);
         assert!(normalized.contains("Please always format all responses as valid JSON only."));
+    }
+
+    #[test]
+    fn test_normalize_identity_opencode_and_omp() {
+        // 验证 OpenCode 开场白归一化为官方身份
+        let opencode_raw = "You are OpenCode, an open source AI coding agent. Follow git discipline.";
+        let opencode_norm = PromptSanitizer::normalize_system_identity(opencode_raw);
+        assert!(opencode_norm.starts_with(OFFICIAL_ANTIGRAVITY_IDENTITY));
+        assert!(opencode_norm.contains("Follow git discipline."));
+
+        // 验证 Oh-My-Pi / OMP 开场白归一化为官方身份
+        let omp_raw = "You are Oh-My-Pi, an interactive AI coding assistant, and you must check tests.";
+        let omp_norm = PromptSanitizer::normalize_system_identity(omp_raw);
+        assert!(omp_norm.starts_with(OFFICIAL_ANTIGRAVITY_IDENTITY));
+        assert!(omp_norm.contains("and you must check tests."));
+    }
+
+    #[test]
+    fn test_clean_text_removes_opencode_omp_headers() {
+        let input = "x-opencode-trace-id: 12345\nx-omp-session-tag: live\nHere is legitimate code.";
+        let cleaned = PromptSanitizer::clean_text(input);
+        assert!(!cleaned.contains("x-opencode-trace-id"));
+        assert!(!cleaned.contains("x-omp-session-tag"));
+        assert!(cleaned.contains("Here is legitimate code."));
+    }
+
+    #[test]
+    fn test_enforce_tool_mutual_exclusion() {
+        use crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion;
+
+        // 混用场景：同时包含 functionDeclarations 与 googleSearch
+        let mut mixed = json!({
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        { "name": "edit_file", "description": "Edit code" }
+                    ]
+                },
+                {
+                    "googleSearch": {}
+                }
+            ]
+        });
+
+        enforce_tool_mutual_exclusion(&mut mixed);
+        let tools = mixed["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].get("functionDeclarations").is_some());
+        assert!(tools[0].get("googleSearch").is_none());
+
+        // 纯搜索场景：不含 functionDeclarations，googleSearch 完好保留
+        let mut pure_search = json!({
+            "tools": [
+                { "googleSearch": {} }
+            ]
+        });
+        enforce_tool_mutual_exclusion(&mut pure_search);
+        assert_eq!(pure_search["tools"].as_array().unwrap().len(), 1);
+        assert!(pure_search["tools"][0].get("googleSearch").is_some());
+    }
+
+    #[test]
+    fn test_adapt_context_overhead_short_request_vs_long_session() {
+        // 场景 1：3.8 模型的超短请求 -> 自适应注入官方环境骨架
+        let mut short_req = json!({
+            "contents": [
+                { "role": "user", "parts": [{ "text": "hello" }] }
+            ]
+        });
+        PromptSanitizer::adapt_context_overhead(&mut short_req, Some("gemini-3.8-pro-high"));
+        let si_text = short_req["systemInstruction"]["parts"][0]["text"].as_str().unwrap();
+        assert!(si_text.contains(OFFICIAL_ANTIGRAVITY_IDENTITY));
+        assert!(si_text.contains("<environment_permissions>"));
+        assert!(si_text.contains("<app_context>"));
+
+        // 场景 2：长会话请求 (文本 > 1500 字符) -> 0 额外开销，绝对不注入
+        let long_text = "A".repeat(2000);
+        let mut long_req = json!({
+            "contents": [
+                { "role": "user", "parts": [{ "text": long_text }] }
+            ]
+        });
+        PromptSanitizer::adapt_context_overhead(&mut long_req, Some("gemini-3.8-pro-high"));
+        assert!(long_req.get("systemInstruction").is_none());
     }
 }

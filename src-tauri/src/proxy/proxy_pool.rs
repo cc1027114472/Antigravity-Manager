@@ -174,7 +174,7 @@ impl ProxyPoolManager {
         timeout_secs: u64,
     ) -> Client {
         let mut builder = Client::builder()
-            .emulation(Emulation::Chrome123)
+            .emulation(Emulation::Chrome132)
             .timeout(Duration::from_secs(timeout_secs));
 
         // 尝试获取代理配置
@@ -831,9 +831,9 @@ impl ProxyPoolManager {
         // Residential proxies often need >10s; keep a bit of headroom for CONNECT + TLS.
         let client_result = Client::builder()
             .proxy(proxy_cfg.proxy)
-            .emulation(Emulation::Chrome123)
+            .emulation(Emulation::Chrome132)
             .timeout(Duration::from_secs(20))
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36")
             .build();
 
         let client = match client_result {

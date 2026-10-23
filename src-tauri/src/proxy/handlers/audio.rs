@@ -111,7 +111,6 @@ pub async fn handle_audio_transcription(
         "request": gemini_request,
         "model": model,
         "userAgent": "antigravity",
-        "requestType": "text"
     });
 
     // 8. 发送请求到 Gemini

@@ -863,10 +863,14 @@ pub fn wrap_request_v2(
         "request": reordered_inner,
         "model": config.final_model,
         "userAgent": official_user_agent,
-        "requestType": if is_agent_request { "agent" } else { "image_gen" },
         // [CACHE] requestId 移到末尾避免动态值破坏前缀字节一致性
         "requestId": official_request_id,
     });
+
+    // [DEFENSE] 3.8 网关严格校验：普通文本/Agent 请求绝不发送 requestType 包装字段
+    if !is_agent_request {
+        final_request_obj["requestType"] = json!("image_gen");
+    }
 
     if is_agent_request && enable_g1_credits {
         if let Some(obj) = final_request_obj.as_object_mut() {

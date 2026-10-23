@@ -1219,11 +1219,14 @@ pub fn transform_openai_request(
         "request": reordered_request,
         "model": config.final_model,
         "userAgent": "antigravity",
-        // [CHANGED v4.1.24] Use "agent" for all non-image requests (matches official client)
-        "requestType": if config.request_type == "image_gen" { "image_gen" } else { "agent" },
         // [CACHE] requestId 移到末尾避免动态 message_count 破坏前缀字节一致性
         "requestId": format!("agent/antigravity/{}/{}", &session_id[..session_id.len().min(8)], message_count),
     });
+
+    // [DEFENSE] 3.8 网关严格校验：普通文本/Agent 请求绝不发送 requestType 包装字段（官方不发送，发送会触发假性 429）
+    if config.request_type == "image_gen" {
+        final_body["requestType"] = json!("image_gen");
+    }
 
     // [CACHE:L3] 使用多层级缓存的 compute_prefix_hash 计算组合哈希
     // Layer 1 + Layer 2 的独立 hash 组合 → Layer 3 key

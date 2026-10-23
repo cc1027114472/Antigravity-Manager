@@ -112,6 +112,22 @@ impl UpstreamClient {
         }
     }
 
+    /// [WARMUP] 官方协议级 TLS / HTTP/2 预热：异步与上游端点建立 TLS 握手并保活长连接
+    /// 零模型推理消耗，不产生空对话探针，消除高频冷启动指纹并降低用户首字延迟 (TTFT)
+    pub async fn warmup_endpoints_async(&self) {
+        let client = self.default_client.read().await.clone();
+        tokio::spawn(async move {
+            for endpoint in V1_INTERNAL_BASE_URL_FALLBACKS {
+                let _ = client
+                    .head(endpoint)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await;
+            }
+            tracing::info!("Upstream endpoints TLS & HTTP/2 connection pool prewarmed");
+        });
+    }
+
     /// [HOT-RELOAD] Rebuild the default HTTP client using the supplied upstream
     /// proxy config. Called from `update_proxy` so changes to the upstream proxy
     /// take effect without restarting the app.
@@ -159,7 +175,7 @@ impl UpstreamClient {
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
     ) -> Result<Client, rquest::Error> {
         let mut builder = Client::builder()
-            .emulation(rquest_util::Emulation::Chrome123)
+            .emulation(rquest_util::Emulation::Chrome132)
             // Connection settings (优化连接复用，减少建立开销)
             .connect_timeout(Duration::from_secs(20))
             .pool_max_idle_per_host(20) // 每主机最多 20 个空闲连接 (对齐官方指纹)
@@ -190,7 +206,7 @@ impl UpstreamClient {
     ) -> Result<Client, rquest::Error> {
         // Reuse base settings similar to default client but with specific proxy
         let builder = Client::builder()
-            .emulation(rquest_util::Emulation::Chrome123)
+            .emulation(rquest_util::Emulation::Chrome132)
             .connect_timeout(Duration::from_secs(20))
             .pool_max_idle_per_host(20)
             .pool_idle_timeout(Duration::from_secs(90))
@@ -365,6 +381,36 @@ impl UpstreamClient {
                     &mut body,
                 );
             }
+        }
+
+        // [OVERHEAD] 自适应上下文开销平衡：对 3.8 超短请求注入官方环境上下文骨架
+        let model_opt = body.get("model").and_then(Value::as_str);
+        if method == "streamGenerateContent" || method == "generateContent" {
+            if let Some(inner) = body.get_mut("request") {
+                crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::adapt_context_overhead(
+                    inner,
+                    model_opt,
+                );
+            } else {
+                crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::adapt_context_overhead(
+                    &mut body,
+                    model_opt,
+                );
+            }
+        }
+
+        // [DEFENSE] 3.8 网关严格校验：普通文本/Agent 请求绝不发送非官方包装字段（仅保留真实的 image_gen）
+        if let Some(obj) = body.as_object_mut() {
+            if obj.get("requestType").and_then(|v| v.as_str()) != Some("image_gen") {
+                obj.remove("requestType");
+            }
+        }
+
+        // [DEFENSE] 3.8 网关严格校验：工具链互斥物理收敛（functionDeclarations 存在时物理剥离 googleSearch）
+        if let Some(inner) = body.get_mut("request") {
+            crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(inner);
+        } else {
+            crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(&mut body);
         }
 
         // [NEW] Get client based on account (cached in proxy pool manager)

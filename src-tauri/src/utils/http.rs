@@ -19,7 +19,7 @@ pub static SHARED_STANDARD_CLIENT_LONG: Lazy<Client> = Lazy::new(|| create_stand
 /// Base client creation logic with JA3 Emulation
 fn create_base_client(timeout_secs: u64) -> Client {
     let mut builder = Client::builder()
-        .emulation(Emulation::Chrome123)
+        .emulation(Emulation::Chrome132)
         .timeout(std::time::Duration::from_secs(timeout_secs));
 
     if let Ok(config) = load_app_config() {

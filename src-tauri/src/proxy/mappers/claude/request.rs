@@ -700,9 +700,13 @@ pub fn transform_claude_request_in(
         "request": inner_request,
         "model": config.final_model,
         "userAgent": "antigravity",
-        // [CHANGED v4.1.24] Use "agent" for all non-image requests
-        "requestType": if config.request_type == "image_gen" { "image_gen" } else { "agent" },
     });
+
+    // [DEFENSE] 3.8 网关严格校验：普通文本/Agent 请求绝不发送 requestType 包装字段（官方不发送，发送会触发假性 429）
+    // 仅当明确为图像生成时才保留 "image_gen"
+    if config.request_type == "image_gen" {
+        body["requestType"] = json!("image_gen");
+    }
 
     // 如果提供了 metadata.user_id，则复用为 sessionId
     if let Some(metadata) = &claude_req.metadata {

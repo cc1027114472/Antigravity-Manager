@@ -27,10 +27,15 @@ pub fn build_official_style_system_instruction(
 ) -> String {
     let mut sections = ContextSections::default();
 
-    sections.user_information.push(format!(
-        "Request type: {}\nMapped model: {}\nSession ID: {}",
-        request_type, mapped_model, session_id
-    ));
+    let user_info_str = if request_type == "image_gen" {
+        format!(
+            "Request type: image_gen\nMapped model: {}\nSession ID: {}",
+            mapped_model, session_id
+        )
+    } else {
+        format!("Mapped model: {}\nSession ID: {}", mapped_model, session_id)
+    };
+    sections.user_information.push(user_info_str);
 
     if let Some(prompt) = global_prompt.map(str::trim).filter(|s| !s.is_empty()) {
         sections.customizations.push(prompt.to_string());

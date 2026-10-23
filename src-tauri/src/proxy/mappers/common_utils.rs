@@ -405,6 +405,50 @@ pub fn inject_google_search_tool(body: &mut Value, mapped_model: Option<&str>) {
     }
 }
 
+/// [DEFENSE] 3.8 网关严格铁律：functionDeclarations 与 googleSearch 绝对互斥
+/// 当 tools 中存在自定义函数调用时，物理剔除所有 googleSearch / googleSearchRetrieval 声明；
+/// 若清洗后 tools 数组为空，物理移出 tools 键，杜绝上游报 400 格式错误或触发伪 429。
+pub fn enforce_tool_mutual_exclusion(request: &mut Value) {
+    if let Some(obj) = request.as_object_mut() {
+        if let Some(tools_val) = obj.get_mut("tools") {
+            if let Some(tools_arr) = tools_val.as_array_mut() {
+                let has_functions = tools_arr.iter().any(|t| {
+                    t.as_object().map_or(false, |o| {
+                        o.get("functionDeclarations")
+                            .and_then(|v| v.as_array())
+                            .map_or(false, |arr| !arr.is_empty())
+                    })
+                });
+
+                if has_functions {
+                    tools_arr.retain(|t| {
+                        if let Some(o) = t.as_object() {
+                            !(o.contains_key("googleSearch") || o.contains_key("googleSearchRetrieval"))
+                        } else {
+                            true
+                        }
+                    });
+                }
+
+                // 移除空对象
+                tools_arr.retain(|t| {
+                    if let Some(o) = t.as_object() {
+                        !o.is_empty()
+                    } else {
+                        true
+                    }
+                });
+            }
+
+            // 如果 tools 数组已经变空，直接移出 tools 键
+            let is_empty = tools_val.as_array().map_or(false, |arr| arr.is_empty());
+            if is_empty {
+                obj.remove("tools");
+            }
+        }
+    }
+}
+
 /// 深度迭代清理客户端发送的 [undefined] 脏字符串，防止 Gemini 接口校验失败
 pub fn deep_clean_undefined(value: &mut Value, depth: usize) {
     if depth > 10 {
