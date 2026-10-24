@@ -883,12 +883,9 @@ pub async fn check_proxy_health(
     state: State<'_, ProxyServiceState>,
 ) -> Result<ProxyPoolConfig, String> {
     let axum = state.resolve_axum_server().await?;
-    let pool_state = axum.proxy_pool_state.clone();
-    let manager = crate::proxy::proxy_pool::ProxyPoolManager::new(pool_state.clone());
+    axum.proxy_pool_manager.health_check().await?;
 
-    manager.health_check().await?;
-
-    let config = pool_state.read().await;
+    let config = axum.proxy_pool_state.read().await;
     Ok(config.clone())
 }
 

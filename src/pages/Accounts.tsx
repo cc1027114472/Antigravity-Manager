@@ -14,7 +14,7 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AccountDetailsDialog from "../components/accounts/AccountDetailsDialog";
 import AccountGrid from "../components/accounts/AccountGrid";
 import AccountTable from "../components/accounts/AccountTable";
@@ -308,35 +308,43 @@ function Accounts() {
     fetchAccounts();
   }, []);
 
-  useEffect(() => {
-    const loadPoolMeta = async () => {
-      try {
-        const [bindings, poolCfg, serial, usage] = await Promise.all([
-          invoke<Record<string, string>>("get_all_account_bindings").catch(() => ({})),
-          invoke<{ proxies?: Array<{ id: string; name?: string }> }>("get_proxy_pool_config").catch(() => null),
-          invoke<{ enabled?: boolean; current_account_id?: string | null }>("get_serial_pool").catch(() => null),
-          invoke<Record<string, string>>("get_proxy_egress_usage").catch(() => ({})),
-        ]);
-        setProxyBindings(bindings || {});
-        const names: Record<string, string> = {};
-        for (const p of poolCfg?.proxies || []) {
-          names[p.id] = p.name || p.id.slice(0, 8);
+  const loadPoolMeta = useCallback(async () => {
+    try {
+      const [bindings, poolCfg, serial, usage] = await Promise.all([
+        invoke<Record<string, string>>("get_all_account_bindings").catch(() => ({})),
+        invoke<{ proxies?: Array<{ id: string; name?: string; is_healthy?: boolean }> }>("get_proxy_pool_config").catch(() => null),
+        invoke<{ enabled?: boolean; current_account_id?: string | null }>("get_serial_pool").catch(() => null),
+        invoke<Record<string, string>>("get_proxy_egress_usage").catch(() => ({})),
+      ]);
+      setProxyBindings(bindings || {});
+      const names: Record<string, string> = {};
+      const effectiveUsage: Record<string, string> = { ...(usage || {}) };
+      for (const p of poolCfg?.proxies || []) {
+        names[p.id] = p.name || p.id.slice(0, 8);
+        if (p.is_healthy === false) {
+          effectiveUsage[p.id] = "failed";
+        } else if (p.is_healthy === true) {
+          // 当代理池健康检测通过时，同步重置为 ok
+          effectiveUsage[p.id] = "ok";
         }
-        setProxyNames(names);
-        setProxyUsageStatus(usage || {});
-        if (serial?.enabled && serial.current_account_id) {
-          setSerialCursorId(serial.current_account_id);
-        } else {
-          setSerialCursorId(null);
-        }
-      } catch {
-        // proxy service may be down
       }
-    };
+      setProxyNames(names);
+      setProxyUsageStatus(effectiveUsage);
+      if (serial?.enabled && serial.current_account_id) {
+        setSerialCursorId(serial.current_account_id);
+      } else {
+        setSerialCursorId(null);
+      }
+    } catch {
+      // proxy service may be down
+    }
+  }, []);
+
+  useEffect(() => {
     loadPoolMeta();
     const timer = setInterval(loadPoolMeta, 15000);
     return () => clearInterval(timer);
-  }, []);
+  }, [loadPoolMeta]);
 
   // Reset pagination when view mode changes to avoid empty pages or confusion
   useEffect(() => {
@@ -493,8 +501,6 @@ function Accounts() {
     });
     try {
       await refreshQuota(accountId);
-      await refreshQuota(accountId);
-      await refreshQuota(accountId);
       showToast(t("common.success"), "success");
     } catch (error) {
       showToast(`${t("common.error")}: ${error}`, "error");
@@ -504,6 +510,7 @@ function Accounts() {
         next.delete(accountId);
         return next;
       });
+      loadPoolMeta();
     }
   };
 

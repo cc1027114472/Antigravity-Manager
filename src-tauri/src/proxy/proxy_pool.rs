@@ -917,14 +917,27 @@ impl ProxyPoolManager {
             .await;
 
         // 统一更新状态
-        let mut config = self.config.write().await;
-        for (id, is_healthy, latency) in results {
-            if let Some(proxy) = config.proxies.iter_mut().find(|p| p.id == id) {
-                proxy.is_healthy = is_healthy;
-                proxy.latency = latency;
-                proxy.last_check_time = Some(chrono::Utc::now().timestamp());
+        {
+            let mut config = self.config.write().await;
+            for (id, is_healthy, latency) in &results {
+                if let Some(proxy) = config.proxies.iter_mut().find(|p| &p.id == id) {
+                    proxy.is_healthy = *is_healthy;
+                    proxy.latency = *latency;
+                    proxy.last_check_time = Some(chrono::Utc::now().timestamp());
+                }
             }
         }
+        for (id, is_healthy, _) in &results {
+            self.egress_usage.insert(
+                id.clone(),
+                if *is_healthy {
+                    EgressUsageStatus::Ok
+                } else {
+                    EgressUsageStatus::Failed
+                },
+            );
+        }
+        self.persist_config().await;
 
         Ok(())
     }
