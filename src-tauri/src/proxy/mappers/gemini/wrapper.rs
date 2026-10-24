@@ -1112,19 +1112,42 @@ async fn try_compress_gemini_with_summary(
         token_obj.as_ref(),
     );
 
+    let pool = crate::proxy::proxy_pool::get_global_proxy_pool()
+        .ok_or_else(|| "Proxy pool not initialized".to_string())?;
+
+    let (client, route) = pool
+        .get_effective_standard_client_with_route(Some(account_id), 60)
+        .await;
+
+    if route == crate::proxy::proxy_pool::EgressRoute::Direct {
+        return Err(format!(
+            "严格代理策略拦截：账号 {} 未绑定健康代理或代理不通 (RED)，Layer-3 摘要生成禁止直连！",
+            account_id
+        ));
+    }
+
     let upstream_url = format!(
         "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal/projects/{}/locations/global/models/{}:generateContent",
         project_id, INTERNAL_BACKGROUND_TASK
     );
 
-    let response = reqwest::Client::new()
+    let response = client
         .post(&upstream_url)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
         .json(&wrapped_summary_body)
         .send()
         .await
-        .map_err(|e| format!("API call failed: {}", e))?;
+        .map_err(|e| {
+            if let crate::proxy::proxy_pool::EgressRoute::Pool { ref entry_id } = route {
+                let pool_clone = std::sync::Arc::clone(&pool);
+                let pid = entry_id.clone();
+                tokio::spawn(async move {
+                    pool_clone.mark_proxy_unhealthy(&pid).await;
+                });
+            }
+            format!("API call failed: {}", e)
+        })?;
 
     if !response.status().is_success() {
         return Err(format!(

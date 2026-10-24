@@ -153,6 +153,18 @@ async fn fetch_project_id(
     email: &str,
     account_id: Option<&str>,
 ) -> (Option<String>, Option<String>) {
+    if let Some(id) = account_id {
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            if !pool.is_account_proxy_available(id).await {
+                crate::modules::logger::log_warn(&format!(
+                    "严格代理策略拦截：账号 {} 未绑定健康代理或代理不通 (RED)，跳过 loadCodeAssist 探测",
+                    email
+                ));
+                return (None, None);
+            }
+        }
+    }
+
     let client = create_standard_client(account_id).await;
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
 
@@ -258,6 +270,17 @@ pub async fn fetch_quota_with_cache(
     account_id: Option<&str>,
 ) -> crate::error::AppResult<(QuotaData, Option<String>)> {
     use crate::error::AppError;
+
+    // [STRICT PROXY] 严格代理策略拦截：若账号未绑定健康代理或代理不通，严禁直连，直接返回错误！
+    if let Some(id) = account_id {
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            if !pool.is_account_proxy_available(id).await {
+                let err_msg = format!("严格代理策略拦截：账号 {} 未绑定健康代理或代理不通 (RED)，严禁本地直连！已跳过刷新该账号配额。", email);
+                crate::modules::logger::log_warn(&err_msg);
+                return Err(AppError::Network(err_msg, None));
+            }
+        }
+    }
 
     // Optimization: Skip loadCodeAssist call if project_id is cached to save API quota
     let (project_id, subscription_tier) = if let Some(pid) = cached_project_id {
@@ -439,6 +462,17 @@ pub async fn fetch_quota_with_cache(
                         "Quota API request failed at {}: {}",
                         ep_url, e
                     ));
+                    if let Some(id) = account_id {
+                        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                            let pool_clone = Arc::clone(&pool);
+                            let acc_id_owned = id.to_string();
+                            tokio::spawn(async move {
+                                if let Ok(Some(cfg)) = pool_clone.get_proxy_for_account(&acc_id_owned).await {
+                                    pool_clone.mark_proxy_unhealthy(&cfg.entry_id).await;
+                                }
+                            });
+                        }
+                    }
                     last_error = Some(AppError::from(e));
                     if has_next {
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -464,6 +498,14 @@ async fn fetch_quota_summary(
     project_id: Option<&str>,
     account_id: Option<&str>,
 ) -> Option<Vec<crate::models::quota::QuotaGroup>> {
+    if let Some(id) = account_id {
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            if !pool.is_account_proxy_available(id).await {
+                return None;
+            }
+        }
+    }
+
     let client = create_standard_client(account_id).await;
     let payload = if let Some(pid) = project_id {
         json!({ "project": pid })

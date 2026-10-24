@@ -144,6 +144,17 @@ impl AutoRecoveryScheduler {
 
     /// Probe an account to determine if its 429/quota block has cleared.
     pub async fn probe_account(&self, account_id: &str, email: &str) -> Result<bool, String> {
+        // [STRICT PROXY] 检查账号代理是否可用，若代理不健康则跳过探测，严禁直连
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            if !pool.is_account_proxy_available(account_id).await {
+                tracing::debug!(
+                    "[AutoRecovery] Account {} ({}) proxy is not healthy or unavailable (RED), skipping probe",
+                    account_id, email
+                );
+                return Ok(false);
+            }
+        }
+
         let (token_mgr, upstream) = {
             let tm_guard = self.token_manager.read().await;
             let up_guard = self.upstream.read().await;

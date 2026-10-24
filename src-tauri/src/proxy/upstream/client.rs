@@ -247,8 +247,9 @@ impl UpstreamClient {
     }
 
     /// Get client for a specific account (or default if no proxy bound).
-    /// Returns `(client, Some(proxy_id))` when a pool proxy is used; `None` for direct/upstream default.
-    pub async fn get_client(&self, account_id: Option<&str>) -> (Client, Option<String>) {
+    /// Returns `(client, Some(proxy_id))` when a pool proxy is used; `None` for upstream default.
+    /// [STRICT POLICY] Direct connection is strictly forbidden for account requests!
+    pub async fn get_client(&self, account_id: Option<&str>) -> Result<(Client, Option<String>), String> {
         if let Some(pool) = &self.proxy_pool {
             if let Some(acc_id) = account_id {
                 // Try to get per-account proxy
@@ -257,7 +258,7 @@ impl UpstreamClient {
                         let entry_id = proxy_cfg.entry_id.clone();
                         // Check cache
                         if let Some(client) = self.client_cache.get(&entry_id) {
-                            return (client.clone(), Some(entry_id));
+                            return Ok((client.clone(), Some(entry_id)));
                         }
                         // Build new client and cache it
                         match self.build_client_with_proxy(proxy_cfg.clone()) {
@@ -269,33 +270,58 @@ impl UpstreamClient {
                                     entry_id,
                                     acc_id
                                 );
-                                return (client, Some(entry_id));
+                                return Ok((client, Some(entry_id)));
                             }
                             Err(e) => {
-                                tracing::error!("Failed to build client for proxy {}: {}, falling back to default", entry_id, e);
-                                // Building the client failed before send — treat as egress failure.
+                                tracing::error!("Failed to build client for proxy {}: {}, strict policy: refuse direct", entry_id, e);
                                 pool.record_egress_usage(
                                     &entry_id,
                                     crate::proxy::proxy_pool::EgressUsageStatus::Failed,
                                 );
+                                let pool_clone = Arc::clone(pool);
+                                let eid = entry_id.clone();
+                                tokio::spawn(async move {
+                                    pool_clone.mark_proxy_unhealthy(&eid).await;
+                                });
+                                return Err(format!("代理节点 {} 构建失败且禁止直连: {}", entry_id, e));
                             }
                         }
                     }
                     Ok(None) => {
-                        // No proxy found or required for this account, use default
+                        // 账号未匹配到可用代理（或绑定的代理不健康/禁用）
+                        // 严格模式检查：如果有配置并启用的全局上游代理，允许使用上游代理
+                        if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+                            let up = app_cfg.proxy.upstream_proxy;
+                            if up.enabled && !up.url.is_empty() {
+                                tracing::info!("[UpstreamClient] Account {} fallback to global upstream proxy: {}", acc_id, up.url);
+                                return Ok((self.default_client.read().await.clone(), None));
+                            }
+                        }
+                        let err_msg = format!("严格代理策略拦截：账号 {} 未绑定健康代理或代理不通 (RED)，严禁本地直连！请先配置或修复代理。", acc_id);
+                        tracing::error!("[UpstreamClient] {}", err_msg);
+                        return Err(err_msg);
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "Error getting proxy for account {}: {}, falling back to default",
-                            acc_id,
-                            e
-                        );
+                        let err_msg = format!("获取账号 {} 的代理配置失败: {}", acc_id, e);
+                        tracing::error!("[UpstreamClient] {}", err_msg);
+                        return Err(err_msg);
                     }
                 }
             }
         }
-        // Fallback to default client
-        (self.default_client.read().await.clone(), None)
+
+        // Generic request without account_id
+        if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+            let up = app_cfg.proxy.upstream_proxy;
+            if up.enabled && !up.url.is_empty() {
+                return Ok((self.default_client.read().await.clone(), None));
+            }
+        }
+        if account_id.is_some() {
+            return Err("严格代理策略拦截：未检测到任何健康代理或上游代理，严禁本地直连！".to_string());
+        }
+        // Fallback to default client for generic non-account requests
+        Ok((self.default_client.read().await.clone(), None))
     }
 
     /// True when the error is an egress/transport failure (not an HTTP application status).
@@ -317,6 +343,9 @@ impl UpstreamClient {
     fn record_egress_outcome(&self, proxy_id: Option<&str>, status: crate::proxy::proxy_pool::EgressUsageStatus) {
         if let (Some(pool), Some(id)) = (&self.proxy_pool, proxy_id) {
             pool.record_egress_usage(id, status);
+            if status == crate::proxy::proxy_pool::EgressUsageStatus::Failed {
+                self.client_cache.remove(id);
+            }
         }
     }
 
@@ -414,7 +443,7 @@ impl UpstreamClient {
         }
 
         // [NEW] Get client based on account (cached in proxy pool manager)
-        let (client, egress_proxy_id) = self.get_client(account_id).await;
+        let (client, egress_proxy_id) = self.get_client(account_id).await?;
 
         // 构建 Headers (所有端点复用)
         let mut headers = header::HeaderMap::new();
@@ -624,6 +653,13 @@ impl UpstreamClient {
                                 egress_proxy_id.as_deref(),
                                 crate::proxy::proxy_pool::EgressUsageStatus::Failed,
                             );
+                            if let (Some(pool), Some(ref id)) = (&self.proxy_pool, &egress_proxy_id) {
+                                let pool_clone = Arc::clone(pool);
+                                let proxy_id_str = id.clone();
+                                tokio::spawn(async move {
+                                    pool_clone.mark_proxy_unhealthy(&proxy_id_str).await;
+                                });
+                            }
                         }
                         let msg = format!("HTTP request failed at {}: {}", base_url, e);
                         tracing::debug!("{}", msg);

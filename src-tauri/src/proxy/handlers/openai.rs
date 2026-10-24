@@ -5425,21 +5425,44 @@ async fn call_openai_gemini_sync(
     let (gemini_body, _, _, _) =
         transform_openai_request(request, &project_id, &session_id, token_obj.as_ref());
 
+    let pool = crate::proxy::proxy_pool::get_global_proxy_pool()
+        .ok_or_else(|| "Proxy pool not initialized".to_string())?;
+
+    let (client, route) = pool
+        .get_effective_standard_client_with_route(Some(&account_id), 60)
+        .await;
+
+    if route == crate::proxy::proxy_pool::EgressRoute::Direct {
+        return Err(format!(
+            "严格代理策略拦截：账号 {} 未绑定健康代理或代理不通 (RED)，Layer-3 摘要生成禁止直连！",
+            account_id
+        ));
+    }
+
     let upstream_url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
         model
     );
 
-    debug!("[{}] [OpenAI-BG] Calling Gemini API: {}", trace_id, model);
+    debug!("[{}] [OpenAI-BG] Calling Gemini API via proxy ({:?}): {}", trace_id, route, model);
 
-    let response = reqwest::Client::new()
+    let response = client
         .post(&upstream_url)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
         .json(&gemini_body)
         .send()
         .await
-        .map_err(|e| format!("API call failed: {}", e))?;
+        .map_err(|e| {
+            if let crate::proxy::proxy_pool::EgressRoute::Pool { ref entry_id } = route {
+                let pool_clone = Arc::clone(&pool);
+                let pid = entry_id.clone();
+                tokio::spawn(async move {
+                    pool_clone.mark_proxy_unhealthy(&pid).await;
+                });
+            }
+            format!("API call failed: {}", e)
+        })?;
 
     if !response.status().is_success() {
         return Err(format!(

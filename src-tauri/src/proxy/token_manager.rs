@@ -2044,19 +2044,36 @@ impl TokenManager {
                 || t.model_quotas.contains_key(target_model)
         });
 
+        // [STRICT PROXY] 严格代理过滤：剔除所有未配置健康代理或代理不通 (RED) 的账号，绝不允许无代理直连
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            let mut proxy_available_tokens = Vec::with_capacity(tokens_snapshot.len());
+            for t in tokens_snapshot {
+                if pool.is_account_proxy_available(&t.account_id).await {
+                    proxy_available_tokens.push(t);
+                } else {
+                    tracing::warn!(
+                        "[Strict Proxy] 账号 {} ({}) 绑定的代理不通或未配置可用代理 (RED)，已移出候选池并跳过",
+                        t.email,
+                        t.account_id
+                    );
+                }
+            }
+            tokens_snapshot = proxy_available_tokens;
+        }
+
         if tokens_snapshot.is_empty() {
             if candidate_count_before > 0 {
                 tracing::warn!(
-                    "No accounts have satisfied quota for billing group: {} (model: {})",
+                    "No accounts have satisfied quota and healthy proxy for billing group: {} (model: {})",
                     billing_target,
                     target_model
                 );
                 return Err(format!(
-                    "No accounts available with quota for model: {}",
+                    "无可用账号：账号配额耗尽或代理不通 (RED) (model: {})",
                     target_model
                 ));
             }
-            return Err("Token pool is empty".to_string());
+            return Err("Token pool is empty or all proxies are UNHEALTHY (RED)".to_string());
         }
 
         tokens_snapshot.sort_by(|a, b| {
@@ -2221,8 +2238,13 @@ impl TokenManager {
                         let is_concurrency_full =
                             self.is_concurrency_full(&preferred_token.account_id);
                         let is_napping = self.pacer.is_in_nap(&preferred_token.account_id);
+                        let is_proxy_available = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                            pool.is_account_proxy_available(&preferred_token.account_id).await
+                        } else {
+                            true
+                        };
 
-                        if !is_rate_limited && !is_quota_protected && !is_concurrency_full && !is_napping {
+                        if !is_rate_limited && !is_quota_protected && !is_concurrency_full && !is_napping && is_proxy_available {
                             tracing::info!(
                                 "🔒 [FIX #820] Using preferred account: {} (fixed mode)",
                                 preferred_token.email
@@ -3132,6 +3154,16 @@ impl TokenManager {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
 
+        // [STRICT PROXY] 检查代理是否健康可用
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            if !pool.is_account_proxy_available(&account_id).await {
+                return Err(format!(
+                    "严格代理策略拦截：账号 {} 绑定的代理不可用或不通 (RED)，严禁直连，已跳过此账号",
+                    email
+                ));
+            }
+        }
+
         // 检查是否过期 (提前5分钟)
         if now < timestamp + expires_in - 300 {
             return Ok((
@@ -3948,6 +3980,17 @@ impl TokenManager {
         match Self::get_account_state_on_disk(&token.account_path).await {
             OnDiskAccountState::Disabled | OnDiskAccountState::Unknown => return false,
             OnDiskAccountState::Enabled => {}
+        }
+
+        // [STRICT PROXY] 严格代理检查：若代理不通或未配置可用代理，串行推进跳过该账号
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            if !pool.is_account_proxy_available(&token.account_id).await {
+                tracing::debug!(
+                    "[SerialPool] 账号 {} 代理不健康或未配置可用代理 (RED)，串行推进跳过",
+                    token.email
+                );
+                return false;
+            }
         }
 
         if require_proxy_binding {

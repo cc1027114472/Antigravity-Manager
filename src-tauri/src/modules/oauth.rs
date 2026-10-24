@@ -537,6 +537,17 @@ async fn refresh_access_token_once(
             crate::proxy::proxy_pool::EgressRoute::from_app_upstream_fallback(),
         )
     };
+
+    // [STRICT PROXY] 若针对具体账号刷新，但未能匹配到任何代理（egress == Direct），严禁直连，直接返回错误！
+    if account_id.is_some() && egress == crate::proxy::proxy_pool::EgressRoute::Direct {
+        let msg = format!(
+            "严格代理策略拦截：账号 {:?} 绑定的代理不通或未配置可用代理 (RED)，严禁本地直连！",
+            account_id
+        );
+        crate::modules::logger::log_error(&msg);
+        return Err((None, msg));
+    }
+
     let prefix = egress.error_prefix();
 
     let params = [
@@ -574,11 +585,19 @@ async fn refresh_access_token_once(
         .send()
         .await
         .map_err(|e| {
+            if let crate::proxy::proxy_pool::EgressRoute::Pool { ref entry_id } = egress {
+                if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                    let pid = entry_id.clone();
+                    tokio::spawn(async move {
+                        pool.mark_proxy_unhealthy(&pid).await;
+                    });
+                }
+            }
             if e.is_connect() || e.is_timeout() {
                 (
                     None,
                     format!(
-                        "{} Refresh request failed: {}. 无法连接 Google 授权服务器，请检查代理设置。",
+                        "{} Refresh request failed: {}. 无法连接 Google 授权服务器，代理已标记为异常 (RED)。",
                         prefix, e
                     ),
                 )
@@ -684,6 +703,14 @@ pub async fn get_user_info(
     access_token: &str,
     account_id: Option<&str>,
 ) -> Result<UserInfo, String> {
+    if let Some(id) = account_id {
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            if !pool.is_account_proxy_available(id).await {
+                return Err(format!("严格代理策略拦截：账号 {} 未绑定健康代理或代理不通 (RED)，禁止直连获取用户信息", id));
+            }
+        }
+    }
+
     let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
         pool.get_effective_client(account_id, 15).await
     } else {

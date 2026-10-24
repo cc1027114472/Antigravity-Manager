@@ -8,6 +8,14 @@ pub async fn fetch_project_id(
     access_token: &str,
     account_id: Option<&str>,
 ) -> Result<String, String> {
+    if let Some(id) = account_id {
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            if !pool.is_account_proxy_available(id).await {
+                return Err(format!("严格代理策略拦截：账号 {} 未绑定健康代理或代理不通 (RED)，禁止直连探测 Project ID", id));
+            }
+        }
+    }
+
     // 使用 Sandbox 环境，避免 Prod 环境的 429 错误
     let url = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist";
 

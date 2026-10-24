@@ -153,6 +153,115 @@ impl ProxyPoolManager {
             status,
             proxy_id
         );
+        if status == EgressUsageStatus::Failed {
+            let pool_config = Arc::clone(&self.config);
+            let pid = proxy_id.to_string();
+            tokio::spawn(async move {
+                let mut changed = false;
+                {
+                    let mut config = pool_config.write().await;
+                    if let Some(proxy) = config.proxies.iter_mut().find(|p| p.id == pid) {
+                        if proxy.is_healthy {
+                            tracing::warn!(
+                                "[ProxyPool] Marking proxy {} ({}) as UNHEALTHY (RED) due to transport failure",
+                                proxy.name,
+                                proxy.id
+                            );
+                            proxy.is_healthy = false;
+                            proxy.last_check_time = Some(chrono::Utc::now().timestamp());
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    if let Ok(mut app_config) = crate::modules::config::load_app_config() {
+                        let config = pool_config.read().await;
+                        app_config.proxy.proxy_pool = config.clone();
+                        let _ = crate::modules::config::save_app_config(&app_config);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Mark a proxy as unhealthy (red) immediately and persist configuration
+    pub async fn mark_proxy_unhealthy(&self, proxy_id: &str) {
+        if proxy_id.is_empty() {
+            return;
+        }
+        self.record_egress_usage(proxy_id, EgressUsageStatus::Failed);
+        let mut changed = false;
+        {
+            let mut config = self.config.write().await;
+            if let Some(proxy) = config.proxies.iter_mut().find(|p| p.id == proxy_id) {
+                if proxy.is_healthy {
+                    tracing::warn!(
+                        "[ProxyPool] Explicitly marking proxy {} ({}) as UNHEALTHY (RED)",
+                        proxy.name,
+                        proxy.id
+                    );
+                    proxy.is_healthy = false;
+                    proxy.last_check_time = Some(chrono::Utc::now().timestamp());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.persist_config().await;
+        }
+    }
+
+    /// 持久化当前代理池配置到磁盘
+    pub async fn persist_config(&self) {
+        if let Ok(mut app_config) = crate::modules::config::load_app_config() {
+            let config = self.config.read().await;
+            app_config.proxy.proxy_pool = config.clone();
+            if let Err(e) = crate::modules::config::save_app_config(&app_config) {
+                tracing::error!("[ProxyPool] Failed to persist proxy pool config: {}", e);
+            }
+        }
+    }
+
+    /// 严格代理模式：检查指定账号是否拥有健康可用的代理。绝不允许直连！
+    /// 1. 若账号专属绑定了代理，则绑定的代理必须存在、已启用且 is_healthy == true。
+    /// 2. 若账号未绑定代理，但代理池开启，且池中有至少一个未被专属绑定、已启用且 is_healthy == true 的节点。
+    /// 3. 若配置了全局上游代理 (UpstreamProxy) 且已启用，也视为可用。
+    /// 4. 否则（直连 Direct）一律视为不可用 (false)！
+    pub async fn is_account_proxy_available(&self, account_id: &str) -> bool {
+        let config = self.config.read().await;
+
+        // 1. 如果账号有专属绑定
+        if let Some(proxy_id) = self.account_bindings.get(account_id) {
+            if let Some(entry) = config.proxies.iter().find(|p| p.id == *proxy_id.value()) {
+                return entry.enabled && entry.is_healthy;
+            }
+            return false;
+        }
+
+        // 2. 如果账号未绑定，检查代理池是否有可用的公用节点
+        if config.enabled {
+            let bound_ids: std::collections::HashSet<String> = self
+                .account_bindings
+                .iter()
+                .map(|kv| kv.value().clone())
+                .collect();
+            let has_healthy_unbound = config.proxies.iter().any(|p| {
+                p.enabled && p.is_healthy && !bound_ids.contains(&p.id)
+            });
+            if has_healthy_unbound {
+                return true;
+            }
+        }
+
+        // 3. 检查是否有启用的全局上游代理
+        if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+            let up = app_cfg.proxy.upstream_proxy;
+            if up.enabled && !up.url.is_empty() {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Snapshot of known usage statuses (`ok` / `failed`). Absent ids = unknown.
@@ -380,13 +489,21 @@ impl ProxyPoolManager {
         }
 
         // 1. 优先使用账号绑定 (专属 IP)
-        if let Some(proxy) = self.get_bound_proxy(account_id, &config).await? {
-            tracing::info!(
-                "[Proxy] Route: Account {} -> Proxy {} (Bound)",
-                account_id,
-                proxy.entry_id
-            );
-            return Ok(Some(proxy));
+        if self.account_bindings.contains_key(account_id) {
+            if let Some(proxy) = self.get_bound_proxy(account_id, &config).await? {
+                tracing::info!(
+                    "[Proxy] Route: Account {} -> Proxy {} (Bound)",
+                    account_id,
+                    proxy.entry_id
+                );
+                return Ok(Some(proxy));
+            } else {
+                tracing::warn!(
+                    "[Proxy] Account {} bound proxy is disabled or UNHEALTHY (RED). Strict policy: refuse fallback or leak direct IP.",
+                    account_id
+                );
+                return Ok(None);
+            }
         }
 
         // 2. 否则从池中策略选择 (公用池)
@@ -410,8 +527,12 @@ impl ProxyPoolManager {
         if let Some(proxy_id) = self.account_bindings.get(account_id) {
             if let Some(entry) = config.proxies.iter().find(|p| p.id == *proxy_id.value()) {
                 if entry.enabled {
-                    // 如果开启了自动故障转移且代理不健康，则返回 None (将回退到其他策略或失败)
-                    if config.auto_failover && !entry.is_healthy {
+                    if !entry.is_healthy {
+                        tracing::warn!(
+                            "[ProxyPool] Bound proxy {} for account {} is UNHEALTHY (RED)",
+                            entry.id,
+                            account_id
+                        );
                         return Ok(None);
                     }
                     return Ok(Some(self.build_proxy_config(entry)?));
