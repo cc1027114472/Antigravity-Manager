@@ -2410,7 +2410,7 @@ async fn call_gemini_sync(
         .await
         .map_err(|e| {
             if let crate::proxy::proxy_pool::EgressRoute::Pool { ref entry_id } = route {
-                let pool_clone = Arc::clone(&pool);
+                let pool_clone = std::sync::Arc::clone(&pool);
                 let pid = entry_id.clone();
                 tokio::spawn(async move {
                     pool_clone.mark_proxy_unhealthy(&pid).await;

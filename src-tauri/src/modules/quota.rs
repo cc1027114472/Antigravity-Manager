@@ -464,7 +464,7 @@ pub async fn fetch_quota_with_cache(
                     ));
                     if let Some(id) = account_id {
                         if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                            let pool_clone = Arc::clone(&pool);
+                            let pool_clone = std::sync::Arc::clone(&pool);
                             let acc_id_owned = id.to_string();
                             tokio::spawn(async move {
                                 if let Ok(Some(cfg)) = pool_clone.get_proxy_for_account(&acc_id_owned).await {
