@@ -450,15 +450,52 @@ pub fn limit_max_logs(max_count: usize) -> Result<usize, String> {
 }
 
 pub fn clear_logs() -> Result<(), String> {
+    // 大库清空优先采用 DROP TABLE + init_db：对已膨胀至数百MB或GB级的大库
+    // 比逐行 DELETE 快数万倍，且避免锁死。但 DROP 需要写锁，高流量节点上
+    // 可能被并发写入/后台 VACUUM 短暂阻塞：加大 busy_timeout 并多轮重试退避。
     let conn = connect_db()?;
-    // 优先采用 DROP TABLE + init_db：对已膨胀至数百MB或GB级的大库比逐行 DELETE 快数万倍，且避免锁死
-    conn.execute("DROP TABLE IF EXISTS request_logs", [])
-        .map_err(|e| format!("Failed to drop request_logs table: {}", e))?;
+    conn.pragma_update(None, "busy_timeout", 8_000)
+        .map_err(|e| e.to_string())?;
+
+    let mut last_err: Option<String> = None;
+    for attempt in 0..30i64 {
+        match conn.execute("DROP TABLE IF EXISTS request_logs", []) {
+            Ok(_) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let is_locked = msg.contains("locked") || msg.contains("busy");
+                if !is_locked {
+                    return Err(format!("Failed to drop request_logs table: {}", msg));
+                }
+                last_err = Some(msg);
+                // 退避重试：0.5s → 0.8s → 1.1s ... 封顶 ~2s，最多等 ~8s*30 轮
+                tracing::warn!(
+                    "clear_logs: request_logs DROP 被锁 (attempt {}), 退避重试",
+                    attempt + 1
+                );
+                std::thread::sleep(std::time::Duration::from_millis(
+                    500 + 300 * (attempt % 30) as u64,
+                ));
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(format!("Failed to drop request_logs table: {}", e));
+    }
+
     init_db()?;
-    // 强制截断 WAL 预写日志文件，彻底释放磁盘
+    // 强制截断 WAL 预写日志文件，彻底释放磁盘 (仍可能被并发读占用，失败可忽略)
     let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
-    // 释放未使用的空间
-    let _ = conn.execute("VACUUM", []);
+    // 释放未使用的空间；同样可能被占用，尽力而为
+    for _ in 0..6 {
+        if conn.execute("VACUUM", []).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
     Ok(())
 }
 
