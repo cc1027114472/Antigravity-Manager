@@ -1073,36 +1073,47 @@ pub async fn handle_chat_completions(
                 .await;
         }
 
-        // [FIX] 403 时设置 is_forbidden 状态并移出池子，避免账号被重复选中
+        // 遇到 403 Forbidden 立即硬熔断：标记反代已禁用、移出可用号池并持久化，彻底禁止任何重试，立刻返回响应
         if status_code == 403 {
-            if let Some(acc_id) = token_manager.get_account_id_by_email(&email) {
-                // Check for VALIDATION_REQUIRED error - temporarily block account
-                if error_text.contains("VALIDATION_REQUIRED")
-                    || error_text.contains("verify your account")
-                    || error_text.contains("validation_url")
-                {
-                    tracing::warn!(
-                        "[OpenAI] VALIDATION_REQUIRED detected on account {}, temporarily blocking",
-                        email
-                    );
-                    let block_minutes = 10i64;
-                    let block_until = chrono::Utc::now().timestamp() + (block_minutes * 60);
+            let target_acc_id = token_manager
+                .get_account_id_by_email(&email)
+                .unwrap_or_else(|| account_id.clone());
 
-                    if let Err(e) = token_manager
-                        .set_validation_block_public(&acc_id, block_until, &error_text)
-                        .await
-                    {
-                        tracing::error!("Failed to set validation block: {}", e);
-                    }
-                }
-
-                // 设置 is_forbidden 状态
-                if let Err(e) = token_manager.set_forbidden(&acc_id, &error_text).await {
-                    tracing::error!("Failed to set forbidden status: {}", e);
-                } else {
-                    tracing::warn!("[OpenAI] Account {} marked as forbidden due to 403", email);
-                }
+            if let Err(e) = token_manager.set_forbidden(&target_acc_id, &error_text).await {
+                tracing::error!("Failed to set forbidden status: {}", e);
+            } else {
+                tracing::warn!("🚫 [OpenAI] Account {} marked as forbidden (403), proxy disabled immediately", email);
             }
+
+            if error_text.contains("VALIDATION_REQUIRED")
+                || error_text.contains("verify your account")
+                || error_text.contains("validation_url")
+            {
+                let block_minutes = 10i64;
+                let block_until = chrono::Utc::now().timestamp() + (block_minutes * 60);
+                let _ = token_manager
+                    .set_validation_block_public(&target_acc_id, block_until, &error_text)
+                    .await;
+            }
+
+            // 严禁后续任何重试，立刻向客户端返回 403 响应
+            return Ok((
+                status,
+                crate::proxy::account_inflight::account_headers(
+                    &email,
+                    Some(&target_acc_id),
+                    Some(mapped_model.as_str()),
+                    crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
+                ),
+                Json(json!({
+                    "error": {
+                        "message": error_text,
+                        "type": "permission_denied",
+                        "code": 403
+                    }
+                })),
+            )
+                .into_response());
         }
 
         // 执行退避

@@ -66,8 +66,11 @@ pub fn determine_retry_strategy(
             RetryStrategy::LinearBackoff { base_ms: 3000 }
         }
 
-        // 401/403 认证/权限错误：切换账号前给予极短缓冲
-        401 | 403 => RetryStrategy::FixedDelay(Duration::from_millis(200)),
+        // 403 权限错误：立即硬熔断并禁用反代，严禁任何重试，直接退出
+        403 => RetryStrategy::NoRetry,
+
+        // 401 认证失效：切换账号前给予极短缓冲
+        401 => RetryStrategy::FixedDelay(Duration::from_millis(200)),
 
         // 404 资源未找到：Google Cloud Code API 的 404 通常是账号级别的间歇性问题
         // (灰度发布、账号权限不同步等)，轮换账号往往能解决

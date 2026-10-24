@@ -93,6 +93,22 @@ pub fn init_db() -> Result<(), String> {
 }
 
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
+    // 遇到瞬时 SQLITE_BUSY 时进行最多 3 次轻量重试（附带递增休眠），防止突发大事务或并发清理导致丢日志
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match try_save_log(log) {
+            Ok(()) => return Ok(()),
+            Err(e) if (e.contains("database is locked") || e.contains("code: 5") || e.contains("busy")) && attempts < 3 => {
+                std::thread::sleep(std::time::Duration::from_millis(attempts * 25));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn try_save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let conn = connect_db()?;
 
     // Do NOT truncate request/response bodies: preserve 100% full payloads for audit.

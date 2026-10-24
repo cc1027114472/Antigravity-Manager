@@ -513,17 +513,11 @@ impl UpstreamClient {
         // [DEBUG] Log headers for verification
         tracing::debug!(?headers, "Final Upstream Request Headers");
 
-        let mut has_triggered_downgrade = false;
+        let mut last_err: Option<String> = None;
+        let mut fallback_attempts: Vec<FallbackAttemptLog> = Vec::new();
 
-        // [TEMPORARY FIX #3074] 针对 403 SERVICE_DISABLED 的自动降级重试逻辑
-        // 我们包装一层循环，以便在检测到特定错误时移除 Header 并重试
-        loop {
-            let mut last_err: Option<String> = None;
-            let mut fallback_attempts: Vec<FallbackAttemptLog> = Vec::new();
-            let mut should_retry_without_header = false;
-
-            // 遍历所有端点，失败时自动切换
-            for (idx, base_url) in V1_INTERNAL_BASE_URL_FALLBACKS.iter().enumerate() {
+        // 遍历所有端点，失败时自动切换
+        for (idx, base_url) in V1_INTERNAL_BASE_URL_FALLBACKS.iter().enumerate() {
                 let url = Self::build_url(base_url, method, query_string);
                 let has_next = idx + 1 < V1_INTERNAL_BASE_URL_FALLBACKS.len();
 
@@ -608,18 +602,17 @@ impl UpstreamClient {
                             });
                         }
 
-                        // [NEW] 检测 403 错误 (Issue #3074)
-                        // 只要带有项目 Header 且返回 403，我们就尝试降级重试一次
-                        if status == StatusCode::FORBIDDEN
-                            && !has_triggered_downgrade
-                            && headers.contains_key("x-goog-user-project")
-                        {
+                        // 遇到 403 Forbidden 立即硬熔断返回，严禁任何内部重试或端点轮换，直接交由上层 Handler 标记账号禁用
+                        if status == StatusCode::FORBIDDEN {
                             tracing::warn!(
-                                "Detected 403 Forbidden with project header, retrying WITHOUT x-goog-user-project header (Account: {:?})",
+                                "🚫 Upstream returned 403 Forbidden on endpoint {} (Account: {:?}), immediate abort without retry",
+                                base_url,
                                 account_id
                             );
-                            should_retry_without_header = true;
-                            break;
+                            return Ok(UpstreamCallResult {
+                                response: resp,
+                                fallback_attempts,
+                            });
                         }
 
                         // 如果有下一个端点且当前错误可重试，则切换
@@ -680,17 +673,8 @@ impl UpstreamClient {
                 }
             }
 
-            // 处理降级逻辑
-            if should_retry_without_header {
-                headers.remove("x-goog-user-project");
-                has_triggered_downgrade = true;
-                // 重启外层 loop，从第一个端点再次尝试
-                continue;
-            }
-
-            // 如果没有触发降级且所有端点都尝试过，返回最后的错误
-            return Err(last_err.unwrap_or_else(|| "All endpoints failed".to_string()));
-        }
+        // 所有端点都尝试过，返回最后的错误
+        Err(last_err.unwrap_or_else(|| "All endpoints failed".to_string()))
     }
 
     /// 调用 v1internal API（带 429 重试,支持闭包）

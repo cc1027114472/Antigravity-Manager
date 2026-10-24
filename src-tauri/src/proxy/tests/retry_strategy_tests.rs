@@ -89,14 +89,22 @@ fn test_retry_strategy_500() {
 }
 
 #[test]
-fn test_retry_strategy_401_403() {
-    for status in [401, 403] {
-        let strategy = determine_retry_strategy(status, "", false);
-        match strategy {
-            RetryStrategy::FixedDelay(d) => assert_eq!(d, Duration::from_millis(200)),
-            other => panic!("Expected FixedDelay(200ms) for {}, got {:?}", status, other),
-        }
+fn test_retry_strategy_401() {
+    let strategy = determine_retry_strategy(401, "", false);
+    match strategy {
+        RetryStrategy::FixedDelay(d) => assert_eq!(d, Duration::from_millis(200)),
+        other => panic!("Expected FixedDelay(200ms) for 401, got {:?}", other),
     }
+}
+
+#[test]
+fn test_retry_strategy_403() {
+    let strategy = determine_retry_strategy(403, "", false);
+    assert!(
+        matches!(strategy, RetryStrategy::NoRetry),
+        "Expected NoRetry for 403, got {:?}",
+        strategy
+    );
 }
 
 #[test]

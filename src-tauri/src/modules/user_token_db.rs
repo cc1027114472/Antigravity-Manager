@@ -66,6 +66,14 @@ pub fn get_db_path() -> Result<PathBuf, String> {
 pub fn connect_db() -> Result<Connection, String> {
     let path = get_db_path()?;
     let conn = Connection::open(&path).map_err(|e| format!("Failed to open database: {}", e))?;
+
+    // 配置 SQLite 并发写与防忙锁参数（支持在网络盘等不支持 WAL 的文件系统下安全降级）
+    let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    conn.pragma_update(None, "busy_timeout", 5000)
+        .map_err(|e| format!("Failed to set busy_timeout: {}", e))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|e| format!("Failed to set synchronous mode: {}", e))?;
+
     Ok(conn)
 }
 

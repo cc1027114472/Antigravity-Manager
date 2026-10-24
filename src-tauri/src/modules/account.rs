@@ -877,6 +877,15 @@ pub fn add_account(
         return Err(format!("Account already exists: {}", email));
     }
 
+    internal_add_account(&mut index, email, name, token)
+}
+
+fn internal_add_account(
+    index: &mut AccountIndex,
+    email: String,
+    name: Option<String>,
+    token: TokenData,
+) -> Result<Account, String> {
     // Create new account
     let account_id = Uuid::new_v4().to_string();
     let mut account = Account::new(account_id.clone(), email.clone(), token);
@@ -902,7 +911,7 @@ pub fn add_account(
         index.current_account_id = Some(account_id);
     }
 
-    save_account_index(&index)?;
+    save_account_index(index)?;
 
     Ok(account)
 }
@@ -975,13 +984,8 @@ pub fn upsert_account(
         }
     }
 
-    // Add if not exists
-    // Note: add_account will attempt to acquire lock, which would deadlock here.
-    // Use an internal version or release lock.
-
-    // Release lock, let add_account handle it
-    drop(_lock);
-    add_account(email, name, token)
+    // Add if not exists using internal_add_account directly without releasing and re-acquiring lock
+    internal_add_account(&mut index, email, name, token)
 }
 
 /// Delete account
@@ -2207,18 +2211,20 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     let tasks: Vec<_> = accounts
         .into_iter()
         .filter(|account| {
-            // [MOD] Now we allow refreshing disabled and proxy_disabled accounts
-            // to support forced re-sync from UI.
-            // Only strictly skip forbidden accounts if necessary, but even those
-            // might want a retry to see if they are unbanned.
-            if let Some(ref q) = account.quota {
-                if q.is_forbidden {
-                    crate::modules::logger::log_info(&format!(
-                        "  - Skipping {} (Forbidden)",
-                        account.email
-                    ));
-                    return false;
-                }
+            // 严格跳过所有已被标记为 403 Forbidden 或反代禁用的账号，杜绝后台定时器私自外发请求触发风控
+            let is_forbidden_quota = account.quota.as_ref().map_or(false, |q| q.is_forbidden);
+            let is_forbidden_proxy = account.proxy_disabled
+                && account
+                    .proxy_disabled_reason
+                    .as_ref()
+                    .map_or(false, |r| r.contains("403") || r.contains("Forbidden"));
+
+            if is_forbidden_quota || is_forbidden_proxy {
+                crate::modules::logger::log_info(&format!(
+                    "  - Skipping {} (Forbidden / Proxy Disabled)",
+                    account.email
+                ));
+                return false;
             }
             true
         })
