@@ -38,6 +38,7 @@ import {
     X,
     Check,
     Clock,
+    Moon,
     Bot,
     Repeat2,
     Terminal,
@@ -389,6 +390,16 @@ function AccountRowContent({
                             <span className="px-2 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-400 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-amber-200/50">
                                 <Clock className="w-2.5 h-2.5" />
                                 <span>{validationBlockedLabel}</span>
+                            </span>
+                        )}
+
+                        {account.nap_remaining_seconds != null && account.nap_remaining_seconds > 0 && !isDisabled && !account.proxy_disabled && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-indigo-200/50"
+                                title={t('accounts.humanized_napping_tooltip', { mins: Math.ceil(account.nap_remaining_seconds / 60) })}
+                            >
+                                <Moon className="w-2.5 h-2.5" />
+                                <span>{t('accounts.humanized_napping', { mins: Math.ceil(account.nap_remaining_seconds / 60) })}</span>
                             </span>
                         )}
 
