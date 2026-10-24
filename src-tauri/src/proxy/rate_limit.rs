@@ -151,11 +151,23 @@ impl HumanizedPacer {
 
     /// 检查账号距离下一次允许发起请求还需要等待多少毫秒
     /// 结合了三层速率约束：
+    /// 0. 拟人化微小憩检查 (Micro-Nap，休眠期内强制等待满秒数)
     /// 1. 响应结束后的 Post-Response Delay + Jitter 冷却
     /// 2. 滚动 60 秒 RPM 漏桶（单账号上限 10 次 / 60 秒）
     pub fn get_required_wait_ms(&self, account_id: &str) -> u64 {
         let now = std::time::Instant::now();
         if let Some(mut entry) = self.account_states.get_mut(account_id) {
+            // 0. Micro-Nap 检查：休眠中需严格等待休眠结束
+            let nap_wait = if let Some(nap) = entry.nap_until {
+                if nap > now {
+                    (nap - now).as_millis() as u64
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
             // 1. Post-Response 冷却检查
             let cooldown_wait = if entry.next_allowed_request_at > now {
                 (entry.next_allowed_request_at - now).as_millis() as u64
@@ -189,7 +201,7 @@ impl HumanizedPacer {
                 0
             };
 
-            return cooldown_wait.max(rpm_wait);
+            return nap_wait.max(cooldown_wait).max(rpm_wait);
         }
         0
     }
@@ -1101,6 +1113,10 @@ mod tests {
         assert!(remaining.is_some());
         let secs = remaining.unwrap();
         assert!(secs >= 118 && secs <= 120);
+
+        // 休眠中的账号在 get_required_wait_ms 中必须强制等待满休眠时长
+        let wait_ms = pacer.get_required_wait_ms("test_acc");
+        assert!(wait_ms >= 118_000 && wait_ms <= 120_000);
     }
 
     #[test]

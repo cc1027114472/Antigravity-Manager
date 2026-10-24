@@ -1823,17 +1823,17 @@ impl TokenManager {
             return None;
         }
 
-        // 2. 拟人化微休眠 (Micro-Nap) 过滤：优先从非休眠状态的账号中挑选，打散账号的使用密集度
-        let non_napping: Vec<&ProxyToken> = available
+        // 2. 拟人化微休眠 (Micro-Nap) 硬隔离：休眠中的账号绝对不可调度！绝不穿透 fallback 回 available！
+        let pool: Vec<&ProxyToken> = available
             .iter()
             .copied()
             .filter(|t| !self.pacer.is_in_nap(&t.account_id))
             .collect();
-        let pool = if !non_napping.is_empty() {
-            non_napping
-        } else {
-            available
-        };
+
+        if pool.is_empty() {
+            tracing::warn!("🚫 [P2C] All candidate accounts are currently in micro-nap. Holding request to prevent anti-abuse detection.");
+            return None;
+        }
 
         if pool.len() == 1 {
             return Some(pool[0]);
@@ -2562,13 +2562,14 @@ impl TokenManager {
 
                 // 若无锁定，则使用 P2C 选择账号 (避免热点问题)
                 if target_token.is_none() {
-                    // 先过滤出未限流且未达并发上限的账号
+                    // 先过滤出未限流、未达并发上限且非休眠中的账号
                     let mut non_limited: Vec<ProxyToken> = Vec::new();
                     for t in &tokens_snapshot {
                         if !self
                             .is_rate_limited(&t.account_id, Some(&normalized_target))
                             .await
                             && !self.is_concurrency_full(&t.account_id)
+                            && !self.pacer.is_in_nap(&t.account_id)
                         {
                             non_limited.push(t.clone());
                         }
@@ -2602,13 +2603,14 @@ impl TokenManager {
                 // 模式 C: P2C 选择 (替代纯轮询)
                 tracing::debug!("🔄 [Mode C] P2C selection from {} candidates", total);
 
-                // 先过滤出未限流且未达并发上限的账号
+                // 先过滤出未限流、未达并发上限且非休眠中的账号
                 let mut non_limited: Vec<ProxyToken> = Vec::new();
                 for t in &tokens_snapshot {
                     if !self
                         .is_rate_limited(&t.account_id, Some(&normalized_target))
                         .await
                         && !self.is_concurrency_full(&t.account_id)
+                        && !self.pacer.is_in_nap(&t.account_id)
                     {
                         non_limited.push(t.clone());
                     }
@@ -2646,13 +2648,18 @@ impl TokenManager {
                 Some(t) => t,
                 None => {
                     // 乐观重置策略: 双层防护机制
-                    // 计算最短等待时间
+                    // 计算最短等待时间（同时核算 429 限流等待与微小憩休眠等待）
                     let min_wait = tokens_snapshot
                         .iter()
                         .filter_map(|t| {
-                            let wait = self
+                            let rl_wait = self
                                 .rate_limit_tracker
                                 .get_remaining_wait(&t.account_id, Some(&normalized_target));
+                            let nap_wait = self
+                                .pacer
+                                .get_nap_remaining_seconds(&t.account_id)
+                                .unwrap_or(0);
+                            let wait = rl_wait.max(nap_wait);
                             if wait > 0 {
                                 Some(wait)
                             } else {
@@ -2676,6 +2683,7 @@ impl TokenManager {
                             // 重新尝试选择账号
                             let retry_token = tokens_snapshot.iter().find(|t| {
                                 !attempted.contains(&t.account_id)
+                                    && !self.pacer.is_in_nap(&t.account_id)
                                     && !self.is_rate_limited_sync(
                                         &t.account_id,
                                         Some(&normalized_target),
@@ -2700,9 +2708,10 @@ impl TokenManager {
                                 // 清除所有限流记录
                                 self.rate_limit_tracker.clear_all();
 
-                                // 再次尝试选择账号（配额保护绝对不可被乐观重置绕过！）
+                                // 再次尝试选择账号（配额保护与小憩休眠绝对不可被乐观重置绕过！）
                                 let final_token = tokens_snapshot.iter().find(|t| {
                                     !attempted.contains(&t.account_id)
+                                        && !self.pacer.is_in_nap(&t.account_id)
                                         && !(quota_protection_enabled
                                             && Self::is_model_quota_protected(&t.protected_models, target_model))
                                 });
