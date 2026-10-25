@@ -801,6 +801,8 @@ pub async fn handle_messages(
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
     let mut force_rotate = false;
     let mut inflight_guard: Option<crate::proxy::account_inflight::AccountInflightGuard> = None;
+    let estimated_prompt_tokens =
+        crate::proxy::mappers::context_manager::ContextManager::estimate_token_usage(&request_for_body) as u32;
 
     for attempt in 0..max_attempts {
         // 2. 模型路由解析
@@ -881,6 +883,36 @@ pub async fn handle_messages(
                 );
                 force_rotate = true;
                 continue;
+            }
+        }
+
+        // [Heat Critical Protection] 大任务防熔断兜底
+        if estimated_prompt_tokens > 50_000 && token_manager.pacer.is_heat_critical(&account_id) {
+            tracing::warn!(
+                "[{}] 🔥 [Heat Protection] Target account {} at critical heat ({:.2} >= 3.0). Holding 8s buffer...",
+                trace_id,
+                email,
+                token_manager.pacer.get_account_heat(&account_id)
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
+            if token_manager.pacer.is_heat_critical(&account_id) {
+                tracing::warn!(
+                    "[{}] 🛑 [Heat Protection] Account {} still critically overheated. Rejecting with 429 Retry-After.",
+                    trace_id,
+                    email
+                );
+                let err_json = json!({
+                    "type": "error",
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": "All pool accounts are currently cooling down from high-volume prompt workloads. Please retry in 20 seconds."
+                    }
+                });
+                let builder = Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("Retry-After", "20");
+                return builder.body(Body::from(serde_json::to_string(&err_json).unwrap())).unwrap();
             }
         }
 

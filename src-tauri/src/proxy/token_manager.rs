@@ -1847,8 +1847,22 @@ impl TokenManager {
             return Some(pool[0]);
         }
 
-        // 3. 拟人化波段节奏优化：优先挑选已经休息满 1~5s 波段间隔的账号
-        let well_rested: Vec<&ProxyToken> = pool
+        // 3. 拟人化波段节奏与大任务热度优化：
+        // 优先在未达到热度饱和 (Heat < 1.5) 的冷账号池中挑选
+        let cold_pool: Vec<&ProxyToken> = pool
+            .iter()
+            .copied()
+            .filter(|t| !self.pacer.is_heat_saturated(&t.account_id))
+            .collect();
+        let candidate_pool = if !cold_pool.is_empty() {
+            cold_pool
+        } else {
+            // 全池饱和时回退到可用池，由后续逻辑结合排队/最小热度接单
+            pool
+        };
+
+        // 优先挑选已经休息满 1~5s 波段间隔且非过热的账号
+        let well_rested: Vec<&ProxyToken> = candidate_pool
             .iter()
             .copied()
             .filter(|t| self.pacer.get_required_wait_ms(&t.account_id) == 0)
@@ -1858,7 +1872,7 @@ impl TokenManager {
             well_rested
         } else {
             // [NEW] 最佳流派规则：全场都在冷却中时，精准挑选“剩余冷却时间最短”的账号进行微等，避免随机抽中超大 TPM 冷却号
-            if let Some(min_wait_token) = pool
+            if let Some(min_wait_token) = candidate_pool
                 .iter()
                 .copied()
                 .min_by_key(|t| self.pacer.get_required_wait_ms(&t.account_id))
@@ -1870,7 +1884,7 @@ impl TokenManager {
                 );
                 return Some(min_wait_token);
             }
-            pool
+            candidate_pool
         };
 
         if final_candidates.len() == 1 {
@@ -1893,29 +1907,36 @@ impl TokenManager {
         let c1 = final_candidates[pick1];
         let c2 = final_candidates[pick2];
 
-        // 优先选择绑定会话数更少的账号，防止多个会话同时扎堆轰炸同一个账号
-        let s1 = self.bound_session_count(&c1.account_id);
-        let s2 = self.bound_session_count(&c2.account_id);
+        // 优先选择热度更低（更清凉）的账号，彻底打散大任务密度
+        let h1 = self.pacer.get_account_heat(&c1.account_id);
+        let h2 = self.pacer.get_account_heat(&c2.account_id);
 
-        let selected = if s1 != s2 {
-            if s1 < s2 { c1 } else { c2 }
-        } else if c1.remaining_quota.unwrap_or(0) >= c2.remaining_quota.unwrap_or(0) {
-            c1
+        let selected = if (h1 - h2).abs() >= 0.5 {
+            // 热度差异显著：强制选择更冷账号
+            if h1 < h2 { c1 } else { c2 }
         } else {
-            c2
+            // 热度相当：优先选择绑定会话数更少的账号
+            let s1 = self.bound_session_count(&c1.account_id);
+            let s2 = self.bound_session_count(&c2.account_id);
+            if s1 != s2 {
+                if s1 < s2 { c1 } else { c2 }
+            } else if c1.remaining_quota.unwrap_or(0) >= c2.remaining_quota.unwrap_or(0) {
+                c1
+            } else {
+                c2
+            }
         };
 
         tracing::debug!(
-            "🎲 [P2C] Selected {} ({}%, {} sessions) from [{}({}%, {} sessions), {}({}%, {} sessions)]",
+            "🎲 [P2C] Selected {} (heat: {:.2}, {}%, {} sessions) from [{}(heat: {:.2}), {}(heat: {:.2})]",
             selected.email,
+            self.pacer.get_account_heat(&selected.account_id),
             selected.remaining_quota.unwrap_or(0),
             self.bound_session_count(&selected.account_id),
             c1.email,
-            c1.remaining_quota.unwrap_or(0),
-            s1,
+            h1,
             c2.email,
-            c2.remaining_quota.unwrap_or(0),
-            s2
+            h2
         );
 
         Some(selected)
@@ -2491,6 +2512,14 @@ impl TokenManager {
                                 "Sticky Session: Bound account {} requires long cooldown ({}ms > 2000ms), unbinding and switching.",
                                 bound_token.email,
                                 pacer_wait
+                            );
+                            self.session_accounts.remove(sid);
+                        } else if self.pacer.is_heat_saturated(acc_id) {
+                            // [Heat Protection] 粘性账号大任务热度饱和 (Heat >= 1.5)，主动解绑分流给冷账号
+                            tracing::info!(
+                                "Sticky Session: Bound account {} is heat-saturated ({:.2} >= 1.5), unbinding to route to cold account.",
+                                bound_token.email,
+                                self.pacer.get_account_heat(acc_id)
                             );
                             self.session_accounts.remove(sid);
                         } else if !attempted.contains(acc_id) {

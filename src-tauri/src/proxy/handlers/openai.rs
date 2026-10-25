@@ -558,6 +558,35 @@ pub async fn handle_chat_completions(
             }
         }
 
+        // [Heat Critical Protection] 大任务防熔断兜底
+        if estimated_prompt_tokens > 50_000 && token_manager.pacer.is_heat_critical(&account_id) {
+            tracing::warn!(
+                "🔥 [Heat Protection] Target account {} at critical heat ({:.2} >= 3.0). Holding 8s buffer...",
+                email,
+                token_manager.pacer.get_account_heat(&account_id)
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
+            if token_manager.pacer.is_heat_critical(&account_id) {
+                tracing::warn!(
+                    "🛑 [Heat Protection] Account {} still critically overheated. Rejecting with 429 Retry-After.",
+                    email
+                );
+                let err_json = json!({
+                    "error": {
+                        "message": "All pool accounts are currently cooling down from high-volume prompt workloads. Please retry in 20 seconds.",
+                        "type": "insufficient_quota",
+                        "param": null,
+                        "code": "account_pool_overheated"
+                    }
+                });
+                let builder = Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("Content-Type", "application/json")
+                    .header("Retry-After", "20");
+                return Ok(builder.body(axum::body::Body::from(serde_json::to_string(&err_json).unwrap())).unwrap().into_response());
+            }
+        }
+
         // 4. 转换请求 (返回内容包含 session_id, message_count, prefix_hash)
         let (gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
             &openai_req,

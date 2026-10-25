@@ -60,6 +60,10 @@ pub struct AccountPacerState {
     pub nap_until: Option<std::time::Instant>,
     /// 保护阈值浮动
     pub threshold_jitter: i32,
+    /// 大任务累积热度积分（半衰期指数衰减）
+    pub massive_heat: f64,
+    /// 上次更新热度的时间
+    pub last_heat_updated_at: std::time::Instant,
 }
 
 /// 单账号拟人化流控与防均质化调度器
@@ -152,6 +156,32 @@ impl HumanizedPacer {
         None
     }
 
+    /// 获取账号当前的大任务热度积分（按 180 秒半衰期指数衰减）
+    pub fn get_account_heat(&self, account_id: &str) -> f64 {
+        if let Some(entry) = self.account_states.get(account_id) {
+            let elapsed_secs = entry.last_heat_updated_at.elapsed().as_secs_f64();
+            // 半衰期 180 秒（3 分钟）：heat = previous_heat * (0.5)^(elapsed / 180.0)
+            let decayed = entry.massive_heat * (0.5f64).powf(elapsed_secs / 180.0);
+            if decayed < 0.05 {
+                0.0
+            } else {
+                decayed
+            }
+        } else {
+            0.0
+        }
+    }
+
+    /// 账号热度是否达到饱和警戒线 (Heat >= 1.5)，饱和账号应避免连续承接新的大任务
+    pub fn is_heat_saturated(&self, account_id: &str) -> bool {
+        self.get_account_heat(account_id) >= 1.5
+    }
+
+    /// 账号热度是否达到极限熔断线 (Heat >= 3.0)
+    pub fn is_heat_critical(&self, account_id: &str) -> bool {
+        self.get_account_heat(account_id) >= 3.0
+    }
+
     /// 检查账号距离下一次允许发起请求还需要等待多少毫秒
     /// 结合了三层速率约束：
     /// 0. 拟人化微小憩检查 (Micro-Nap，休眠期内强制等待满秒数)
@@ -223,6 +253,8 @@ impl HumanizedPacer {
                 current_interval_ms: 2000,
                 nap_until: None,
                 threshold_jitter: Self::get_threshold_jitter(account_id),
+                massive_heat: 0.0,
+                last_heat_updated_at: now,
             }
         });
 
@@ -259,8 +291,38 @@ impl HumanizedPacer {
                 current_interval_ms: cooldown_ms,
                 nap_until: None,
                 threshold_jitter: Self::get_threshold_jitter(account_id),
+                massive_heat: 0.0,
+                last_heat_updated_at: now,
             }
         });
+
+        // 1. 先进行时间指数衰减（半衰期 180s）
+        let elapsed_secs = entry.last_heat_updated_at.elapsed().as_secs_f64();
+        let decayed_heat = entry.massive_heat * (0.5f64).powf(elapsed_secs / 180.0);
+
+        // 2. 阶梯追加本次任务热度
+        let tokens = prompt_tokens.unwrap_or(0);
+        let added_heat = if tokens >= 100_000 {
+            2.0 // >100K Tokens (超大/重构任务) 产出 2.0 热度
+        } else if tokens >= 30_000 {
+            1.0 // 30K~100K Tokens 产出 1.0 热度
+        } else {
+            0.0 // 小任务不增加大任务过热分
+        };
+
+        entry.massive_heat = decayed_heat + added_heat;
+        entry.last_heat_updated_at = now;
+
+        if added_heat > 0.0 {
+            tracing::info!(
+                "🔥 [HumanizedPacer] Account {} heat updated: {:.2} (+{:.1} from {} tokens, decayed from {:.2})",
+                account_id,
+                entry.massive_heat,
+                added_heat,
+                tokens,
+                decayed_heat
+            );
+        }
 
         entry.last_response_completed_at = Some(now);
         entry.next_allowed_request_at = next_allowed;

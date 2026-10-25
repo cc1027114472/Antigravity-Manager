@@ -178,6 +178,38 @@ pub async fn handle_generate(
             }
         }
 
+        // [Heat Critical Protection] 大任务防熔断兜底：如果选出的账号依然处于极限高热（说明全池大任务过载）
+        if estimated_prompt_tokens > 50_000 && token_manager.pacer.is_heat_critical(&account_id) {
+            tracing::warn!(
+                "🔥 [Heat Protection] Account pool overheated. Target {} is at critical heat ({:.2} >= 3.0). Holding 8s buffer to cool down...",
+                email,
+                token_manager.pacer.get_account_heat(&account_id)
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
+            if token_manager.pacer.is_heat_critical(&account_id) {
+                tracing::warn!(
+                    "🛑 [Heat Protection] Account {} still critically overheated after buffer delay. Rejecting with 429 Retry-After to protect account safety.",
+                    email
+                );
+                let err_json = json!({
+                    "error": {
+                        "code": 429,
+                        "message": "All pool accounts are currently cooling down from high-volume prompt workloads. Please retry in 20 seconds.",
+                        "status": "RESOURCE_EXHAUSTED",
+                        "details": [{
+                            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                            "retryDelay": "20s"
+                        }]
+                    }
+                });
+                let builder = axum::response::Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("Content-Type", "application/json")
+                    .header("Retry-After", "20");
+                return Ok(builder.body(axum::body::Body::from(serde_json::to_string(&err_json).unwrap())).unwrap().into_response());
+            }
+        }
+
         // 5. 包装请求 (project injection)
         // [FIX #765] Pass session_id to wrap_request for signature injection
         // [NEW] 获取完整 Token 对象以注入动态规格 (dynamic > static default > 65535)
