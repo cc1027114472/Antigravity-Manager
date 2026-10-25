@@ -518,7 +518,10 @@ pub async fn handle_generate(
                     let pacer_guard = token_manager.begin_request_pacing(&account_id, Some(estimated_prompt_tokens));
                     let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
                     let pacer_clone = pacer_arc.clone();
+                    let inflight_arc = std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
+                    let inflight_clone = inflight_arc.clone();
                     let stream_with_pacer = async_stream::stream! {
+                        let _guard_hold = inflight_clone;
                         let mut inner = Box::pin(stream);
                         while let Some(item) = inner.next().await {
                             yield item;
@@ -528,6 +531,7 @@ pub async fn handle_generate(
                                 guard.complete();
                             }
                         }
+                        drop(_guard_hold);
                     };
                     let body = axum::body::Body::from_stream(stream_with_pacer);
                     return Ok(builder.body(body).unwrap().into_response());

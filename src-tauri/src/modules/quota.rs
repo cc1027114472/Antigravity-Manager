@@ -303,37 +303,25 @@ pub async fn fetch_quota_with_cache(
     for (ep_idx, ep_url) in QUOTA_API_ENDPOINTS.iter().enumerate() {
         let has_next = ep_idx + 1 < QUOTA_API_ENDPOINTS.len();
 
-        let mut current_payload = payload.clone();
-        let mut retry_without_project = false;
-
-        loop {
-            match client
-                .post(*ep_url)
-                .bearer_auth(access_token)
-                .header(
-                    rquest::header::USER_AGENT,
-                    crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
-                )
-                .json(&current_payload)
-                .send()
-                .await
+        match client
+            .post(*ep_url)
+            .bearer_auth(access_token)
+            .header(
+                rquest::header::USER_AGENT,
+                crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
+            )
+            .json(&payload)
+            .send()
+            .await
             {
                 Ok(response) => {
                     // Convert HTTP error status to AppError
                     if let Err(_) = response.error_for_status_ref() {
                         let status = response.status();
 
-                        // [FIX] 403 Forbidden 处理：如果是带有 project_id 的请求，尝试剥离后重试
+                        // [REMOVED] 不再"剥离 project 后偷偷重试"：403 即为账号真实不可用信号，
+                        // 直接走标记禁用/验证封锁的真实路径（对齐上游行为，避免掩盖 USER_PROJECT_DENIED 等真实错误）。
                         if status == rquest::StatusCode::FORBIDDEN {
-                            if current_payload.get("project").is_some() && !retry_without_project {
-                                crate::modules::logger::log_warn(&format!(
-                                    "Quota fetch got 403 with project ID, retrying without project ID..."
-                                ));
-                                current_payload = json!({});
-                                retry_without_project = true;
-                                continue;
-                            }
-
                             let text = response.text().await.unwrap_or_default();
                             crate::modules::logger::log_warn(&format!(
                                 "Account unauthorized (403 Forbidden): {}",
@@ -378,7 +366,7 @@ pub async fn fetch_quota_with_cache(
                             last_error =
                                 Some(AppError::Unknown(format!("HTTP {} - {}", status, text)));
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            break; // Break the inner retry loop, continue to next endpoint
+                            continue; // 换下一个 endpoint
                         }
 
                         return Err(AppError::Unknown(format!(
@@ -477,11 +465,10 @@ pub async fn fetch_quota_with_cache(
                     if has_next {
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
-                    break; // Break the inner retry loop on network error, continue to next endpoint
+                    continue; // 网络错误时继续尝试下一个 endpoint
                 }
             }
-        } // End of inner loop
-    }
+        }
 
     Err(last_error.unwrap_or_else(|| {
         AppError::Unknown("Quota fetch failed: all endpoints exhausted".to_string())

@@ -81,17 +81,20 @@ impl HumanizedPacer {
         // 基础冷却：1500ms ~ 3500ms (1500ms + 0~2000ms 随机抖动)
         let base_delay: u64 = rng.gen_range(1500..=3500);
 
-        // TPM 动态保护补偿：阶梯式追加冷却，防止高频超大 Prompt 击穿 TPM 闸门并触发云端封控
+        // TPM 动态保护补偿：平滑阶梯延时，既保证大请求后有充分的人性化停顿，又保留号池弹性
         let tokens = prompt_tokens.unwrap_or(0);
-        let tpm_penalty: u64 = if tokens > 300_000 {
-            // 超超大上下文 (>300K Tokens，如 400K~800K)：追加 10s ~ 16s 冷却，平滑单账号分钟吞吐
-            rng.gen_range(10_000..=16_000)
-        } else if tokens > 100_000 {
-            // 极大上下文 (100K~300K Tokens)：追加 4s ~ 7s 冷却
-            rng.gen_range(4_000..=7_000)
-        } else if tokens > 25_000 {
-            // 较大上下文 (25K~100K Tokens)：追加 1.5s ~ 3s 冷却
-            rng.gen_range(1_500..=3_000)
+        let tpm_penalty: u64 = if tokens > 250_000 {
+            // 超巨型上下文 (>250K Tokens)：平滑追加 20s ~ 35s 延迟
+            rng.gen_range(20_000..=35_000)
+        } else if tokens > 150_000 {
+            // 极大上下文 (150K~250K Tokens)：追加 12s ~ 22s 延迟
+            rng.gen_range(12_000..=22_000)
+        } else if tokens > 50_000 {
+            // 较大上下文 (50K~150K Tokens)：追加 6s ~ 12s 延迟
+            rng.gen_range(6_000..=12_000)
+        } else if tokens > 15_000 {
+            // 中等上下文 (15K~50K Tokens)：追加 2s ~ 5s 延迟
+            rng.gen_range(2_000..=5_000)
         } else {
             0
         };

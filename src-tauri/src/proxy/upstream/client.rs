@@ -491,15 +491,11 @@ impl UpstreamClient {
         // This header belongs to the IDE's JS layer, not the official client's egress.
         // Sending it creates a contradictory "Electron + Node.js" fingerprint.
 
-        // [NEW] 深度解析 body 中的 project_id 并注入 Header
-        // 只有当 Body 包含 project 字段且非测试项目时，注入 x-goog-user-project
-        if let Some(proj) = body.get("project").and_then(|v| v.as_str()) {
-            if !proj.is_empty() && proj != "test-project" && proj != "project-id" {
-                if let Ok(hv) = header::HeaderValue::from_str(proj) {
-                    headers.insert("x-goog-user-project", hv);
-                }
-            }
-        }
+        // [REMOVED] 不再注入 x-goog-user-project 配额项目头（对齐上游 v4.6.2 已验证方案）。
+        // 官方 Antigravity 客户端在内容生成请求中从不发送该 Header（见抓包协议文档），
+        // 一旦发送，Google 会对 body 中的 project（如 aicode-consumers）执行配额项目 IAM 校验，
+        // 无 serviceusage.services.use 权限的账号一律返回 403 USER_PROJECT_DENIED。
+        // 移除后鉴权回归正常，也无需再靠"摘头偷偷重试"的降级补丁兜底。
 
         // 注入额外的 Headers (如 anthropic-beta)
         for (k, v) in extra_headers {

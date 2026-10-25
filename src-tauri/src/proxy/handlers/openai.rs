@@ -874,7 +874,10 @@ pub async fn handle_chat_completions(
                     let pacer_guard = token_manager.begin_request_pacing(&account_id, Some(estimated_prompt_tokens));
                     let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
                     let pacer_clone = pacer_arc.clone();
+                    let inflight_arc = std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
+                    let inflight_clone = inflight_arc.clone();
                     let stream_with_pacer = async_stream::stream! {
+                        let _guard_hold = inflight_clone;
                         let mut inner = Box::pin(combined_stream);
                         while let Some(item) = inner.next().await {
                             yield item;
@@ -884,6 +887,7 @@ pub async fn handle_chat_completions(
                                 guard.complete();
                             }
                         }
+                        drop(_guard_hold);
                     };
                     let body = Body::from_stream(stream_with_pacer);
                     return Ok(builder.body(body).unwrap().into_response());
@@ -2001,6 +2005,11 @@ pub async fn handle_completions(
     }
     let token_manager = state.token_manager.clone();
 
+    let raw_estimated =
+        crate::proxy::mappers::context_manager::ContextManager::estimate_openai_token_usage(
+            &openai_req,
+        );
+
     let mut compression_applied = false;
     let mut is_purified = false;
 
@@ -2011,10 +2020,6 @@ pub async fn handle_completions(
             2_000_000
         };
 
-        let raw_estimated =
-            crate::proxy::mappers::context_manager::ContextManager::estimate_openai_token_usage(
-                &openai_req,
-            );
         let calibrator = crate::proxy::mappers::estimation_calibrator::get_calibrator();
         let mut estimated_usage = calibrator.calibrate(raw_estimated);
         let mut usage_ratio = estimated_usage as f32 / context_limit as f32;
@@ -2514,8 +2519,26 @@ pub async fn handle_completions(
                     if let Some(p) = peak {
                         builder = builder.header("X-In-Flight-Peak", p.to_string());
                     }
+                    let pacer_guard = token_manager.begin_request_pacing(&account_id, Some(raw_estimated as u32));
+                    let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
+                    let pacer_clone = pacer_arc.clone();
+                    let inflight_arc = std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
+                    let inflight_clone = inflight_arc.clone();
+                    let stream_with_guards = async_stream::stream! {
+                        let _guard_hold = inflight_clone;
+                        let mut inner = Box::pin(combined_stream);
+                        while let Some(item) = inner.next().await {
+                            yield item;
+                        }
+                        if let Ok(mut g) = pacer_clone.lock() {
+                            if let Some(mut guard) = g.take() {
+                                guard.complete();
+                            }
+                        }
+                        drop(_guard_hold);
+                    };
                     return builder
-                        .body(Body::from_stream(combined_stream))
+                        .body(Body::from_stream(stream_with_guards))
                         .unwrap()
                         .into_response();
                 } else {

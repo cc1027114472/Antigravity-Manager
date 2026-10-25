@@ -1789,6 +1789,14 @@ impl TokenManager {
         protected_models.contains(target_model) || protected_models.contains(&clean_model)
     }
 
+    /// 获取当前绑定到指定账号的活跃会话数量
+    pub fn bound_session_count(&self, account_id: &str) -> usize {
+        self.session_accounts
+            .iter()
+            .filter(|entry| entry.value() == account_id)
+            .count()
+    }
+
     /// P2C 算法的候选池大小 - 从前 N 个最优候选中随机选择
     const P2C_POOL_SIZE: usize = 5;
 
@@ -1885,21 +1893,29 @@ impl TokenManager {
         let c1 = final_candidates[pick1];
         let c2 = final_candidates[pick2];
 
-        // 选择配额更高的
-        let selected = if c1.remaining_quota.unwrap_or(0) >= c2.remaining_quota.unwrap_or(0) {
+        // 优先选择绑定会话数更少的账号，防止多个会话同时扎堆轰炸同一个账号
+        let s1 = self.bound_session_count(&c1.account_id);
+        let s2 = self.bound_session_count(&c2.account_id);
+
+        let selected = if s1 != s2 {
+            if s1 < s2 { c1 } else { c2 }
+        } else if c1.remaining_quota.unwrap_or(0) >= c2.remaining_quota.unwrap_or(0) {
             c1
         } else {
             c2
         };
 
         tracing::debug!(
-            "🎲 [P2C] Selected {} ({}%) from [{}({}%), {}({}%)]",
+            "🎲 [P2C] Selected {} ({}%, {} sessions) from [{}({}%, {} sessions), {}({}%, {} sessions)]",
             selected.email,
             selected.remaining_quota.unwrap_or(0),
+            self.bound_session_count(&selected.account_id),
             c1.email,
             c1.remaining_quota.unwrap_or(0),
+            s1,
             c2.email,
-            c2.remaining_quota.unwrap_or(0)
+            c2.remaining_quota.unwrap_or(0),
+            s2
         );
 
         Some(selected)
