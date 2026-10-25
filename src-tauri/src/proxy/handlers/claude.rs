@@ -886,35 +886,42 @@ pub async fn handle_messages(
             }
         }
 
-        // [Heat Critical Protection] 大任务防熔断兜底
-        if estimated_prompt_tokens > 50_000 && token_manager.pacer.is_heat_critical(&account_id) {
+        // [Heat Preflight] 请求开始时按预估 tokens 预判拦截（替代完成后记账，杜绝并发穿透）
+        let raw_body_len: usize = headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| serde_json::to_vec(&request_for_body).map(|b| b.len()).unwrap_or(0));
+        if let Some(retry_after) = token_manager
+            .pacer
+            .preflight_check(&account_id, estimated_prompt_tokens, raw_body_len)
+        {
             tracing::warn!(
-                "[{}] 🔥 [Heat Protection] Target account {} at critical heat ({:.2} >= 3.0). Holding 8s buffer...",
+                "[{}] 🛑 [Heat Preflight] Rejecting {} ({} tokens, {} bytes) with 429 Retry-After: {}s",
                 trace_id,
                 email,
-                token_manager.pacer.get_account_heat(&account_id)
+                estimated_prompt_tokens,
+                raw_body_len,
+                retry_after
             );
-            tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
-            if token_manager.pacer.is_heat_critical(&account_id) {
-                tracing::warn!(
-                    "[{}] 🛑 [Heat Protection] Account {} still critically overheated. Rejecting with 429 Retry-After.",
-                    trace_id,
-                    email
-                );
-                let err_json = json!({
-                    "type": "error",
-                    "error": {
-                        "type": "rate_limit_error",
-                        "message": "All pool accounts are currently cooling down from high-volume prompt workloads. Please retry in 20 seconds."
-                    }
-                });
-                let builder = Response::builder()
-                    .status(StatusCode::TOO_MANY_REQUESTS)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header("Retry-After", "20");
-                return builder.body(Body::from(serde_json::to_string(&err_json).unwrap())).unwrap();
-            }
+            let err_json = json!({
+                "type": "error",
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": format!("All pool accounts are currently cooling down from high-volume prompt workloads. Please retry in {} seconds.", retry_after)
+                }
+            });
+            let builder = Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Retry-After", retry_after.to_string());
+            return builder.body(Body::from(serde_json::to_string(&err_json).unwrap())).unwrap();
         }
+
+        // [Heat Preflight] 放行后立即按预估 tokens 预占热度
+        token_manager
+            .pacer
+            .preallocate_heat(&account_id, estimated_prompt_tokens, raw_body_len);
 
         // ===== 【优化】后台任务智能检测与降级 =====
         // 使用新的检测系统，支持 5 大类关键词和多 Flash 模型策略

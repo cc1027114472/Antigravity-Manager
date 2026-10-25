@@ -172,14 +172,122 @@ impl HumanizedPacer {
         }
     }
 
+    /// 大任务热度的单次增量（与 mark_request_completed 的阶梯一致）：
+    /// >=100K tokens → 2.0；30K~100K → 1.0；其余 0.0
+    fn heat_increment_for_tokens(tokens: u32) -> f64 {
+        if tokens >= 100_000 {
+            2.0
+        } else if tokens >= 30_000 {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// 请求开始时的合成热度：当前热度 + 本次预估任务将带来的热度增量
+    /// （用于"请求开始时按预估 tokens 预判拦截"，避免完成后才记账导致的并发穿透）
+    pub fn projected_heat(&self, account_id: &str, prompt_tokens: u32) -> f64 {
+        let current = self.get_account_heat(account_id);
+        let added = Self::heat_increment_for_tokens(prompt_tokens);
+        current + added
+    }
+
+    /// [Preflight] 大任务开始前预判拦截：
+    /// 返回 Some(retry_after_secs) 表示应立即 429 拒绝；None 表示放行。
+    /// 规则：
+    /// 1. >200KB 超大请求（TOS 高危）：账号只要不是完全冷却（heat >= 0.5）即拒绝，强制回冷窗口；
+    /// 2. >30K tokens 大任务且合成热度 >= 2.0（critical 熔断线下调）即拒绝，防止同一账号反复叠加超大任务。
+    pub fn preflight_check(
+        &self,
+        account_id: &str,
+        prompt_tokens: u32,
+        raw_body_len: usize,
+    ) -> Option<u64> {
+        let current = self.get_account_heat(account_id);
+
+        // 超大体量（>200KB ≈ >50K~100K tokens）：软拦截，要求账号几乎完全冷却
+        if raw_body_len > 200 * 1024 {
+            if current >= 0.5 {
+                tracing::warn!(
+                    "🛑 [Heat Preflight] Account {} oversized payload ({} bytes) but heat {:.2} >= 0.5. Rejecting 429.",
+                    account_id,
+                    raw_body_len,
+                    current
+                );
+                return Some(25);
+            }
+            return None;
+        }
+
+        // 大任务热度预判：>30K tokens 且合成热度 >= 2.0 → 429
+        if prompt_tokens > 30_000 {
+            let projected = self.projected_heat(account_id, prompt_tokens);
+            if projected >= 2.0 {
+                tracing::warn!(
+                    "🛑 [Heat Preflight] Account {} projected heat {:.2} >= 2.0 for {} tokens. Rejecting 429.",
+                    account_id,
+                    projected,
+                    prompt_tokens
+                );
+                return Some(20);
+            }
+        }
+        None
+    }
+
+    /// [Preflight] 请求开始时立即按预估 tokens（及 raw body 大小）预占热度，
+    /// 保证大请求在流式传输期间（尚未完成记账前）热度就已生效，并发请求会立刻看到热号而绕开。
+    pub fn preallocate_heat(&self, account_id: &str, prompt_tokens: u32, raw_body_len: usize) {
+        let now = std::time::Instant::now();
+        let mut entry = self.account_states.entry(account_id.to_string()).or_insert_with(|| {
+            AccountPacerState {
+                last_request_time: now,
+                last_response_completed_at: None,
+                next_allowed_request_at: now,
+                rolling_requests: std::collections::VecDeque::new(),
+                request_counter: 0,
+                current_interval_ms: 2000,
+                nap_until: None,
+                threshold_jitter: Self::get_threshold_jitter(account_id),
+                massive_heat: 0.0,
+                last_heat_updated_at: now,
+            }
+        });
+
+        let elapsed_secs = entry.last_heat_updated_at.elapsed().as_secs_f64();
+        let decayed_heat = entry.massive_heat * (0.5f64).powf(elapsed_secs / 180.0);
+
+        // >200KB 直接按 >=100K tokens 的高危档预占 2.0 热度，锁定账号冷却窗口
+        let effective_tokens = if raw_body_len > 200 * 1024 {
+            prompt_tokens.max(100_000)
+        } else {
+            prompt_tokens
+        };
+        let added = Self::heat_increment_for_tokens(effective_tokens);
+
+        entry.massive_heat = decayed_heat + added;
+        entry.last_heat_updated_at = now;
+
+        if added > 0.0 {
+            tracing::info!(
+                "🔥 [HumanizedPacer] Account {} heat pre-allocated at start: {:.2} (+{:.1} from {} tokens, body {}B)",
+                account_id,
+                entry.massive_heat,
+                added,
+                effective_tokens,
+                raw_body_len
+            );
+        }
+    }
+
     /// 账号热度是否达到饱和警戒线 (Heat >= 1.5)，饱和账号应避免连续承接新的大任务
     pub fn is_heat_saturated(&self, account_id: &str) -> bool {
         self.get_account_heat(account_id) >= 1.5
     }
 
-    /// 账号热度是否达到极限熔断线 (Heat >= 3.0)
+    /// 账号热度是否达到极限熔断线 (Heat >= 2.0，已由 3.0 下调以便更早背压)
     pub fn is_heat_critical(&self, account_id: &str) -> bool {
-        self.get_account_heat(account_id) >= 3.0
+        self.get_account_heat(account_id) >= 2.0
     }
 
     /// 检查账号距离下一次允许发起请求还需要等待多少毫秒
@@ -296,33 +404,13 @@ impl HumanizedPacer {
             }
         });
 
-        // 1. 先进行时间指数衰减（半衰期 180s）
+        // 1. 完成时不再重复累加大任务热度：
+        //    热度已在请求开始时通过 preallocate_heat 按预估 tokens 预占，
+        //    此处仅做时间衰减刷新（保持 last_heat_updated_at 持续滚动，避免老年热度永久挂账）
         let elapsed_secs = entry.last_heat_updated_at.elapsed().as_secs_f64();
         let decayed_heat = entry.massive_heat * (0.5f64).powf(elapsed_secs / 180.0);
-
-        // 2. 阶梯追加本次任务热度
-        let tokens = prompt_tokens.unwrap_or(0);
-        let added_heat = if tokens >= 100_000 {
-            2.0 // >100K Tokens (超大/重构任务) 产出 2.0 热度
-        } else if tokens >= 30_000 {
-            1.0 // 30K~100K Tokens 产出 1.0 热度
-        } else {
-            0.0 // 小任务不增加大任务过热分
-        };
-
-        entry.massive_heat = decayed_heat + added_heat;
+        entry.massive_heat = if decayed_heat < 0.05 { 0.0 } else { decayed_heat };
         entry.last_heat_updated_at = now;
-
-        if added_heat > 0.0 {
-            tracing::info!(
-                "🔥 [HumanizedPacer] Account {} heat updated: {:.2} (+{:.1} from {} tokens, decayed from {:.2})",
-                account_id,
-                entry.massive_heat,
-                added_heat,
-                tokens,
-                decayed_heat
-            );
-        }
 
         entry.last_response_completed_at = Some(now);
         entry.next_allowed_request_at = next_allowed;
