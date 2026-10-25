@@ -126,26 +126,42 @@ struct Tier {
     slug: Option<String>,
 }
 
-/// Get shared HTTP Client (15s timeout) for pure info fetching (No JA3)
+/// Get shared HTTP Client (15s timeout) with Chrome132 TLS Emulation
 async fn create_standard_client(account_id: Option<&str>) -> rquest::Client {
     if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(account_id, 15).await
+        pool.get_effective_client(account_id, 15).await
     } else {
-        crate::utils::http::get_standard_client()
+        crate::utils::http::get_client()
     }
 }
 
-/// Get shared HTTP Client (60s timeout) for pure info fetching (No JA3)
-#[allow(dead_code)] // 预留给预热/后台任务调用
+/// Get shared HTTP Client (60s timeout) with Chrome132 TLS Emulation
+#[allow(dead_code)]
 async fn create_long_standard_client(account_id: Option<&str>) -> rquest::Client {
     if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(account_id, 60).await
+        pool.get_effective_client(account_id, 60).await
     } else {
-        crate::utils::http::get_long_standard_client()
+        crate::utils::http::get_long_client()
     }
 }
 
-const CLOUD_CODE_BASE_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+/// 统一注入官方 Antigravity IDE 客户端身份头，消除非浏览器指纹与脚本特征
+fn inject_official_client_headers(
+    builder: rquest::RequestBuilder,
+    access_token: &str,
+) -> rquest::RequestBuilder {
+    let mid = machine_uid::get().unwrap_or_else(|_| "00000000-0000-0000-0000-000000000000".to_string());
+    builder
+        .bearer_auth(access_token)
+        .header(rquest::header::CONTENT_TYPE, "application/json")
+        .header(rquest::header::USER_AGENT, crate::constants::USER_AGENT.as_str())
+        .header("x-client-name", "antigravity")
+        .header("x-client-version", crate::constants::CURRENT_VERSION.as_str())
+        .header("x-machine-id", mid)
+        .header("x-vscode-sessionid", crate::constants::SESSION_ID.as_str())
+}
+
+const CLOUD_CODE_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 
 /// Fetch project ID and subscription tier
 async fn fetch_project_id(
@@ -168,17 +184,9 @@ async fn fetch_project_id(
     let client = create_standard_client(account_id).await;
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
 
-    let res = client
-        .post(format!("{}/v1internal:loadCodeAssist", CLOUD_CODE_BASE_URL))
-        .header(
-            rquest::header::AUTHORIZATION,
-            format!("Bearer {}", access_token),
-        )
-        .header(rquest::header::CONTENT_TYPE, "application/json")
-        .header(
-            rquest::header::USER_AGENT,
-            crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
-        )
+    let req = client
+        .post(format!("{}/v1internal:loadCodeAssist", CLOUD_CODE_BASE_URL));
+    let res = inject_official_client_headers(req, access_token)
         .json(&meta)
         .send()
         .await;
@@ -303,13 +311,8 @@ pub async fn fetch_quota_with_cache(
     for (ep_idx, ep_url) in QUOTA_API_ENDPOINTS.iter().enumerate() {
         let has_next = ep_idx + 1 < QUOTA_API_ENDPOINTS.len();
 
-        match client
-            .post(*ep_url)
-            .bearer_auth(access_token)
-            .header(
-                rquest::header::USER_AGENT,
-                crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
-            )
+        let req = client.post(*ep_url);
+        match inject_official_client_headers(req, access_token)
             .json(&payload)
             .send()
             .await
@@ -501,13 +504,8 @@ async fn fetch_quota_summary(
     };
 
     for ep_url in QUOTA_SUMMARY_ENDPOINTS.iter() {
-        let res = client
-            .post(*ep_url)
-            .bearer_auth(access_token)
-            .header(
-                rquest::header::USER_AGENT,
-                crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
-            )
+        let req = client.post(*ep_url);
+        let res = inject_official_client_headers(req, access_token)
             .json(&payload)
             .send()
             .await;
