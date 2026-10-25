@@ -178,7 +178,7 @@ pub static CURRENT_VERSION: LazyLock<String> = LazyLock::new(|| {
 
 /// Native OAuth Authorization User-Agent
 pub static NATIVE_OAUTH_USER_AGENT: LazyLock<String> =
-    LazyLock::new(|| format!("vscode/1.96.2 (Antigravity/{})", CURRENT_VERSION.as_str()));
+    LazyLock::new(|| format!("vscode/1.X.X (Antigravity/{})", CURRENT_VERSION.as_str()));
 
 /// Current resolved Antigravity version (e.g., "4.3.0")
 pub fn get_current_version() -> String {
