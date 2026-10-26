@@ -41,6 +41,18 @@ pub struct RateLimitInfo {
 /// 连续失败计数过期时间：1小时（超过此时间未失败则重置计数）
 const FAILURE_COUNT_EXPIRY_SECONDS: u64 = 3600;
 
+/// 冷启动平滑缓冲：服务启动后前 60 秒内禁止大体量请求直接突刺上游，
+/// 防止 docker restart 后积压请求瞬间涌入触发 Google 风控（TOS_VIOLATION）
+const COLD_START_WARMUP_SECS: u64 = 60;
+
+/// 大任务热度极限熔断线：合成热度达到该值即拒绝 >30K tokens 任务。
+/// 由 2.0 放大到 4.0 —— 30K~100K 任务允许连发 3 个，100K+ 任务冷号可放行 1 个，
+/// 保证正常对话/大上下文顺畅，同时仍能拦住同一账号连续大任务风暴。
+const HEAT_CRITICAL_THRESHOLD: f64 = 4.0;
+
+/// 超大体量（>200KB）软拦截线：账号热度 >= 该值即拒绝（由 0.5 放大到 1.0）
+const OVERSIZE_HEAT_THRESHOLD: f64 = 1.0;
+
 /// 单账号拟人化节奏与风控状态
 #[derive(Debug, Clone)]
 pub struct AccountPacerState {
@@ -69,12 +81,15 @@ pub struct AccountPacerState {
 /// 单账号拟人化流控与防均质化调度器
 pub struct HumanizedPacer {
     account_states: DashMap<String, AccountPacerState>,
+    /// 服务进程启动时刻，用于冷启动平滑缓冲（重启后前 60s 限制大请求突刺）
+    started_at: std::time::Instant,
 }
 
 impl HumanizedPacer {
     pub fn new() -> Self {
         Self {
             account_states: DashMap::new(),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -195,8 +210,12 @@ impl HumanizedPacer {
     /// [Preflight] 大任务开始前预判拦截：
     /// 返回 Some(retry_after_secs) 表示应立即 429 拒绝；None 表示放行。
     /// 规则：
-    /// 1. >200KB 超大请求（TOS 高危）：账号只要不是完全冷却（heat >= 0.5）即拒绝，强制回冷窗口；
-    /// 2. >30K tokens 大任务且合成热度 >= 2.0（critical 熔断线下调）即拒绝，防止同一账号反复叠加超大任务。
+    /// 0. 冷启动缓冲：服务启动后前 COLD_START_WARMUP_SECS 秒内，大体量请求一律 429 缓一缓，
+    ///    防止 docker restart 后积压请求瞬间突刺上游（发版封号高峰的根因）；
+    /// 1. >200KB 超大请求（TOS 高危）：账号热度 >= 1.0（已由 0.5 放大）即拒绝，强制回冷窗口；
+    ///    且不再直接放行，继续走 token 预判（堵住"冷号+超大请求"裂缝）；
+    /// 2. >30K tokens 大任务且合成热度 >= HEAT_CRITICAL_THRESHOLD(4.0，已由 2.0 放大) 即拒绝，
+    ///    保证正常对话顺畅，同时拦截同一账号连续大任务风暴。
     pub fn preflight_check(
         &self,
         account_id: &str,
@@ -205,28 +224,45 @@ impl HumanizedPacer {
     ) -> Option<u64> {
         let current = self.get_account_heat(account_id);
 
-        // 超大体量（>200KB ≈ >50K~100K tokens）：软拦截，要求账号几乎完全冷却
+        // 0. 冷启动平滑缓冲：重启后前 60s 内，大请求一律 429 Retry-After 30s
+        let uptime_secs = self.started_at.elapsed().as_secs();
+        if uptime_secs < COLD_START_WARMUP_SECS
+            && (raw_body_len > 200 * 1024 || prompt_tokens > 30_000)
+        {
+            tracing::warn!(
+                "🛡️ [Cold-Start Warmup] Account {} large request ({} tokens, {}B) within first {}s after start. Rejecting 429 Retry-After 30s.",
+                account_id,
+                prompt_tokens,
+                raw_body_len,
+                COLD_START_WARMUP_SECS
+            );
+            return Some(30);
+        }
+
+        // 1. 超大体量（>200KB ≈ >50K~100K tokens）：软拦截，要求账号热度低于 1.0
         if raw_body_len > 200 * 1024 {
-            if current >= 0.5 {
+            if current >= OVERSIZE_HEAT_THRESHOLD {
                 tracing::warn!(
-                    "🛑 [Heat Preflight] Account {} oversized payload ({} bytes) but heat {:.2} >= 0.5. Rejecting 429.",
+                    "🛑 [Heat Preflight] Account {} oversized payload ({} bytes) but heat {:.2} >= {:.1}. Rejecting 429.",
                     account_id,
                     raw_body_len,
-                    current
+                    current,
+                    OVERSIZE_HEAT_THRESHOLD
                 );
                 return Some(25);
             }
-            return None;
+            // 注意：不再 return None 直接放行，继续走 token 预判，堵住毒 IP 利用"冷号+超大请求"的裂缝
         }
 
-        // 大任务热度预判：>30K tokens 且合成热度 >= 2.0 → 429
+        // 2. 大任务热度预判：>30K tokens 且合成热度 >= 4.0 → 429
         if prompt_tokens > 30_000 {
             let projected = self.projected_heat(account_id, prompt_tokens);
-            if projected >= 2.0 {
+            if projected >= HEAT_CRITICAL_THRESHOLD {
                 tracing::warn!(
-                    "🛑 [Heat Preflight] Account {} projected heat {:.2} >= 2.0 for {} tokens. Rejecting 429.",
+                    "🛑 [Heat Preflight] Account {} projected heat {:.2} >= {:.1} for {} tokens. Rejecting 429.",
                     account_id,
                     projected,
+                    HEAT_CRITICAL_THRESHOLD,
                     prompt_tokens
                 );
                 return Some(20);
@@ -285,9 +321,9 @@ impl HumanizedPacer {
         self.get_account_heat(account_id) >= 1.5
     }
 
-    /// 账号热度是否达到极限熔断线 (Heat >= 2.0，已由 3.0 下调以便更早背压)
+    /// 账号热度是否达到极限熔断线 (Heat >= HEAT_CRITICAL_THRESHOLD，已由 2.0 放大到 4.0 以便正常对话顺畅)
     pub fn is_heat_critical(&self, account_id: &str) -> bool {
-        self.get_account_heat(account_id) >= 2.0
+        self.get_account_heat(account_id) >= HEAT_CRITICAL_THRESHOLD
     }
 
     /// 检查账号距离下一次允许发起请求还需要等待多少毫秒
