@@ -188,12 +188,14 @@ impl HumanizedPacer {
     }
 
     /// 大任务热度的单次增量（与 mark_request_completed 的阶梯一致）：
-    /// >=100K tokens → 2.0；30K~100K → 1.0；其余 0.0
+    /// >=100K tokens → 2.0；70K~100K → 1.0；30K~70K → 0.5（用户要求降低中等任务惩罚）；其余 0.0
     fn heat_increment_for_tokens(tokens: u32) -> f64 {
         if tokens >= 100_000 {
             2.0
-        } else if tokens >= 30_000 {
+        } else if tokens >= 70_000 {
             1.0
+        } else if tokens >= 30_000 {
+            0.5
         } else {
             0.0
         }
