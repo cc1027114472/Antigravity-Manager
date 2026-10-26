@@ -188,9 +188,9 @@ impl HumanizedPacer {
     }
 
     /// 大任务热度的单次增量（与 mark_request_completed 的阶梯一致）：
-    /// >=100K tokens → 2.0；70K~100K → 1.0；30K~70K → 0.5（用户要求降低中等任务惩罚）；其余 0.0
+    /// >=130K tokens → 2.0；70K~130K → 1.0（用户指定）；30K~70K → 0.5；其余 0.0
     fn heat_increment_for_tokens(tokens: u32) -> f64 {
-        if tokens >= 100_000 {
+        if tokens >= 130_000 {
             2.0
         } else if tokens >= 70_000 {
             1.0
@@ -295,9 +295,9 @@ impl HumanizedPacer {
         let elapsed_secs = entry.last_heat_updated_at.elapsed().as_secs_f64();
         let decayed_heat = entry.massive_heat * (0.5f64).powf(elapsed_secs / 180.0);
 
-        // >200KB 直接按 >=100K tokens 的高危档预占 2.0 热度，锁定账号冷却窗口
+        // >200KB 直接按 >=130K tokens 的高危档预占 2.0 热度，锁定账号冷却窗口
         let effective_tokens = if raw_body_len > 200 * 1024 {
-            prompt_tokens.max(100_000)
+            prompt_tokens.max(130_000)
         } else {
             prompt_tokens
         };
