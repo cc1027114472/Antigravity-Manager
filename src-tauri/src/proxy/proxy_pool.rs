@@ -276,7 +276,8 @@ impl ProxyPoolManager {
     /// 逻辑：
     /// 1. 账号显式绑定代理优先 (Account-Proxy Binding)
     /// 2. 如果无绑定，且开启了“自动全局”，取池中第一个节点
-    /// 3. 如果以上均无，则检查全局上游代理 (Upstream Proxy) [由调用方 fallback]
+    /// 3. 如果以上均无，则检查全局上游代理 (Upstream Proxy)
+    /// [STRICT PROXY] 若最终未匹配到任何代理，返回“黑洞客户端”（禁止直连）
     pub async fn get_effective_client(
         &self,
         account_id: Option<&str>,
@@ -301,7 +302,7 @@ impl ProxyPoolManager {
                     );
                 } else {
                     // [FIX #1583] 明确记录池中无可用代理的情况
-                    tracing::warn!("[Proxy] Route: Generic Request -> No available proxy in pool, falling back to upstream or direct");
+                    tracing::warn!("[Proxy] Route: Generic Request -> No available proxy in pool, falling back to upstream");
                 }
                 res
             } else {
@@ -318,24 +319,58 @@ impl ProxyPoolManager {
             if let Ok(app_cfg) = crate::modules::config::load_app_config() {
                 let up = app_cfg.proxy.upstream_proxy;
                 if up.enabled && !up.url.is_empty() {
-                    if let Ok(p) = rquest::Proxy::all(&up.url) {
-                        tracing::info!(
-                            "[Proxy] Route: {:?} -> Upstream: {} (AppConfig)",
-                            account_id.unwrap_or("Generic"),
-                            up.url
-                        );
-                        builder = builder.proxy(p);
+                    match rquest::Proxy::all(&up.url) {
+                        Ok(p) => {
+                            tracing::info!(
+                                "[Proxy] Route: {:?} -> Upstream: {} (AppConfig)",
+                                account_id.unwrap_or("Generic"),
+                                up.url
+                            );
+                            builder = builder.proxy(p);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[Proxy] Upstream proxy URL invalid ({}): {}. Strict policy: refuse direct!",
+                                up.url, e
+                            );
+                            return crate::utils::http::build_blackhole_client(&format!(
+                                "upstream proxy URL invalid: {}",
+                                up.url
+                            ));
+                        }
                     }
                 } else {
-                    tracing::info!(
-                        "[Proxy] Route: {:?} -> Direct",
+                    tracing::error!(
+                        "[Proxy] Route: {:?} -> NO proxy available (pool empty & upstream disabled). Strict policy: BLACKHOLE, refuse direct!",
                         account_id.unwrap_or("Generic")
                     );
+                    return crate::utils::http::build_blackhole_client(
+                        "no proxy available: pool empty & upstream disabled",
+                    );
                 }
+            } else {
+                tracing::error!(
+                    "[Proxy] Failed to read app config for upstream fallback. Strict policy: BLACKHOLE, refuse direct!"
+                );
+                return crate::utils::http::build_blackhole_client(
+                    "failed to load app config for upstream fallback",
+                );
             }
         }
 
-        builder.build().unwrap_or_else(|_| Client::new())
+        match builder.build() {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::error!(
+                    "[Proxy] Client build failed ({}). Strict policy: BLACKHOLE, refuse bare client!",
+                    e
+                );
+                crate::utils::http::build_blackhole_client(&format!(
+                    "client build failed: {}",
+                    e
+                ))
+            }
+        }
     }
 
     /// [NEW] 为指定账号获取“最终生效”的无特征 Standard HttpClient (专门用于纯净场景，如 OAuth 退还)
@@ -394,26 +429,70 @@ impl ProxyPoolManager {
             if let Ok(app_cfg) = crate::modules::config::load_app_config() {
                 let up = app_cfg.proxy.upstream_proxy;
                 if up.enabled && !up.url.is_empty() {
-                    if let Ok(p) = rquest::Proxy::all(&up.url) {
-                        tracing::info!(
-                            "[Proxy] Route: {:?} (Standard Client) -> Upstream: {} (AppConfig)",
-                            account_id.unwrap_or("Generic"),
-                            up.url
-                        );
-                        builder = builder.proxy(p);
-                        resolved = EgressRoute::Upstream;
+                    match rquest::Proxy::all(&up.url) {
+                        Ok(p) => {
+                            tracing::info!(
+                                "[Proxy] Route: {:?} (Standard Client) -> Upstream: {} (AppConfig)",
+                                account_id.unwrap_or("Generic"),
+                                up.url
+                            );
+                            builder = builder.proxy(p);
+                            resolved = EgressRoute::Upstream;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[Proxy] (Standard Client) upstream proxy URL invalid ({}): {}. Strict policy: refuse direct!",
+                                up.url, e
+                            );
+                            return (
+                                crate::utils::http::build_blackhole_client(&format!(
+                                    "upstream proxy URL invalid: {}",
+                                    up.url
+                                )),
+                                EgressRoute::Direct,
+                            );
+                        }
                     }
                 } else {
-                    tracing::info!(
-                        "[Proxy] Route: {:?} (Standard Client) -> Direct",
+                    tracing::error!(
+                        "[Proxy] Route: {:?} (Standard Client) -> NO proxy available (pool empty & upstream disabled). Strict policy: BLACKHOLE, refuse direct!",
                         account_id.unwrap_or("Generic")
                     );
+                    // [STRICT PROXY] 双保险：即使调用方漏检 route，黑洞客户端也无法直连
+                    return (
+                        crate::utils::http::build_blackhole_client(
+                            "no proxy available: pool empty & upstream disabled (standard client)",
+                        ),
+                        EgressRoute::Direct,
+                    );
                 }
+            } else {
+                tracing::error!(
+                    "[Proxy] (Standard Client) failed to read app config for upstream fallback. Strict policy: BLACKHOLE, refuse direct!"
+                );
+                return (
+                    crate::utils::http::build_blackhole_client(
+                        "failed to load app config for upstream fallback (standard client)",
+                    ),
+                    EgressRoute::Direct,
+                );
             }
             resolved
         };
 
-        let client = builder.build().unwrap_or_else(|_| Client::new());
+        let client = match builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    "[Proxy] (Standard Client) client build failed ({}). Strict policy: BLACKHOLE, refuse bare client!",
+                    e
+                );
+                crate::utils::http::build_blackhole_client(&format!(
+                    "standard client build failed: {}",
+                    e
+                ))
+            }
+        };
         (client, route)
     }
 
@@ -877,8 +956,20 @@ impl ProxyPoolManager {
         }
     }
 
-    /// 健康检查
+    /// 全量健康检查（手动触发 / 低频巡检）：检查所有启用的代理
     pub async fn health_check(&self) -> Result<(), String> {
+        self.health_check_filtered(false).await
+    }
+
+    /// 双速自愈：只重探当前标记为不健康（RED）的代理，用于快速回绿
+    pub async fn health_check_unhealthy(&self) -> Result<(), String> {
+        self.health_check_filtered(true).await
+    }
+
+    /// 健康检查（内部公共实现）
+    /// - only_unhealthy == false: 全量扫描所有启用的代理
+    /// - only_unhealthy == true:  只扫描当前 is_healthy == false 的红色节点（自愈路径）
+    async fn health_check_filtered(&self, only_unhealthy: bool) -> Result<(), String> {
         // 由于需要异步并发检查，且不能锁住 config 太久，
         // 我们先复制一份需要检查的代理列表
         let proxies_to_check: Vec<_> = {
@@ -886,10 +977,15 @@ impl ProxyPoolManager {
             config
                 .proxies
                 .iter()
-                .filter(|p| p.enabled)
+                .filter(|p| p.enabled && (!only_unhealthy || !p.is_healthy))
                 .cloned()
                 .collect()
         };
+
+        if proxies_to_check.is_empty() {
+            // 自愈路径下如果没有红色节点，直接返回，无需空转一轮
+            return Ok(());
+        }
 
         let concurrency_limit = 20usize;
         let results = stream::iter(proxies_to_check)
@@ -921,9 +1017,33 @@ impl ProxyPoolManager {
             let mut config = self.config.write().await;
             for (id, is_healthy, latency) in &results {
                 if let Some(proxy) = config.proxies.iter_mut().find(|p| &p.id == id) {
+                    let was_healthy = proxy.is_healthy;
                     proxy.is_healthy = *is_healthy;
                     proxy.latency = *latency;
                     proxy.last_check_time = Some(chrono::Utc::now().timestamp());
+
+                    // [NET-OBS] 网络波动观察：代理健康状态翻转日志（RED→GREEN 表示恢复；GREEN→RED 表示劣化）
+                    if was_healthy && !*is_healthy {
+                        tracing::warn!(
+                            proxy_id = %proxy.id,
+                            proxy_name = %proxy.name,
+                            proxy_url = %proxy.url,
+                            latency_ms = latency.unwrap_or(0),
+                            "[NET-OBS] proxy turned RED (health check): {} ({})",
+                            proxy.name,
+                            proxy.id
+                        );
+                    } else if !was_healthy && *is_healthy {
+                        tracing::info!(
+                            proxy_id = %proxy.id,
+                            proxy_name = %proxy.name,
+                            proxy_url = %proxy.url,
+                            latency_ms = latency.unwrap_or(0),
+                            "[NET-OBS] proxy recovered GREEN (health check): {} ({})",
+                            proxy.name,
+                            proxy.id
+                        );
+                    }
                 }
             }
         }
@@ -1008,30 +1128,98 @@ impl ProxyPoolManager {
         }
     }
 
-    /// 启动健康检查循环
+    /// 红色节点递增退避重探间隔（秒）：
+    /// 变红后依次按 3s → 6s → 9s → 20s 重探，之后保持 20s 连续退避探测直到恢复。
+    /// 既保证瞬时抖动最快 3s 内回绿，又避免对持续宕机的节点高频空探。
+    const RED_RECHECK_BACKOFF_SECS: [u64; 4] = [3, 6, 9, 20];
+
+    /// 启动健康检查循环（退避自愈探测）
+    ///
+    /// 自愈策略：
+    /// - 池中有红色（不健康）节点 → 只快速重探红色节点，探测间隔按 3s→6s→9s→20s 递增退避，
+    ///   探测成功后立即回绿、账号解冻并重置退避进度；探测失败则沿退避阶梯继续，直至全部恢复；
+    /// - 全部节点健康 → 全量低频巡检（health_check_interval，默认 300s），
+    ///   期间每 5s 检查一次是否有节点被业务请求拉红，一旦变红立即打断低频睡眠进入退避重探。
     pub fn start_health_check_loop(self: Arc<Self>) {
         tokio::spawn(async move {
-            tracing::info!("Starting proxy pool health check loop...");
+            tracing::info!("Starting proxy pool health check loop (backoff recheck)...");
+            // 连续红色轮次：决定下一次退避间隔档位（0 = 无红色）
+            let mut consecutive_red_rounds: usize = 0;
+
             loop {
-                // Perform check only if enabled
-                let enabled = self.config.read().await.enabled;
+                // 读取当前状态：代理池是否启用、红色节点数量、配置的巡检间隔
+                let (enabled, red_count, base_interval) = {
+                    let cfg = self.config.read().await;
+                    let red_count = if cfg.enabled {
+                        cfg.proxies
+                            .iter()
+                            .filter(|p| p.enabled && !p.is_healthy)
+                            .count()
+                    } else {
+                        0
+                    };
+                    (cfg.enabled, red_count, cfg.health_check_interval)
+                };
+
                 if enabled {
-                    if let Err(e) = self.health_check().await {
-                        tracing::error!("Proxy pool health check failed: {}", e);
+                    if red_count > 0 {
+                        // 退避自愈：只重探红色节点，快速回绿
+                        if let Err(e) = self.health_check_unhealthy().await {
+                            tracing::error!("Proxy pool red-node recheck failed: {}", e);
+                        }
+                    } else {
+                        // 全绿：全量低频巡检
+                        if let Err(e) = self.health_check().await {
+                            tracing::error!("Proxy pool health check failed: {}", e);
+                        }
                     }
                 }
 
-                // Get interval and sleep AFTER check
-                let interval_secs = {
+                // 检查后重新统计：是否仍有红色残留（决定退避递增 or 重置）
+                let still_red = {
                     let cfg = self.config.read().await;
-                    if !cfg.enabled {
-                        60 // check every minute if disabled
-                    } else {
-                        cfg.health_check_interval.max(30) // Back to default min 30s
-                    }
+                    cfg.proxies
+                        .iter()
+                        .filter(|p| p.enabled && !p.is_healthy)
+                        .count()
+                };
+                consecutive_red_rounds = if still_red > 0 {
+                    (consecutive_red_rounds + 1).min(Self::RED_RECHECK_BACKOFF_SECS.len())
+                } else {
+                    0
                 };
 
-                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                // 计算下一次探测间隔（sleep AFTER check）
+                let interval_secs = if !enabled {
+                    60
+                } else if consecutive_red_rounds > 0 {
+                    // 退避阶梯：3s → 6s → 9s → 20s（封顶 20s，持续退避直至恢复）
+                    Self::RED_RECHECK_BACKOFF_SECS[consecutive_red_rounds - 1]
+                } else {
+                    base_interval.max(30)
+                };
+
+                // 长档睡眠拆分为 5s 片段：感知到运行中代理被业务请求拉红时立即打断进入退避探测
+                if interval_secs > 30 {
+                    let mut slept: u64 = 0;
+                    while slept < interval_secs {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        slept += 5;
+                        let cfg = self.config.read().await;
+                        let suddenly_red = cfg
+                            .proxies
+                            .iter()
+                            .any(|p| p.enabled && !p.is_healthy);
+                        if suddenly_red {
+                            tracing::warn!(
+                                "Proxy turned RED during low-frequency sleep; breaking into backoff recheck"
+                            );
+                            break;
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                }
             }
         });
     }

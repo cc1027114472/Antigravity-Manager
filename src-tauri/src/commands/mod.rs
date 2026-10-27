@@ -1281,8 +1281,20 @@ pub async fn get_token_stats_account_trend_daily(
 
 #[tauri::command]
 pub async fn query_transit_info(url: String, key: String) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+    // [STRICT PROXY] 严禁本地直连任意第三方 API：未启用上游代理时直接拒绝，绝不裸连暴露出口 IP。
+    let config = crate::modules::config::load_app_config()
+        .map_err(|e| format!("STRICT PROXY: failed to load app config: {}", e))?;
+    let upstream = config.proxy.upstream_proxy;
+    if !upstream.enabled || upstream.url.trim().is_empty() {
+        return Err("严格代理策略拦截：未启用全局上游代理，禁止直连查询第三方 API，请先配置代理".to_string());
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10));
+    let proxy = reqwest::Proxy::all(&upstream.url)
+        .map_err(|e| format!("STRICT PROXY: invalid upstream proxy url '{}': {}", upstream.url, e))?;
+    builder = builder.proxy(proxy);
+    let client = builder
         .build()
         .map_err(|e| e.to_string())?;
 

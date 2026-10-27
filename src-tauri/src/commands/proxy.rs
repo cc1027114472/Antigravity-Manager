@@ -632,13 +632,16 @@ pub async fn fetch_zai_models(
 
     let url = join_base_url(&zai.base_url, "/v1/models");
 
+    // [STRICT PROXY] 严禁无代理直连 z.ai！未启用上游代理时直接拒绝。
+    if !upstream_proxy.enabled || upstream_proxy.url.trim().is_empty() {
+        return Err("严格代理策略拦截：未启用上游代理，禁止直连获取 z.ai 模型列表，请先配置全局上游代理".to_string());
+    }
+
     let mut builder =
         reqwest::Client::builder().timeout(Duration::from_secs(request_timeout.max(5)));
-    if upstream_proxy.enabled && !upstream_proxy.url.is_empty() {
-        let proxy = reqwest::Proxy::all(&upstream_proxy.url)
-            .map_err(|e| format!("Invalid upstream proxy url: {}", e))?;
-        builder = builder.proxy(proxy);
-    }
+    let proxy = reqwest::Proxy::all(&upstream_proxy.url)
+        .map_err(|e| format!("Invalid upstream proxy url: {}", e))?;
+    builder = builder.proxy(proxy);
     let client = builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;

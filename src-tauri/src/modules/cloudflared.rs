@@ -148,6 +148,33 @@ impl CloudflaredManager {
         f(&mut status);
     }
 
+    /// 构建带上游代理的下载客户端
+    /// [STRICT PROXY] 严禁本地直连下载 cloudflared 二进制：未配置启用全局上游代理时返回 Err。
+    async fn build_download_client() -> Result<reqwest::Client, String> {
+        let config = crate::modules::config::load_app_config()
+            .map_err(|e| format!("STRICT PROXY: failed to load app config: {}", e))?;
+        let upstream = config.proxy.upstream_proxy;
+        if !upstream.enabled || upstream.url.trim().is_empty() {
+            return Err(
+                "严格代理策略拦截：未启用全局上游代理，禁止直连下载 cloudflared 二进制，请先配置代理"
+                    .to_string(),
+            );
+        }
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .user_agent("antigravity-manager");
+        let proxy = reqwest::Proxy::all(&upstream.url).map_err(|e| {
+            format!(
+                "STRICT PROXY: invalid upstream proxy url '{}': {}",
+                upstream.url, e
+            )
+        })?;
+        builder = builder.proxy(proxy);
+        builder
+            .build()
+            .map_err(|e| format!("Failed to build download client: {}", e))
+    }
+
     /// 安装cloudflared
     pub async fn install(&self) -> Result<CloudflaredStatus, String> {
         let bin_dir = self.bin_path.parent().unwrap();
@@ -159,7 +186,11 @@ impl CloudflaredManager {
         let download_url = get_download_url()?;
         info!("[cloudflared] Downloading from: {}", download_url);
 
-        let response = reqwest::get(&download_url)
+        // [STRICT PROXY] 走上游代理下载，绝不裸连
+        let client = Self::build_download_client().await?;
+        let response = client
+            .get(&download_url)
+            .send()
             .await
             .map_err(|e| format!("Download failed: {}", e))?;
 

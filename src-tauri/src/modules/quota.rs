@@ -126,23 +126,51 @@ struct Tier {
     slug: Option<String>,
 }
 
-/// Get shared HTTP Client (15s timeout) for pure info fetching (No JA3)
-async fn create_standard_client(account_id: Option<&str>) -> rquest::Client {
+/// Get shared HTTP Client for pure info fetching (No JA3)
+/// [STRICT PROXY] 严格代理策略：必须使用健康代理或有效全局上游代理，遇到 Direct 严禁直连并直接返回 Err！
+async fn create_standard_client(
+    account_id: Option<&str>,
+    timeout_secs: u64,
+) -> Result<(rquest::Client, crate::proxy::proxy_pool::EgressRoute), String> {
     if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(account_id, 15).await
+        let (client, route) = pool
+            .get_effective_standard_client_with_route(account_id, timeout_secs)
+            .await;
+        if route == crate::proxy::proxy_pool::EgressRoute::Direct {
+            let err_msg = format!(
+                "严格代理策略拦截：账号 {:?} 未匹配到健康代理且上游代理未启用，严禁本地直连！",
+                account_id
+            );
+            crate::modules::logger::log_error(&err_msg);
+            return Err(err_msg);
+        }
+        Ok((client, route))
     } else {
-        crate::utils::http::get_standard_client()
+        // 全局代理池未初始化，严格检查全局上游代理
+        if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+            let up = app_cfg.proxy.upstream_proxy;
+            if up.enabled && !up.url.is_empty() {
+                return Ok((
+                    crate::utils::http::get_standard_client(),
+                    crate::proxy::proxy_pool::EgressRoute::Upstream,
+                ));
+            }
+        }
+        let err_msg = format!(
+            "严格代理策略拦截：全局代理池未初始化且未配置全局上游代理，账号 {:?} 严禁本地直连！",
+            account_id
+        );
+        crate::modules::logger::log_error(&err_msg);
+        Err(err_msg)
     }
 }
 
 /// Get shared HTTP Client (60s timeout) for pure info fetching (No JA3)
 #[allow(dead_code)] // 预留给预热/后台任务调用
-async fn create_long_standard_client(account_id: Option<&str>) -> rquest::Client {
-    if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(account_id, 60).await
-    } else {
-        crate::utils::http::get_long_standard_client()
-    }
+async fn create_long_standard_client(
+    account_id: Option<&str>,
+) -> Result<(rquest::Client, crate::proxy::proxy_pool::EgressRoute), String> {
+    create_standard_client(account_id, 60).await
 }
 
 const CLOUD_CODE_BASE_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
@@ -165,7 +193,16 @@ async fn fetch_project_id(
         }
     }
 
-    let client = create_standard_client(account_id).await;
+    let (client, _route) = match create_standard_client(account_id, 15).await {
+        Ok(res) => res,
+        Err(e) => {
+            crate::modules::logger::log_warn(&format!(
+                "跳过 loadCodeAssist 探测，代理不可用: {}",
+                e
+            ));
+            return (None, None);
+        }
+    };
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
 
     let res = client
@@ -291,7 +328,12 @@ pub async fn fetch_quota_with_cache(
 
     // We keep project_id to store in the DB, but we NO LONGER force inject it into payload if it's absent
 
-    let client = create_standard_client(account_id).await;
+    let (client, _route) = match create_standard_client(account_id, 15).await {
+        Ok(res) => res,
+        Err(e) => {
+            return Err(AppError::Network(e, None));
+        }
+    };
     let payload = if let Some(ref pid) = project_id {
         json!({ "project": pid })
     } else {
@@ -493,7 +535,16 @@ async fn fetch_quota_summary(
         }
     }
 
-    let client = create_standard_client(account_id).await;
+    let (client, _route) = match create_standard_client(account_id, 15).await {
+        Ok(res) => res,
+        Err(e) => {
+            crate::modules::logger::log_warn(&format!(
+                "跳过 QuotaSummary 抓取，代理不可用: {}",
+                e
+            ));
+            return None;
+        }
+    };
     let payload = if let Some(pid) = project_id {
         json!({ "project": pid })
     } else {

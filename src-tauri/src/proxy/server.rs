@@ -2008,7 +2008,48 @@ async fn admin_fetch_zai_models(
         .unwrap_or("https://api.z.ai");
 
     // 尝试从 z.ai 获取模型
-    let client = reqwest::Client::new();
+    // [STRICT PROXY] 严禁裸 reqwest 直连 z.ai！统一走代理池/上游代理严格客户端。
+    let (client, route) =
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            pool.get_effective_standard_client_with_route(None, 60).await
+        } else {
+            // 池未初始化：检查应用配置中的全局上游代理，未启用则拒绝
+            if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+                let up = app_cfg.proxy.upstream_proxy;
+                if up.enabled && !up.url.is_empty() {
+                    (
+                        crate::utils::http::get_standard_client(),
+                        crate::proxy::proxy_pool::EgressRoute::Upstream,
+                    )
+                } else {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "严格代理策略拦截：全局代理池未初始化且未配置启用全局上游代理，禁止直连获取 z.ai 模型列表"
+                                .to_string(),
+                        }),
+                    ));
+                }
+            } else {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "严格代理策略拦截：无法读取应用配置确定代理出口，禁止直连获取 z.ai 模型列表"
+                            .to_string(),
+                    }),
+                ));
+            }
+        };
+    if route == crate::proxy::proxy_pool::EgressRoute::Direct {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "严格代理策略拦截：未匹配到健康代理且上游代理未启用 (Direct)，禁止直连获取 z.ai 模型列表"
+                    .to_string(),
+            }),
+        ));
+    }
+
     let resp = client
         .get(format!("{}/v1/models", base_url))
         .header("Authorization", format!("Bearer {}", api_key))

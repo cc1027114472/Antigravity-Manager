@@ -186,28 +186,33 @@ async fn check_updater_json() -> Result<UpdateInfo, String> {
 }
 
 async fn create_client() -> Result<reqwest::Client, String> {
+    // Load config to check for upstream proxy
+    let config = crate::modules::config::load_app_config()
+        .map_err(|e| format!("STRICT PROXY: failed to load app config: {}", e))?;
+
+    // [STRICT PROXY] 严禁本地直连更新服务器：未启用上游代理时直接报错（更新检查失败可接受，但绝不裸连）。
+    let upstream = config.proxy.upstream_proxy;
+    if !upstream.enabled || upstream.url.trim().is_empty() {
+        return Err("严格代理策略拦截：未启用全局上游代理，禁止直连更新检查，请先配置代理".to_string());
+    }
+
     let mut builder = reqwest::Client::builder()
         .user_agent("Antigravity-Manager")
         .timeout(std::time::Duration::from_secs(10));
 
-    // Load config to check for upstream proxy
-    if let Ok(config) = crate::modules::config::load_app_config() {
-        if config.proxy.upstream_proxy.enabled && !config.proxy.upstream_proxy.url.is_empty() {
-            logger::log_info(&format!(
-                "Update checker using upstream proxy: {}",
-                config.proxy.upstream_proxy.url
+    logger::log_info(&format!(
+        "Update checker using upstream proxy: {}",
+        upstream.url
+    ));
+    match reqwest::Proxy::all(&upstream.url) {
+        Ok(proxy) => {
+            builder = builder.proxy(proxy);
+        }
+        Err(e) => {
+            return Err(format!(
+                "STRICT PROXY: invalid upstream proxy URL '{}': {}; refusing direct update check",
+                upstream.url, e
             ));
-            match reqwest::Proxy::all(&config.proxy.upstream_proxy.url) {
-                Ok(proxy) => {
-                    builder = builder.proxy(proxy);
-                }
-                Err(e) => {
-                    logger::log_warn(&format!(
-                        "Failed to parse proxy URL '{}': {}",
-                        config.proxy.upstream_proxy.url, e
-                    ));
-                }
-            }
         }
     }
 

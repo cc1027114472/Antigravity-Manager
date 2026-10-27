@@ -16,14 +16,16 @@ fn build_client(
     upstream_proxy: crate::proxy::config::UpstreamProxyConfig,
     timeout_secs: u64,
 ) -> Result<reqwest::Client, String> {
+    // [STRICT PROXY] 严禁无代理直连 z.ai MCP！未启用上游代理时直接拒绝。
+    if !upstream_proxy.enabled || upstream_proxy.url.trim().is_empty() {
+        return Err("严格代理策略拦截：未启用上游代理，禁止直连 z.ai MCP 请求".to_string());
+    }
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_secs.max(5)));
 
-    if upstream_proxy.enabled && !upstream_proxy.url.is_empty() {
-        let url = crate::proxy::config::normalize_proxy_url(&upstream_proxy.url);
-        let proxy =
-            reqwest::Proxy::all(&url).map_err(|e| format!("Invalid upstream proxy url: {}", e))?;
-        builder = builder.proxy(proxy);
-    }
+    let url = crate::proxy::config::normalize_proxy_url(&upstream_proxy.url);
+    let proxy =
+        reqwest::Proxy::all(&url).map_err(|e| format!("Invalid upstream proxy url: {}", e))?;
+    builder = builder.proxy(proxy);
 
     builder
         .build()

@@ -188,14 +188,12 @@ impl HumanizedPacer {
     }
 
     /// 大任务热度的单次增量（与 mark_request_completed 的阶梯一致）：
-    /// >=130K tokens → 2.0；70K~130K → 1.0（用户指定）；30K~70K → 0.5；其余 0.0
+    /// 只有 >=130K tokens 的"超大请求"才加热度 2.0；130K 以下一律不加（0.0）。
+    /// 即：正常对话（<130K tokens）与热度计分完全无关，
+    ///     热度只由真正的高危超大请求（>=130K）驱动，避免误伤普通大任务。
     fn heat_increment_for_tokens(tokens: u32) -> f64 {
         if tokens >= 130_000 {
             2.0
-        } else if tokens >= 70_000 {
-            1.0
-        } else if tokens >= 30_000 {
-            0.5
         } else {
             0.0
         }
@@ -212,12 +210,12 @@ impl HumanizedPacer {
     /// [Preflight] 大任务开始前预判拦截：
     /// 返回 Some(retry_after_secs) 表示应立即 429 拒绝；None 表示放行。
     /// 规则：
-    /// 0. 冷启动缓冲：服务启动后前 COLD_START_WARMUP_SECS 秒内，大体量请求一律 429 缓一缓，
+    /// 0. 冷启动缓冲：服务启动后前 COLD_START_WARMUP_SECS 秒内，超大请求（>200KB 或 >100K tokens）一律 429 缓一缓，
     ///    防止 docker restart 后积压请求瞬间突刺上游（发版封号高峰的根因）；
-    /// 1. >200KB 超大请求（TOS 高危）：账号热度 >= 1.0（已由 0.5 放大）即拒绝，强制回冷窗口；
+    /// 1. >200KB 超大请求（TOS 高危）：账号热度 >= 1.0 即拒绝，强制回冷窗口；
     ///    且不再直接放行，继续走 token 预判（堵住"冷号+超大请求"裂缝）；
-    /// 2. >30K tokens 大任务且合成热度 >= HEAT_CRITICAL_THRESHOLD(4.0，已由 2.0 放大) 即拒绝，
-    ///    保证正常对话顺畅，同时拦截同一账号连续大任务风暴。
+    /// 2. >100K tokens 超大任务且合成热度 >= HEAT_CRITICAL_THRESHOLD(4.0) 即拒绝：
+    ///    100K 以内的请求与热度完全无关（不加热、不拦截），热度只防护 >=130K 驱动的超大请求风暴。
     pub fn preflight_check(
         &self,
         account_id: &str,
@@ -226,10 +224,10 @@ impl HumanizedPacer {
     ) -> Option<u64> {
         let current = self.get_account_heat(account_id);
 
-        // 0. 冷启动平滑缓冲：重启后前 60s 内，大请求一律 429 Retry-After 30s
+        // 0. 冷启动平滑缓冲：重启后前 60s 内，超大请求一律 429 Retry-After 30s
         let uptime_secs = self.started_at.elapsed().as_secs();
         if uptime_secs < COLD_START_WARMUP_SECS
-            && (raw_body_len > 200 * 1024 || prompt_tokens > 30_000)
+            && (raw_body_len > 200 * 1024 || prompt_tokens > 100_000)
         {
             tracing::warn!(
                 "🛡️ [Cold-Start Warmup] Account {} large request ({} tokens, {}B) within first {}s after start. Rejecting 429 Retry-After 30s.",
@@ -241,7 +239,7 @@ impl HumanizedPacer {
             return Some(30);
         }
 
-        // 1. 超大体量（>200KB ≈ >50K~100K tokens）：软拦截，要求账号热度低于 1.0
+        // 1. 超大体量（>200KB = TOS 高危物理特征）：软拦截，要求账号热度低于 1.0
         if raw_body_len > 200 * 1024 {
             if current >= OVERSIZE_HEAT_THRESHOLD {
                 tracing::warn!(
@@ -256,8 +254,8 @@ impl HumanizedPacer {
             // 注意：不再 return None 直接放行，继续走 token 预判，堵住毒 IP 利用"冷号+超大请求"的裂缝
         }
 
-        // 2. 大任务热度预判：>30K tokens 且合成热度 >= 4.0 → 429
-        if prompt_tokens > 30_000 {
+        // 2. 超大任务热度预判：>100K tokens 且合成热度 >= 4.0 → 429（100K 以内与热度无关）
+        if prompt_tokens > 100_000 {
             let projected = self.projected_heat(account_id, prompt_tokens);
             if projected >= HEAT_CRITICAL_THRESHOLD {
                 tracing::warn!(

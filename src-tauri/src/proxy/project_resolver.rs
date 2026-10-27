@@ -4,6 +4,8 @@ use serde_json::Value;
 /// 这是获取 cloudaicompanionProject 的正确方式
 ///
 /// `account_id` 用于与 AI 反代共用同一 egress（bound → pool → upstream → direct）。
+/// [STRICT PROXY] 严格代理策略：若最终路由为 Direct（无池代理且无上游代理），
+/// 一律报错拒绝，严禁本地直连 googleapis 探测 Project ID！
 pub async fn fetch_project_id(
     access_token: &str,
     account_id: Option<&str>,
@@ -25,11 +27,29 @@ pub async fn fetch_project_id(
         }
     });
 
-    let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(account_id, 15).await
+    // [STRICT PROXY] 使用带 route 信息的接口，Direct 路由必须拒绝
+    let (client, route) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+        pool.get_effective_standard_client_with_route(account_id, 15).await
     } else {
-        crate::utils::http::get_client()
+        // 池未初始化：检查全局上游代理，未启用则拒绝
+        if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+            let up = app_cfg.proxy.upstream_proxy;
+            if up.enabled && !up.url.is_empty() {
+                (
+                    crate::utils::http::get_standard_client(),
+                    crate::proxy::proxy_pool::EgressRoute::Upstream,
+                )
+            } else {
+                return Err("严格代理策略拦截：全局代理池未初始化且未配置启用全局上游代理，禁止直连探测 Project ID".to_string());
+            }
+        } else {
+            return Err("严格代理策略拦截：无法读取应用配置确定代理出口，禁止直连探测 Project ID".to_string());
+        }
     };
+
+    if route == crate::proxy::proxy_pool::EgressRoute::Direct {
+        return Err("严格代理策略拦截：未匹配到健康代理且上游代理未启用 (Direct)，禁止直连探测 Project ID".to_string());
+    }
 
     let response = client
         .post(url)

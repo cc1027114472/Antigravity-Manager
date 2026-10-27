@@ -89,18 +89,14 @@ impl UpstreamClient {
             Err(err_with_proxy) => {
                 tracing::error!(
                     error = %err_with_proxy,
-                    "Failed to create default HTTP client with configured upstream proxy; retrying without proxy"
+                    "CRITICAL: Failed to create default HTTP client with configured upstream proxy. Strict policy: REFUSE falling back to unproxied/bare client! Building BLACKHOLE client."
                 );
-                match Self::build_client_internal(None) {
-                    Ok(client) => client,
-                    Err(err_without_proxy) => {
-                        tracing::error!(
-                            error = %err_without_proxy,
-                            "Failed to create default HTTP client without proxy; falling back to bare client"
-                        );
-                        Client::new()
-                    }
-                }
+                // [STRICT PROXY] 严禁在代理配置失败时降级重试无代理/裸客户端！
+                // 宁可连接直接报错，绝不向外暴露真实 IP。
+                crate::utils::http::build_blackhole_client(&format!(
+                    "UpstreamClient default client build failed: {}",
+                    err_with_proxy
+                ))
             }
         };
 
@@ -140,18 +136,9 @@ impl UpstreamClient {
             Err(err_with_proxy) => {
                 tracing::error!(
                     error = %err_with_proxy,
-                    "Hot-reload: failed to rebuild default HTTP client with configured upstream proxy; retrying without proxy"
+                    "Hot-reload: failed to rebuild default HTTP client with configured upstream proxy. Strict policy: keeping previous client and REFUSING fallback to unproxied client!"
                 );
-                match Self::build_client_internal(None) {
-                    Ok(c) => c,
-                    Err(err_without_proxy) => {
-                        tracing::error!(
-                            error = %err_without_proxy,
-                            "Hot-reload: failed to rebuild default HTTP client without proxy; keeping previous client"
-                        );
-                        return;
-                    }
-                }
+                return;
             }
         };
         let mut guard = self.default_client.write().await;
@@ -170,10 +157,12 @@ impl UpstreamClient {
         }
     }
 
-    /// Internal helper to build a client with optional upstream proxy config
+    /// Internal helper to build a client with optional upstream proxy config.
+    /// [STRICT PROXY] 若未传入启用的上游代理配置（None / 未启用 / URL 为空），
+    /// 直接返回 Err —— 严禁构建无代理裸客户端作为 default_client。
     fn build_client_internal(
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
-    ) -> Result<Client, rquest::Error> {
+    ) -> Result<Client, String> {
         let mut builder = Client::builder()
             .emulation(rquest_util::Emulation::Chrome132)
             // Connection settings (优化连接复用，减少建立开销)
@@ -186,17 +175,27 @@ impl UpstreamClient {
 
         builder = Self::apply_default_user_agent(builder);
 
-        if let Some(config) = proxy_config {
-            if config.enabled && !config.url.is_empty() {
-                let url = crate::proxy::config::normalize_proxy_url(&config.url);
-                if let Ok(proxy) = rquest::Proxy::all(&url) {
-                    builder = builder.proxy(proxy);
-                    tracing::info!("UpstreamClient enabled proxy: {}", url);
-                }
-            }
+        let config = proxy_config
+            .ok_or_else(|| "strict proxy: missing upstream proxy config (None)".to_string())?;
+        if !config.enabled || config.url.is_empty() {
+            return Err(format!(
+                "strict proxy: upstream proxy not enabled or URL empty (enabled={}, url='{}'): refuse building unproxied default client",
+                config.enabled, config.url
+            ));
         }
+        let url = crate::proxy::config::normalize_proxy_url(&config.url);
+        let proxy = rquest::Proxy::all(&url).map_err(|e| {
+            format!(
+                "strict proxy: invalid upstream proxy URL '{}': {} : refuse building unproxied default client",
+                url, e
+            )
+        })?;
+        builder = builder.proxy(proxy);
+        tracing::info!("UpstreamClient enabled proxy: {}", url);
 
-        builder.build()
+        builder
+            .build()
+            .map_err(|e| format!("failed to build proxied client: {}", e))
     }
 
     /// Build a client with a specific PoolProxyConfig (from ProxyPool)
@@ -317,11 +316,9 @@ impl UpstreamClient {
                 return Ok((self.default_client.read().await.clone(), None));
             }
         }
-        if account_id.is_some() {
-            return Err("严格代理策略拦截：未检测到任何健康代理或上游代理，严禁本地直连！".to_string());
-        }
-        // Fallback to default client for generic non-account requests
-        Ok((self.default_client.read().await.clone(), None))
+        let err_msg = "严格代理策略拦截：未检测到任何健康代理或启用的全局上游代理，严禁本地直连！".to_string();
+        tracing::error!("[UpstreamClient] {}", err_msg);
+        Err(err_msg)
     }
 
     /// True when the error is an egress/transport failure (not an HTTP application status).
@@ -338,6 +335,39 @@ impl UpstreamClient {
                     || s.contains("timed out")
                     || s.contains("timeout")
             }
+    }
+
+    /// 细分传输层错误类型，用于 [NET-OBS] 网络波动观察日志。
+    fn classify_egress_error(err: &rquest::Error) -> &'static str {
+        if err.is_timeout() {
+            "timeout"
+        } else if err.is_connect() {
+            "connect_failed"
+        } else if err.is_request() {
+            "request_malformed"
+        } else {
+            let s = err.to_string().to_lowercase();
+            if s.contains("dns") || s.contains("name resolution") || s.contains("failed to lookup") {
+                "dns"
+            } else if s.contains("proxy") {
+                "proxy_handshake"
+            } else if s.contains("tls")
+                || s.contains("ssl")
+                || s.contains("handshake")
+                || s.contains("certificate")
+            {
+                "tls_handshake"
+            } else if s.contains("reset")
+                || s.contains("closed")
+                || s.contains("broken pipe")
+                || s.contains("eof")
+                || s.contains("connection aborted")
+            {
+                "conn_reset"
+            } else {
+                "other"
+            }
+        }
     }
 
     fn record_egress_outcome(&self, proxy_id: Option<&str>, status: crate::proxy::proxy_pool::EgressUsageStatus) {
@@ -554,7 +584,16 @@ impl UpstreamClient {
                                 "HTTP request timed out after {}s waiting for response headers at {} (method={}, body_len={})",
                                 watchdog_secs, base_url, method, body_bytes.len()
                             );
-                            tracing::warn!(%err_msg, "Upstream candidate endpoint timed out, fast falling back to next endpoint");
+                            tracing::warn!(
+                                account_id = %account_id.unwrap_or("generic"),
+                                proxy_id = %egress_proxy_id.as_deref().unwrap_or("upstream"),
+                                endpoint = %base_url,
+                                method = %method,
+                                err_kind = "timeout",
+                                endpoint_idx = idx,
+                                "[NET-OBS] endpoint timeout, failing over: {}",
+                                err_msg
+                            );
                             fallback_attempts.push(FallbackAttemptLog {
                                 endpoint_url: base_url.to_string(),
                                 status: None,
@@ -580,10 +619,13 @@ impl UpstreamClient {
                         if status.is_success() {
                             if idx > 0 {
                                 tracing::info!(
-                                    "✓ Upstream fallback succeeded | Endpoint: {} | Status: {} | Next endpoints available: {}",
-                                    base_url,
-                                    status,
-                                    V1_INTERNAL_BASE_URL_FALLBACKS.len() - idx - 1
+                                    account_id = %account_id.unwrap_or("generic"),
+                                    proxy_id = %egress_proxy_id.as_deref().unwrap_or("upstream"),
+                                    endpoint = %base_url,
+                                    method = %method,
+                                    failover_idx = idx,
+                                    status = %status.as_u16(),
+                                    "[NET-OBS] upstream recovered via endpoint failover"
                                 );
                             } else {
                                 tracing::debug!(
@@ -638,6 +680,19 @@ impl UpstreamClient {
                     }
                     Err(e) => {
                         if Self::is_egress_transport_error(&e) {
+                            // [NET-OBS] 网络波动观察日志：传输层失败（连接/超时/DNS/TLS/代理握手/连接重置）
+                            // 统一前缀便于在 logs/app.log 中 grep。仅观察，不改任何行为。
+                            tracing::warn!(
+                                account_id = %account_id.unwrap_or("generic"),
+                                proxy_id = %egress_proxy_id.as_deref().unwrap_or("upstream"),
+                                endpoint = %base_url,
+                                method = %method,
+                                err_kind = Self::classify_egress_error(&e),
+                                endpoint_idx = idx,
+                                "[NET-OBS] egress transport failure: {}",
+                                e
+                            );
+
                             self.record_egress_outcome(
                                 egress_proxy_id.as_deref(),
                                 crate::proxy::proxy_pool::EgressUsageStatus::Failed,
@@ -649,6 +704,18 @@ impl UpstreamClient {
                                     pool_clone.mark_proxy_unhealthy(&proxy_id_str).await;
                                 });
                             }
+                        } else {
+                            // [NET-OBS] 非传输层错误（例如连接建立成功但协议层失败），也记录以便对比
+                            tracing::warn!(
+                                account_id = %account_id.unwrap_or("generic"),
+                                proxy_id = %egress_proxy_id.as_deref().unwrap_or("upstream"),
+                                endpoint = %base_url,
+                                method = %method,
+                                err_kind = Self::classify_egress_error(&e),
+                                endpoint_idx = idx,
+                                "[NET-OBS] egress non-transport failure: {}",
+                                e
+                            );
                         }
                         let msg = format!("HTTP request failed at {}: {}", base_url, e);
                         tracing::debug!("{}", msg);

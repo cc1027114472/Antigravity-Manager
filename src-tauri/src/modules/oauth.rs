@@ -380,6 +380,14 @@ async fn exchange_code_once(
             crate::proxy::proxy_pool::EgressRoute::from_app_upstream_fallback(),
         )
     };
+
+    // [STRICT PROXY] 登录换 token 行为：若未能匹配到任何健康代理或上游代理（egress == Direct），严禁直连！
+    if egress == crate::proxy::proxy_pool::EgressRoute::Direct {
+        let msg = "严格代理策略拦截：未能匹配到任何可用代理或启用的全局上游代理，严禁本地直连 Google 换取 Token！".to_string();
+        crate::modules::logger::log_error(&msg);
+        return Err((None, msg));
+    }
+
     let prefix = egress.error_prefix();
 
     let params = [
@@ -538,8 +546,8 @@ async fn refresh_access_token_once(
         )
     };
 
-    // [STRICT PROXY] 若针对具体账号刷新，但未能匹配到任何代理（egress == Direct），严禁直连，直接返回错误！
-    if account_id.is_some() && egress == crate::proxy::proxy_pool::EgressRoute::Direct {
+    // [STRICT PROXY] Token 刷新行为：未能匹配到任何代理（egress == Direct），严禁直连，直接返回错误！
+    if egress == crate::proxy::proxy_pool::EgressRoute::Direct {
         let msg = format!(
             "严格代理策略拦截：账号 {:?} 绑定的代理不通或未配置可用代理 (RED)，严禁本地直连！",
             account_id
@@ -711,11 +719,20 @@ pub async fn get_user_info(
         }
     }
 
-    let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_client(account_id, 15).await
+    let (client, egress) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+        pool.get_effective_standard_client_with_route(account_id, 15).await
     } else {
-        crate::utils::http::get_client()
+        (
+            crate::utils::http::get_standard_client(),
+            crate::proxy::proxy_pool::EgressRoute::from_app_upstream_fallback(),
+        )
     };
+
+    if egress == crate::proxy::proxy_pool::EgressRoute::Direct {
+        let err_msg = format!("严格代理策略拦截：账号 {:?} 未绑定健康代理或代理不通 (RED)，禁止直连获取用户信息", account_id);
+        crate::modules::logger::log_error(&err_msg);
+        return Err(err_msg);
+    }
 
     let response = client
         .get(USERINFO_URL)

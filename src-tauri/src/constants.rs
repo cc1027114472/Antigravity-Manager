@@ -70,8 +70,25 @@ fn try_fetch_remote_version() -> Option<String> {
 
     std::thread::spawn(move || {
         let result = (|| -> Option<String> {
+            // [STRICT PROXY] 严禁本地直连版本服务器：未配置启用全局上游代理时直接跳过远程版本检查。
+            // 远端版本不是关键路径，失败时走 KNOWN_STABLE_VERSION 兜底即可。
+            let up = crate::modules::config::load_app_config()
+                .map(|c| c.proxy.upstream_proxy)
+                .unwrap_or_default();
+            if !up.enabled || up.url.trim().is_empty() {
+                tracing::debug!("STRICT PROXY: no enabled upstream proxy, skipping remote version check (no direct egress)");
+                return None;
+            }
+
             let client = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                .proxy(
+                    reqwest::Proxy::all(&up.url)
+                        .map_err(|e| {
+                            tracing::error!("STRICT PROXY: invalid upstream proxy url '{}': {}", up.url, e);
+                        })
+                        .ok()?,
+                )
                 .build()
                 .ok()?;
 
