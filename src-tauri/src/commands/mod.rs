@@ -248,8 +248,8 @@ pub async fn fetch_account_quota(
     let mut account =
         modules::load_account(&account_id).map_err(crate::error::AppError::Account)?;
 
-    // 使用带重试的查询 (Shared logic)
-    let mut quota = modules::account::fetch_quota_with_retry(&mut account).await?;
+    // 使用带重试的查询 (Shared logic，传入 force_manual = true 允许单次核验真实存活状态)
+    let mut quota = modules::account::fetch_quota_with_retry_opts(&mut account, true).await?;
 
     // 4. 更新账号配额
     modules::update_account_quota(&account_id, quota.clone())
@@ -1026,6 +1026,13 @@ pub async fn toggle_proxy_status(
         account_json["proxy_disabled"] = serde_json::Value::Bool(false);
         account_json["proxy_disabled_reason"] = serde_json::Value::Null;
         account_json["proxy_disabled_at"] = serde_json::Value::Null;
+        // 用户人工显式恢复启用反代，同步清理配额中的硬禁用标记
+        if let Some(quota) = account_json.get_mut("quota") {
+            if quota.get("is_forbidden").and_then(|v| v.as_bool()).unwrap_or(false) {
+                quota["is_forbidden"] = serde_json::Value::Bool(false);
+                quota["forbidden_reason"] = serde_json::Value::Null;
+            }
+        }
     } else {
         // 禁用反代
         let now = chrono::Utc::now().timestamp();

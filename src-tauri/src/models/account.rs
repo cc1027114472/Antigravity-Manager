@@ -134,6 +134,28 @@ impl Account {
         self.last_used = chrono::Utc::now().timestamp();
     }
 
+    /// 403 / Forbidden 是硬禁用：禁止后台探活、配额刷新、预热再打上游。
+    pub fn is_hard_forbidden(&self) -> bool {
+        if self
+            .quota
+            .as_ref()
+            .map(|q| q.is_forbidden)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if !self.proxy_disabled {
+            return false;
+        }
+        self.proxy_disabled_reason
+            .as_deref()
+            .map(|r| {
+                let lower = r.to_lowercase();
+                lower.contains("403") || lower.contains("forbidden")
+            })
+            .unwrap_or(false)
+    }
+
     pub fn update_quota(&mut self, mut quota: QuotaData) {
         if let Some(ref existing) = self.quota {
             if quota.subscription_tier.is_none() {

@@ -1632,10 +1632,11 @@ pub fn mark_account_validation_blocked(
 /// Update account quota
 pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), String> {
     let mut account = load_account(account_id)?;
+    let was_hard_forbidden = account.is_hard_forbidden();
     let is_quota_healthy = !quota.is_forbidden;
     account.update_quota(quota);
 
-    // [自愈机制] 当配额正常恢复时，自动解除临时验证锁定和因403导致的禁用状态
+    // 临时验证锁定可随配额恢复解除。403 Forbidden 是硬禁用：禁止因一次配额成功而自动解禁。
     if is_quota_healthy {
         if account.validation_blocked || account.validation_url.is_some() {
             account.validation_blocked = false;
@@ -1648,12 +1649,30 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
             && account
                 .proxy_disabled_reason
                 .as_ref()
-                .map_or(false, |r| r.contains("403") || r.contains("Forbidden") || r.contains("validation"))
+                .map_or(false, |r| {
+                    let lower = r.to_lowercase();
+                    lower.contains("validation")
+                        && !lower.contains("403")
+                        && !lower.contains("forbidden")
+                })
         {
             account.proxy_disabled = false;
             account.proxy_disabled_reason = None;
             account.proxy_disabled_at = None;
             tracing::info!("[Account] Proxy unblocked automatically for {} after quota success", account.email);
+        } else if was_hard_forbidden {
+            account.proxy_disabled = true;
+            if account
+                .proxy_disabled_reason
+                .as_ref()
+                .map_or(true, |r| !r.to_lowercase().contains("forbidden"))
+            {
+                account.proxy_disabled_reason = Some("Forbidden (403): hard disable, no auto-unblock".to_string());
+            }
+            tracing::info!(
+                "[Account] Keeping {} proxy-disabled (403 Forbidden); will not auto-unblock after quota success",
+                account.email
+            );
         }
     }
 
@@ -1935,8 +1954,30 @@ pub fn export_accounts() -> Result<Vec<(String, String)>, String> {
 
 /// Quota query with retry (moved from commands to modules for reuse)
 pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppResult<QuotaData> {
+    fetch_quota_with_retry_opts(account, false).await
+}
+
+/// 配额查询（支持区分后台自动探活与人工手动刷新）
+pub async fn fetch_quota_with_retry_opts(
+    account: &mut Account,
+    force_manual: bool,
+) -> crate::error::AppResult<QuotaData> {
     use crate::error::AppError;
     use crate::modules::oauth;
+
+    if !force_manual && account.is_hard_forbidden() {
+        return Err(AppError::Account(format!(
+            "账号 {} 已 403 Forbidden 硬禁用，后台拒绝自动向上游探活或刷新配额",
+            account.email
+        )));
+    }
+
+    if force_manual && account.is_hard_forbidden() {
+        modules::logger::log_info(&format!(
+            "用户人工请求刷新已 403 硬禁用的账号配额，单次放行向上游核验真实状态: {}",
+            account.email
+        ));
+    }
 
     // 1. Time-based check - ensure Token is valid first
     let token = match oauth::ensure_fresh_token(&account.token, Some(&account.id)).await {
@@ -2211,17 +2252,9 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     let tasks: Vec<_> = accounts
         .into_iter()
         .filter(|account| {
-            // 严格跳过所有已被标记为 403 Forbidden 或反代禁用的账号，杜绝后台定时器私自外发请求触发风控
-            let is_forbidden_quota = account.quota.as_ref().map_or(false, |q| q.is_forbidden);
-            let is_forbidden_proxy = account.proxy_disabled
-                && account
-                    .proxy_disabled_reason
-                    .as_ref()
-                    .map_or(false, |r| r.contains("403") || r.contains("Forbidden"));
-
-            if is_forbidden_quota || is_forbidden_proxy {
+            if account.is_hard_forbidden() {
                 crate::modules::logger::log_info(&format!(
-                    "  - Skipping {} (Forbidden / Proxy Disabled)",
+                    "  - Skipping {} (403 Forbidden, no probe)",
                     account.email
                 ));
                 return false;
