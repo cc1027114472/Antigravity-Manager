@@ -398,6 +398,7 @@ async fn exchange_code_once(
         ("grant_type", "authorization_code"),
     ];
 
+    // Header-only vscode UA for oauth2.googleapis.com; TLS is still Chrome132 (same egress as AI).
     tracing::debug!(
         "[OAuth] Sending exchange_code request with User-Agent: {}",
         crate::constants::NATIVE_OAUTH_USER_AGENT.as_str()
@@ -578,6 +579,7 @@ async fn refresh_access_token_once(
         ));
     }
 
+    // Header-only vscode UA for oauth2.googleapis.com; TLS is still Chrome132 (same egress as AI).
     tracing::debug!(
         "[OAuth] Sending refresh_access_token request with User-Agent: {}",
         crate::constants::NATIVE_OAUTH_USER_AGENT.as_str()

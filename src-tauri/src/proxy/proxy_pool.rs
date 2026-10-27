@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use rquest_util::Emulation;
@@ -110,6 +110,33 @@ pub struct ProxyPoolManager {
 
     /// Live request outcome per pool proxy (in-memory only; resets on restart).
     egress_usage: Arc<DashMap<String, EgressUsageStatus>>,
+
+    /// Consecutive successful health probes while RED. GREEN requires
+    /// [`GREEN_CONFIRM_SUCCESSES`] in a row so a single lucky 204 cannot flap the node.
+    green_confirm_streak: Arc<DashMap<String, u8>>,
+
+    /// Instant the node last transitioned RED → GREEN in this process.
+    /// Used to hold oversized generateContent until the egress looks "settled".
+    green_at: Arc<DashMap<String, Instant>>,
+}
+
+/// Health probes that must succeed in a row before a RED node is marked GREEN.
+const GREEN_CONFIRM_SUCCESSES: u8 = 2;
+
+/// Next `(is_healthy, confirm_streak)` after one health probe.
+fn next_health_state(was_healthy: bool, probe_ok: bool, streak: u8) -> (bool, u8) {
+    if was_healthy {
+        return if probe_ok { (true, 0) } else { (false, 0) };
+    }
+    if !probe_ok {
+        return (false, 0);
+    }
+    let streak = streak.saturating_add(1);
+    if streak >= GREEN_CONFIRM_SUCCESSES {
+        (true, 0)
+    } else {
+        (false, streak)
+    }
 }
 
 impl ProxyPoolManager {
@@ -138,7 +165,33 @@ impl ProxyPoolManager {
             round_robin_index: Arc::new(AtomicUsize::new(0)),
             forced_egress: Arc::new(DashMap::new()),
             egress_usage: Arc::new(DashMap::new()),
+            green_confirm_streak: Arc::new(DashMap::new()),
+            green_at: Arc::new(DashMap::new()),
         }
+    }
+
+    fn note_proxy_turned_red(&self, proxy_id: &str) {
+        self.green_confirm_streak.remove(proxy_id);
+        self.green_at.remove(proxy_id);
+    }
+
+    fn note_proxy_turned_green(&self, proxy_id: &str) {
+        self.green_confirm_streak.remove(proxy_id);
+        self.green_at
+            .insert(proxy_id.to_string(), Instant::now());
+    }
+
+    /// Seconds since this account's dedicated pool node last recovered GREEN.
+    /// `None` if the account is unbound, the node never recovered this process, or the stamp is gone.
+    pub fn dedicated_recovery_elapsed_secs(&self, account_id: &str) -> Option<u64> {
+        let proxy_id = self.account_bindings.get(account_id)?.value().clone();
+        let stamped = self.green_at.get(&proxy_id)?;
+        Some(stamped.elapsed().as_secs())
+    }
+
+    /// True when this account is pinned to a dedicated pool node (must not change egress).
+    pub fn has_dedicated_binding(&self, account_id: &str) -> bool {
+        self.account_bindings.contains_key(account_id)
     }
 
     /// Record live egress outcome for a pool proxy. Direct/upstream (no entry_id) is ignored.
@@ -155,6 +208,8 @@ impl ProxyPoolManager {
         );
         if status == EgressUsageStatus::Failed {
             let pool_config = Arc::clone(&self.config);
+            let streak = Arc::clone(&self.green_confirm_streak);
+            let green_at = Arc::clone(&self.green_at);
             let pid = proxy_id.to_string();
             tokio::spawn(async move {
                 let mut changed = false;
@@ -173,6 +228,8 @@ impl ProxyPoolManager {
                         }
                     }
                 }
+                streak.remove(&pid);
+                green_at.remove(&pid);
                 if changed {
                     if let Ok(mut app_config) = crate::modules::config::load_app_config() {
                         let config = pool_config.read().await;
@@ -206,6 +263,7 @@ impl ProxyPoolManager {
                 }
             }
         }
+        self.note_proxy_turned_red(proxy_id);
         if changed {
             self.persist_config().await;
         }
@@ -283,9 +341,9 @@ impl ProxyPoolManager {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> Client {
-        let mut builder = Client::builder()
-            .emulation(Emulation::Chrome132)
-            .timeout(Duration::from_secs(timeout_secs));
+        let mut builder = crate::utils::http::apply_chrome_identity(
+            Client::builder().timeout(Duration::from_secs(timeout_secs)),
+        );
 
         // 尝试获取代理配置
         let proxy_opt = if let Some(acc_id) = account_id {
@@ -314,6 +372,17 @@ impl ProxyPoolManager {
         if let Some(proxy_cfg) = proxy_opt {
             builder = builder.proxy(proxy_cfg.proxy);
             // Already logged more detail in get_proxy_for_account or pool selection
+        } else if account_id
+            .map(|id| self.has_dedicated_binding(id))
+            .unwrap_or(false)
+        {
+            tracing::error!(
+                "[Proxy] Route: {} bound proxy unavailable (RED). Strict policy: BLACKHOLE, refuse upstream fallback to keep egress sticky.",
+                account_id.unwrap_or("unknown")
+            );
+            return crate::utils::http::build_blackhole_client(
+                "bound proxy unavailable: refuse upstream fallback",
+            );
         } else {
             // Fallback 到应用配置的单上游代理
             if let Ok(app_cfg) = crate::modules::config::load_app_config() {
@@ -373,7 +442,7 @@ impl ProxyPoolManager {
         }
     }
 
-    /// [NEW] 为指定账号获取“最终生效”的无特征 Standard HttpClient (专门用于纯净场景，如 OAuth 退还)
+    /// Same egress selection as [`Self::get_effective_client`], Chrome132 identity (quota / OAuth).
     pub async fn get_effective_standard_client(
         &self,
         account_id: Option<&str>,
@@ -390,9 +459,9 @@ impl ProxyPoolManager {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> (Client, EgressRoute) {
-        let mut builder = Client::builder()
-            // 无 Emulation 设置，走纯正的基础 TLS 指纹
-            .timeout(Duration::from_secs(timeout_secs));
+        let mut builder = crate::utils::http::apply_chrome_identity(
+            Client::builder().timeout(Duration::from_secs(timeout_secs)),
+        );
 
         // 尝试获取代理配置
         let proxy_opt = if let Some(acc_id) = account_id {
@@ -423,6 +492,20 @@ impl ProxyPoolManager {
             let entry_id = proxy_cfg.entry_id.clone();
             builder = builder.proxy(proxy_cfg.proxy);
             EgressRoute::Pool { entry_id }
+        } else if account_id
+            .map(|id| self.has_dedicated_binding(id))
+            .unwrap_or(false)
+        {
+            tracing::error!(
+                "[Proxy] Route: {} (Standard Client) bound proxy unavailable (RED). Strict policy: BLACKHOLE, refuse upstream fallback.",
+                account_id.unwrap_or("unknown")
+            );
+            return (
+                crate::utils::http::build_blackhole_client(
+                    "bound proxy unavailable: refuse upstream fallback (standard client)",
+                ),
+                EgressRoute::Direct,
+            );
         } else {
             // Fallback 到应用配置的单上游代理
             let mut resolved = EgressRoute::Direct;
@@ -1015,15 +1098,29 @@ impl ProxyPoolManager {
         // 统一更新状态
         {
             let mut config = self.config.write().await;
-            for (id, is_healthy, latency) in &results {
+            for (id, probe_ok, latency) in &results {
                 if let Some(proxy) = config.proxies.iter_mut().find(|p| &p.id == id) {
                     let was_healthy = proxy.is_healthy;
-                    proxy.is_healthy = *is_healthy;
+                    let prev_streak = self
+                        .green_confirm_streak
+                        .get(id)
+                        .map(|v| *v)
+                        .unwrap_or(0);
+                    let (new_healthy, new_streak) =
+                        next_health_state(was_healthy, *probe_ok, prev_streak);
+                    if new_streak == 0 {
+                        self.green_confirm_streak.remove(id);
+                    } else {
+                        self.green_confirm_streak.insert(id.clone(), new_streak);
+                    }
+
+                    proxy.is_healthy = new_healthy;
                     proxy.latency = *latency;
                     proxy.last_check_time = Some(chrono::Utc::now().timestamp());
 
                     // [NET-OBS] 网络波动观察：代理健康状态翻转日志（RED→GREEN 表示恢复；GREEN→RED 表示劣化）
-                    if was_healthy && !*is_healthy {
+                    if was_healthy && !new_healthy {
+                        self.note_proxy_turned_red(id);
                         tracing::warn!(
                             proxy_id = %proxy.id,
                             proxy_name = %proxy.name,
@@ -1033,24 +1130,46 @@ impl ProxyPoolManager {
                             proxy.name,
                             proxy.id
                         );
-                    } else if !was_healthy && *is_healthy {
+                    } else if !was_healthy && new_healthy {
+                        self.note_proxy_turned_green(id);
                         tracing::info!(
                             proxy_id = %proxy.id,
                             proxy_name = %proxy.name,
                             proxy_url = %proxy.url,
                             latency_ms = latency.unwrap_or(0),
-                            "[NET-OBS] proxy recovered GREEN (health check): {} ({})",
+                            "[NET-OBS] proxy recovered GREEN after {} consecutive probes: {} ({})",
+                            GREEN_CONFIRM_SUCCESSES,
                             proxy.name,
                             proxy.id
+                        );
+                    } else if !was_healthy && *probe_ok && !new_healthy {
+                        tracing::info!(
+                            proxy_id = %proxy.id,
+                            proxy_name = %proxy.name,
+                            confirm = new_streak,
+                            required = GREEN_CONFIRM_SUCCESSES,
+                            "[NET-OBS] proxy {} still RED, waiting for consecutive health successes ({}/{})",
+                            proxy.name,
+                            new_streak,
+                            GREEN_CONFIRM_SUCCESSES
                         );
                     }
                 }
             }
         }
-        for (id, is_healthy, _) in &results {
+        for (id, _, _) in &results {
+            let healthy = {
+                let config = self.config.read().await;
+                config
+                    .proxies
+                    .iter()
+                    .find(|p| &p.id == id)
+                    .map(|p| p.is_healthy)
+                    .unwrap_or(false)
+            };
             self.egress_usage.insert(
                 id.clone(),
-                if *is_healthy {
+                if healthy {
                     EgressUsageStatus::Ok
                 } else {
                     EgressUsageStatus::Failed
@@ -1397,6 +1516,43 @@ mod tests {
                 assert_eq!(entry_id, "pool-node");
             }
             other => panic!("expected Pool route, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_next_health_state_requires_consecutive_success() {
+        assert_eq!(next_health_state(true, true, 0), (true, 0));
+        assert_eq!(next_health_state(true, false, 0), (false, 0));
+        assert_eq!(next_health_state(false, false, 1), (false, 0));
+        assert_eq!(next_health_state(false, true, 0), (false, 1));
+        assert_eq!(next_health_state(false, true, 1), (true, 0));
+        assert_eq!(next_health_state(false, false, 0), (false, 0));
+    }
+
+    #[tokio::test]
+    async fn test_bound_account_does_not_use_pool_or_upstream_when_red() {
+        let mut bad = proxy("bound-node", None);
+        bad.is_healthy = false;
+        let pool = test_pool(vec![bad, proxy("other-healthy", None)]);
+        let _ = pool
+            .bind_account_to_proxy_inner("pinned".into(), "bound-node".into(), false)
+            .await;
+
+        assert!(pool.has_dedicated_binding("pinned"));
+        assert!(!pool.has_dedicated_binding("free"));
+
+        let route = pool.get_proxy_for_account("pinned").await.unwrap();
+        assert!(
+            route.is_none(),
+            "bound RED must not pick another pool node"
+        );
+
+        let (_client, egress) = pool
+            .get_effective_standard_client_with_route(Some("pinned"), 5)
+            .await;
+        match egress {
+            EgressRoute::Direct => {}
+            other => panic!("bound RED must fail closed, got {:?}", other),
         }
     }
 }

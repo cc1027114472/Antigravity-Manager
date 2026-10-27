@@ -45,6 +45,22 @@ const FAILURE_COUNT_EXPIRY_SECONDS: u64 = 3600;
 /// 防止 docker restart 后积压请求瞬间涌入触发 Google 风控（TOS_VIOLATION）
 const COLD_START_WARMUP_SECS: u64 = 60;
 
+/// Dedicated proxy just recovered GREEN: hold oversized generateContent so
+/// token refresh / small traffic can settle on the same TLS identity first.
+const EGRESS_RECOVERY_COOLDOWN_SECS: u64 = 90;
+
+fn is_oversized_burst(prompt_tokens: u32, raw_body_len: usize) -> bool {
+    raw_body_len > 200 * 1024 || prompt_tokens > 100_000
+}
+
+fn remaining_recovery_hold_secs(elapsed_secs: u64) -> Option<u64> {
+    if elapsed_secs >= EGRESS_RECOVERY_COOLDOWN_SECS {
+        None
+    } else {
+        Some((EGRESS_RECOVERY_COOLDOWN_SECS - elapsed_secs).max(15))
+    }
+}
+
 /// 大任务热度极限熔断线：合成热度达到该值即拒绝 >30K tokens 任务。
 /// 由 2.0 放大到 4.0 —— 30K~100K 任务允许连发 3 个，100K+ 任务冷号可放行 1 个，
 /// 保证正常对话/大上下文顺畅，同时仍能拦住同一账号连续大任务风暴。
@@ -226,8 +242,7 @@ impl HumanizedPacer {
 
         // 0. 冷启动平滑缓冲：重启后前 60s 内，超大请求一律 429 Retry-After 30s
         let uptime_secs = self.started_at.elapsed().as_secs();
-        if uptime_secs < COLD_START_WARMUP_SECS
-            && (raw_body_len > 200 * 1024 || prompt_tokens > 100_000)
+        if uptime_secs < COLD_START_WARMUP_SECS && is_oversized_burst(prompt_tokens, raw_body_len)
         {
             tracing::warn!(
                 "🛡️ [Cold-Start Warmup] Account {} large request ({} tokens, {}B) within first {}s after start. Rejecting 429 Retry-After 30s.",
@@ -237,6 +252,25 @@ impl HumanizedPacer {
                 COLD_START_WARMUP_SECS
             );
             return Some(30);
+        }
+
+        // 0b. 专属代理刚从 RED 回绿：先让 token/配额走同一套 Chrome132 身份，再放行超大推理。
+        if is_oversized_burst(prompt_tokens, raw_body_len) {
+            if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                if let Some(elapsed) = pool.dedicated_recovery_elapsed_secs(account_id) {
+                    if let Some(wait) = remaining_recovery_hold_secs(elapsed) {
+                        tracing::warn!(
+                            "🛡️ [Egress Recovery] Account {} large request ({} tokens, {}B) {}s after dedicated proxy GREEN. Rejecting 429 Retry-After {}s.",
+                            account_id,
+                            prompt_tokens,
+                            raw_body_len,
+                            elapsed,
+                            wait
+                        );
+                        return Some(wait);
+                    }
+                }
+            }
         }
 
         // 1. 超大体量（>200KB = TOS 高危物理特征）：软拦截，要求账号热度低于 1.0

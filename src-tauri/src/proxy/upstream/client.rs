@@ -163,17 +163,9 @@ impl UpstreamClient {
     fn build_client_internal(
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
     ) -> Result<Client, String> {
-        let mut builder = Client::builder()
-            .emulation(rquest_util::Emulation::Chrome132)
-            // Connection settings (优化连接复用，减少建立开销)
-            .connect_timeout(Duration::from_secs(20))
-            .pool_max_idle_per_host(20) // 每主机最多 20 个空闲连接 (对齐官方指纹)
-            .pool_idle_timeout(Duration::from_secs(90)) // 空闲连接保持 90 秒
-            .tcp_keepalive(Duration::from_secs(60)) // TCP 保活探测 60 秒
-            // 强制开启 HTTP/2 协议，并支持在 SOCKS/HTTPS 代理下通过 ALPN 强制降级/协商
-            .timeout(Duration::from_secs(600));
-
-        builder = Self::apply_default_user_agent(builder);
+        let mut builder = crate::utils::http::apply_chrome_identity(
+            Client::builder().timeout(Duration::from_secs(600)),
+        );
 
         let config = proxy_config
             .ok_or_else(|| "strict proxy: missing upstream proxy config (None)".to_string())?;
@@ -204,16 +196,12 @@ impl UpstreamClient {
         proxy_config: crate::proxy::proxy_pool::PoolProxyConfig,
     ) -> Result<Client, rquest::Error> {
         // Reuse base settings similar to default client but with specific proxy
-        let builder = Client::builder()
-            .emulation(rquest_util::Emulation::Chrome132)
-            .connect_timeout(Duration::from_secs(20))
-            .pool_max_idle_per_host(20)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(60))
-            .timeout(Duration::from_secs(600))
-            .proxy(proxy_config.proxy); // Apply the specific proxy
-
-        Self::apply_default_user_agent(builder).build()
+        crate::utils::http::apply_chrome_identity(
+            Client::builder()
+                .timeout(Duration::from_secs(600))
+                .proxy(proxy_config.proxy),
+        )
+        .build()
     }
 
     fn apply_default_user_agent(builder: rquest::ClientBuilder) -> rquest::ClientBuilder {
@@ -287,12 +275,20 @@ impl UpstreamClient {
                         }
                     }
                     Ok(None) => {
-                        // 账号未匹配到可用代理（或绑定的代理不健康/禁用）
-                        // 严格模式检查：如果有配置并启用的全局上游代理，允许使用上游代理
+                        // 专属绑定账号必须钉在原出口：绑定节点 RED 时硬失败，禁止切到全局上游。
+                        if pool.has_dedicated_binding(acc_id) {
+                            let err_msg = format!(
+                                "严格代理策略拦截：账号 {} 的专属代理不通 (RED)，禁止切换全局上游以免出口漂移。等待原代理回绿后再请求。",
+                                acc_id
+                            );
+                            tracing::error!("[UpstreamClient] {}", err_msg);
+                            return Err(err_msg);
+                        }
+                        // 未绑定账号：池中无健康节点时，仅允许已启用的全局上游代理（仍禁止直连）
                         if let Ok(app_cfg) = crate::modules::config::load_app_config() {
                             let up = app_cfg.proxy.upstream_proxy;
                             if up.enabled && !up.url.is_empty() {
-                                tracing::info!("[UpstreamClient] Account {} fallback to global upstream proxy: {}", acc_id, up.url);
+                                tracing::info!("[UpstreamClient] Unbound account {} fallback to global upstream proxy: {}", acc_id, up.url);
                                 return Ok((self.default_client.read().await.clone(), None));
                             }
                         }

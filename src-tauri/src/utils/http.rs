@@ -1,8 +1,29 @@
 use crate::modules::config::load_app_config;
 use once_cell::sync::Lazy;
-use rquest::{Client, Proxy};
+use rquest::{header, Client, ClientBuilder, Proxy};
 use rquest_util::Emulation;
 use std::time::Duration;
+
+/// Same TLS / HTTP2 / default UA as AI upstream (Chrome 132 + Antigravity Electron UA).
+/// Quota, OAuth, and generateContent must share this identity on a given egress IP.
+pub fn apply_chrome_identity(builder: ClientBuilder) -> ClientBuilder {
+    let builder = builder
+        .emulation(Emulation::Chrome132)
+        .connect_timeout(Duration::from_secs(20))
+        .pool_max_idle_per_host(20)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(60));
+    let ua = crate::constants::USER_AGENT.as_str();
+    if header::HeaderValue::from_str(ua).is_ok() {
+        builder.user_agent(ua)
+    } else {
+        tracing::warn!(
+            user_agent = %ua,
+            "Invalid default User-Agent value, using fallback"
+        );
+        builder.user_agent("antigravity")
+    }
+}
 
 /// 黑洞客户端：任何请求都在连接阶段立即失败（不可达地址 + 极短超时），
 /// 用于 [STRICT PROXY] 策略——代理未启用/配置失败时禁止降级为无代理裸客户端，
@@ -33,17 +54,9 @@ pub static SHARED_CLIENT: Lazy<Client> = Lazy::new(|| create_base_client(15));
 /// Global shared HTTP client (Long timeout: 60s, for warmup etc.)
 pub static SHARED_CLIENT_LONG: Lazy<Client> = Lazy::new(|| create_base_client(60));
 
-/// Global shared standard HTTP client (15s timeout, NO JA3 Emulation)
-pub static SHARED_STANDARD_CLIENT: Lazy<Client> = Lazy::new(|| create_standard_client(15));
-
-/// Global shared standard HTTP client (Long timeout: 60s, NO JA3 Emulation)
-pub static SHARED_STANDARD_CLIENT_LONG: Lazy<Client> = Lazy::new(|| create_standard_client(60));
-
-/// Base client creation logic with JA3 Emulation
+/// Base client: Chrome132 impersonation + Antigravity UA (same as AI upstream).
 fn create_base_client(timeout_secs: u64) -> Client {
-    let mut builder = Client::builder()
-        .emulation(Emulation::Chrome132)
-        .timeout(Duration::from_secs(timeout_secs));
+    let mut builder = apply_chrome_identity(Client::builder().timeout(Duration::from_secs(timeout_secs)));
 
     match load_app_config() {
         Ok(config) => {
@@ -57,7 +70,7 @@ fn create_base_client(timeout_secs: u64) -> Client {
                             "HTTP shared client enabled upstream proxy: {}",
                             normalized
                         );
-                        tracing::info!("Initialized JA3/TLS Impersonation (Chrome123)");
+                        tracing::info!("Initialized JA3/TLS Impersonation (Chrome132)");
                         return builder.build().unwrap_or_else(|e| {
                             build_blackhole_client(&format!(
                                 "shared JA3 client build failed: {}",
@@ -95,60 +108,12 @@ pub fn get_client() -> Client {
     SHARED_CLIENT.clone()
 }
 
-/// Base client creation logic strictly WITHOUT JA3 Emulation (Pure Native)
-fn create_standard_client(timeout_secs: u64) -> Client {
-    let mut builder = Client::builder()
-        // No .emulation(Emulation::Chrome123) here!
-        .timeout(Duration::from_secs(timeout_secs));
-
-    match load_app_config() {
-        Ok(config) => {
-            let proxy_config = config.proxy.upstream_proxy;
-            if proxy_config.enabled && !proxy_config.url.is_empty() {
-                let normalized = crate::proxy::config::normalize_proxy_url(&proxy_config.url);
-                match Proxy::all(&normalized) {
-                    Ok(proxy) => {
-                        builder = builder.proxy(proxy);
-                        tracing::info!(
-                            "HTTP standard client enabled upstream proxy: {}",
-                            normalized
-                        );
-                        tracing::info!("Initialized Pure Native Standard Client");
-                        return builder.build().unwrap_or_else(|e| {
-                            build_blackhole_client(&format!(
-                                "shared standard client build failed: {}",
-                                e
-                            ))
-                        });
-                    }
-                    Err(e) => {
-                        return build_blackhole_client(&format!(
-                            "invalid_proxy_url: {}, error: {}. Strict policy: refuse direct leak",
-                            normalized, e
-                        ));
-                    }
-                }
-            } else {
-                return build_blackhole_client(
-                    "upstream proxy not enabled or URL empty in app config (standard client)",
-                );
-            }
-        }
-        Err(e) => {
-            return build_blackhole_client(&format!(
-                "failed to load app config for shared standard client: {}",
-                e
-            ));
-        }
-    }
-}
-
-/// Get standard HTTP client without JA3 Emulation (15s timeout)
+/// Same impersonated client as [`get_client`]. Kept as a named alias for OAuth/quota call sites.
 pub fn get_standard_client() -> Client {
-    SHARED_STANDARD_CLIENT.clone()
+    SHARED_CLIENT.clone()
 }
 
-/// Get long timeout standard HTTP client without JA3 Emulation (60s timeout)
+/// Same impersonated client as the long-timeout shared pool (60s).
 pub fn get_long_standard_client() -> Client {
-    SHARED_STANDARD_CLIENT_LONG.clone()
+    SHARED_CLIENT_LONG.clone()
 }

@@ -126,7 +126,7 @@ struct Tier {
     slug: Option<String>,
 }
 
-/// Get shared HTTP Client for pure info fetching (No JA3)
+/// Get shared HTTP Client for quota / loadCodeAssist (Chrome132, same as AI upstream).
 /// [STRICT PROXY] 严格代理策略：必须使用健康代理或有效全局上游代理，遇到 Direct 严禁直连并直接返回 Err！
 async fn create_standard_client(
     account_id: Option<&str>,
@@ -165,7 +165,7 @@ async fn create_standard_client(
     }
 }
 
-/// Get shared HTTP Client (60s timeout) for pure info fetching (No JA3)
+/// Get shared HTTP Client (60s timeout) for quota / loadCodeAssist (Chrome132).
 #[allow(dead_code)] // 预留给预热/后台任务调用
 async fn create_long_standard_client(
     account_id: Option<&str>,
@@ -214,7 +214,7 @@ async fn fetch_project_id(
         .header(rquest::header::CONTENT_TYPE, "application/json")
         .header(
             rquest::header::USER_AGENT,
-            crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
+            crate::constants::USER_AGENT.as_str(),
         )
         .json(&meta)
         .send()
@@ -350,7 +350,7 @@ pub async fn fetch_quota_with_cache(
             .bearer_auth(access_token)
             .header(
                 rquest::header::USER_AGENT,
-                crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
+                crate::constants::USER_AGENT.as_str(),
             )
             .json(&payload)
             .send()
@@ -557,7 +557,7 @@ async fn fetch_quota_summary(
             .bearer_auth(access_token)
             .header(
                 rquest::header::USER_AGENT,
-                crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
+                crate::constants::USER_AGENT.as_str(),
             )
             .json(&payload)
             .send()
