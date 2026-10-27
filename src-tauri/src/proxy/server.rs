@@ -2757,7 +2757,8 @@ async fn admin_fetch_account_quota(
         )
     })?;
 
-    let quota = crate::modules::account::fetch_quota_with_retry(&mut account)
+    // 人工在 Web 管理端点击单号刷新，传入 force_manual = true 允许单次核验真实存活状态
+    let quota = crate::modules::account::fetch_quota_with_retry_opts(&mut account, true)
         .await
         .map_err(|e| {
             (

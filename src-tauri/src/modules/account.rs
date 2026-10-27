@@ -1852,6 +1852,15 @@ pub fn toggle_proxy_status(
         None
     };
 
+    if enable {
+        if let Some(ref mut q) = account.quota {
+            if q.is_forbidden {
+                q.is_forbidden = false;
+                q.forbidden_reason = None;
+            }
+        }
+    }
+
     save_account(&account)?;
 
     // Also update index summary
