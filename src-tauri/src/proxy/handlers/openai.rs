@@ -479,6 +479,17 @@ pub async fn handle_chat_completions(
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
     let mut inflight_guard: Option<crate::proxy::account_inflight::AccountInflightGuard> = None;
+    let mut lease_guard: Option<crate::proxy::SlotLeaseGuard> = None;
+    let estimated_prompt_tokens =
+        crate::proxy::mappers::context_manager::ContextManager::estimate_openai_token_usage(
+            &openai_req,
+        ) as u32;
+    let raw_body_len: usize = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| serde_json::to_vec(&original_body).map(|b| b.len()).unwrap_or(0));
+    let footprint = crate::proxy::RequestFootprint::new(estimated_prompt_tokens, raw_body_len);
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
@@ -487,6 +498,7 @@ pub async fn handle_chat_completions(
     );
 
     for attempt in 0..max_attempts {
+        lease_guard = None;
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
             .tools
@@ -505,20 +517,50 @@ pub async fn handle_chat_completions(
         // 3. 提取 SessionId (粘性指纹)
         let session_id = SessionManager::extract_openai_session_id(&openai_req);
 
-        // 4. 获取 Token (使用准确的 request_type)
-        // 关键：在重试尝试时根据 force_rotate 决定是否轮换账号
-        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+        // 4. 容量感知前置选号并原子锁定槽位租约
+        let acquired = match token_manager
+            .acquire_token_with_lease(
                 &config.request_type,
                 force_rotate,
                 Some(&session_id),
                 &mapped_model,
+                footprint,
             )
             .await
         {
-            Ok(t) => t,
-            Err(e) => {
-                // [FIX] Attach headers to error response for logging visibility
+            Ok(acq) => acq,
+            Err(crate::proxy::TokenAcquireError::PoolCoolingDown {
+                retry_after_secs,
+                reason,
+            }) => {
+                tracing::warn!(
+                    "⏳ [Capacity Router] Pool cooling down ({} tokens, {}B): {} (Retry-After: {}s)",
+                    estimated_prompt_tokens,
+                    raw_body_len,
+                    reason,
+                    retry_after_secs
+                );
+                let err_json = json!({
+                    "error": {
+                        "message": format!("All pool accounts are currently cooling down ({}). Please retry in {} seconds.", reason, retry_after_secs),
+                        "type": "rate_limit_error",
+                        "param": null,
+                        "code": "account_pool_cooling_down"
+                    }
+                });
+                let builder = Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("Content-Type", "application/json")
+                    .header("X-Mapped-Model", mapped_model.as_str())
+                    .header("Retry-After", retry_after_secs.to_string());
+                return Ok(builder
+                    .body(axum::body::Body::from(
+                        serde_json::to_string(&err_json).unwrap(),
+                    ))
+                    .unwrap()
+                    .into_response());
+            }
+            Err(crate::proxy::TokenAcquireError::Unavailable(e)) => {
                 let headers = [("X-Mapped-Model", mapped_model.as_str())];
                 return Ok((
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -529,13 +571,11 @@ pub async fn handle_chat_completions(
             }
         };
 
-        // [NEW] 估算 prompt tokens 用于大上下文 TPM 动态冷却补偿
-        let estimated_prompt_tokens: u32 = openai_req.messages.iter().map(|m| {
-            match &m.content {
-                Some(crate::proxy::mappers::openai::OpenAIContent::String(s)) => (s.len() / 4) as u32,
-                _ => 50,
-            }
-        }).sum();
+        let access_token = acquired.access_token;
+        let project_id = acquired.project_id;
+        let email = acquired.email;
+        let account_id = acquired.account_id;
+        lease_guard = Some(acquired.lease_guard);
 
         // [NEW v4.1.29] 获取完整 Token 对象用于动态规格查询
         let proxy_token = token_manager.get_token_by_id(&account_id);
@@ -544,56 +584,18 @@ pub async fn handle_chat_completions(
             .await;
 
         last_email = Some(email.clone());
-        info!("✓ Using account: {} (type: {})", email, config.request_type);
+        info!(
+            "✓ Using account: {} (type: {}, tier: {:?})",
+            email, config.request_type, footprint.tier
+        );
 
         let need_new = match inflight_guard.as_ref() {
             Some(g) => g.account_id() != account_id.as_str(),
             None => true,
         };
         if need_new {
-            if !token_manager.try_replace_inflight(&mut inflight_guard, &account_id) {
-                tracing::warn!("Account {} at concurrency cap, rotating", email);
-                force_rotate = true;
-                continue;
-            }
+            token_manager.replace_inflight(&mut inflight_guard, &account_id);
         }
-
-        // [Heat Preflight] 请求开始时按预估 tokens 预判拦截（替代完成后记账，杜绝并发穿透）
-        let raw_body_len: usize = headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or_else(|| serde_json::to_vec(&original_body).map(|b| b.len()).unwrap_or(0));
-        if let Some(retry_after) = token_manager
-            .pacer
-            .preflight_check(&account_id, estimated_prompt_tokens, raw_body_len)
-        {
-            tracing::warn!(
-                "🛑 [Heat Preflight] Rejecting {} ({} tokens, {} bytes) with 429 Retry-After: {}s",
-                email,
-                estimated_prompt_tokens,
-                raw_body_len,
-                retry_after
-            );
-            let err_json = json!({
-                "error": {
-                    "message": format!("All pool accounts are currently cooling down from high-volume prompt workloads. Please retry in {} seconds.", retry_after),
-                    "type": "insufficient_quota",
-                    "param": null,
-                    "code": "account_pool_overheated"
-                }
-            });
-            let builder = Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header("Content-Type", "application/json")
-                .header("Retry-After", retry_after.to_string());
-            return Ok(builder.body(axum::body::Body::from(serde_json::to_string(&err_json).unwrap())).unwrap().into_response());
-        }
-
-        // [Heat Preflight] 放行后立即按预估 tokens 预占热度
-        token_manager
-            .pacer
-            .preallocate_heat(&account_id, estimated_prompt_tokens, raw_body_len);
 
         // 4. 转换请求 (返回内容包含 session_id, message_count, prefix_hash)
         let (gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
@@ -818,6 +820,9 @@ pub async fn handle_chat_completions(
                 if retry_this_account {
                     continue; // Rotate to next account
                 }
+                if let Some(g) = lease_guard.as_mut() {
+                    g.mark_upstream_accepted();
+                }
 
                 // Combine first chunk with remaining stream
                 let combined_stream =
@@ -908,18 +913,20 @@ pub async fn handle_chat_completions(
                     if let Some(p) = peak {
                         builder = builder.header("X-In-Flight-Peak", p.to_string());
                     }
-                    let pacer_guard = token_manager.begin_request_pacing(&account_id, Some(estimated_prompt_tokens));
-                    let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
-                    let pacer_clone = pacer_arc.clone();
-                    let inflight_arc = std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
+                    let lease_arc =
+                        std::sync::Arc::new(std::sync::Mutex::new(lease_guard.take()));
+                    let lease_clone = lease_arc.clone();
+                    let inflight_arc =
+                        std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
                     let inflight_clone = inflight_arc.clone();
                     let stream_with_pacer = async_stream::stream! {
                         let _guard_hold = inflight_clone;
+                        let _lease_hold = lease_clone;
                         let mut inner = Box::pin(combined_stream);
                         while let Some(item) = inner.next().await {
                             yield item;
                         }
-                        if let Ok(mut g) = pacer_clone.lock() {
+                        if let Ok(mut g) = _lease_hold.lock() {
                             if let Some(mut guard) = g.take() {
                                 guard.complete();
                             }
@@ -935,7 +942,9 @@ pub async fn handle_chat_completions(
 
                     match collect_stream_to_json(combined_stream).await {
                         Ok(full_response) => {
-                            token_manager.pacer.mark_request_completed(&account_id, Some(estimated_prompt_tokens));
+                            if let Some(mut guard) = lease_guard.take() {
+                                guard.complete();
+                            }
                             info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
                             if debug_logger::is_enabled(&debug_cfg) {
                                 let converted_response = serde_json::to_value(&full_response)
@@ -985,6 +994,9 @@ pub async fn handle_chat_completions(
                 }
             }
 
+            if let Some(g) = lease_guard.as_mut() {
+                g.mark_upstream_accepted();
+            }
             let gemini_resp: Value = response
                 .json()
                 .await
@@ -1039,6 +1051,9 @@ pub async fn handle_chat_completions(
                     &payload,
                 )
                 .await;
+            }
+            if let Some(mut guard) = lease_guard.take() {
+                guard.complete();
             }
             return Ok((
                 StatusCode::OK,
@@ -2232,8 +2247,19 @@ pub async fn handle_completions(
     }
 
     let mut force_rotate = false;
+    let mut lease_guard: Option<crate::proxy::SlotLeaseGuard> = None;
+    let estimated_prompt_tokens_codex =
+        crate::proxy::mappers::context_manager::ContextManager::estimate_openai_token_usage(
+            &openai_req,
+        ) as u32;
+    let raw_body_len_codex = serde_json::to_vec(&openai_req)
+        .map(|b| b.len())
+        .unwrap_or(0);
+    let footprint =
+        crate::proxy::RequestFootprint::new(estimated_prompt_tokens_codex, raw_body_len_codex);
 
     for attempt in 0..max_attempts {
+        lease_guard = None;
         // 3. 模型配置解析
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
@@ -2255,17 +2281,41 @@ pub async fn handle_completions(
         let session_id_str = SessionManager::extract_openai_session_id(&openai_req);
         let session_id = Some(session_id_str.as_str());
 
-        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+        let acquired = match token_manager
+            .acquire_token_with_lease(
                 &config.request_type,
                 force_rotate,
                 session_id,
                 &mapped_model,
+                footprint,
             )
             .await
         {
-            Ok(t) => t,
-            Err(e) => {
+            Ok(acq) => acq,
+            Err(crate::proxy::TokenAcquireError::PoolCoolingDown {
+                retry_after_secs,
+                reason,
+            }) => {
+                let err_json = json!({
+                    "error": {
+                        "message": format!("All pool accounts are currently cooling down ({}). Please retry in {} seconds.", reason, retry_after_secs),
+                        "type": "rate_limit_error",
+                        "param": null,
+                        "code": "account_pool_cooling_down"
+                    }
+                });
+                return axum::response::Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("Content-Type", "application/json")
+                    .header("X-Mapped-Model", mapped_model.as_str())
+                    .header("Retry-After", retry_after_secs.to_string())
+                    .body(axum::body::Body::from(
+                        serde_json::to_string(&err_json).unwrap(),
+                    ))
+                    .unwrap()
+                    .into_response();
+            }
+            Err(crate::proxy::TokenAcquireError::Unavailable(e)) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     [("X-Mapped-Model", mapped_model)],
@@ -2275,24 +2325,29 @@ pub async fn handle_completions(
             }
         };
 
+        let access_token = acquired.access_token;
+        let project_id = acquired.project_id;
+        let email = acquired.email;
+        let account_id = acquired.account_id;
+        lease_guard = Some(acquired.lease_guard);
+
         let mapped_model = token_manager
             .resolve_dynamic_model_for_account(&account_id, &mapped_model)
             .await;
 
         last_email = Some(email.clone());
 
-        info!("✓ Using account: {} (type: {})", email, config.request_type);
+        info!(
+            "✓ Using account: {} (type: {}, tier: {:?})",
+            email, config.request_type, footprint.tier
+        );
 
         let need_new = match inflight_guard.as_ref() {
             Some(g) => g.account_id() != account_id.as_str(),
             None => true,
         };
         if need_new {
-            if !token_manager.try_replace_inflight(&mut inflight_guard, &account_id) {
-                tracing::warn!("Account {} at concurrency cap, rotating", email);
-                force_rotate = true;
-                continue;
-            }
+            token_manager.replace_inflight(&mut inflight_guard, &account_id);
         }
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
@@ -2497,6 +2552,9 @@ pub async fn handle_completions(
                     if retry_this_account {
                         continue;
                     }
+                    if let Some(g) = lease_guard.as_mut() {
+                        g.mark_upstream_accepted();
+                    }
 
                     let combined_stream = futures::stream::once(async move {
                         Ok::<Bytes, String>(first_data_chunk.unwrap())
@@ -2556,18 +2614,20 @@ pub async fn handle_completions(
                     if let Some(p) = peak {
                         builder = builder.header("X-In-Flight-Peak", p.to_string());
                     }
-                    let pacer_guard = token_manager.begin_request_pacing(&account_id, Some(raw_estimated as u32));
-                    let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
-                    let pacer_clone = pacer_arc.clone();
-                    let inflight_arc = std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
+                    let lease_arc =
+                        std::sync::Arc::new(std::sync::Mutex::new(lease_guard.take()));
+                    let lease_clone = lease_arc.clone();
+                    let inflight_arc =
+                        std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
                     let inflight_clone = inflight_arc.clone();
                     let stream_with_guards = async_stream::stream! {
                         let _guard_hold = inflight_clone;
+                        let _lease_hold = lease_clone;
                         let mut inner = Box::pin(combined_stream);
                         while let Some(item) = inner.next().await {
                             yield item;
                         }
-                        if let Ok(mut g) = pacer_clone.lock() {
+                        if let Ok(mut g) = _lease_hold.lock() {
                             if let Some(mut guard) = g.take() {
                                 guard.complete();
                             }
@@ -2665,10 +2725,16 @@ pub async fn handle_completions(
                         converted_meta,
                     );
 
+                    if let Some(g) = lease_guard.as_mut() {
+                        g.mark_upstream_accepted();
+                    }
                     // Collect
                     use crate::proxy::mappers::openai::collector::collect_stream_to_json;
                     match collect_stream_to_json(combined_stream).await {
                         Ok(chat_resp) => {
+                            if let Some(mut guard) = lease_guard.take() {
+                                guard.complete();
+                            }
                             let is_responses_api = uri.path() == "/v1/responses";
 
                             if is_responses_api {
@@ -2840,6 +2906,9 @@ pub async fn handle_completions(
                 }
             }
 
+            if let Some(g) = lease_guard.as_mut() {
+                g.mark_upstream_accepted();
+            }
             let gemini_resp: Value = match response.json().await {
                 Ok(json) => json,
                 Err(e) => {
@@ -2852,6 +2921,9 @@ pub async fn handle_completions(
                 }
             };
 
+            if let Some(mut guard) = lease_guard.take() {
+                guard.complete();
+            }
             let chat_resp = transform_openai_response(
                 &gemini_resp,
                 Some("session-123"),

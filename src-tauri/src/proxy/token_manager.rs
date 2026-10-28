@@ -8,8 +8,43 @@ use tokio_util::sync::CancellationToken;
 
 use crate::proxy::account_inflight::{AccountInflightGuard, AccountInflightTracker};
 use crate::proxy::config::SerialPoolConfig;
-use crate::proxy::rate_limit::RateLimitTracker;
+use crate::proxy::rate_limit::{
+    AccountProbe, LeaseRejectReason, RateLimitTracker, RequestFootprint, SlotLeaseGuard,
+    COLD_POOL_HEAT_THRESHOLD, DEFAULT_CONCURRENCY_SLOTS, FALLBACK_MAX_SLOT_WAIT_MS,
+    STICKY_MAX_SLOT_WAIT_MS,
+};
 use crate::proxy::sticky_config::StickySessionConfig;
+
+/// 容量感知路由选号成功返回的完整凭证与并发槽位生命周期租约
+pub struct AcquiredToken {
+    pub access_token: String,
+    pub project_id: String,
+    pub email: String,
+    pub account_id: String,
+    pub wait_ms: u64,
+    pub lease_guard: SlotLeaseGuard,
+}
+
+/// 容量感知路由选号失败原因（区分全池冷却/过热 429 与池空/全挂 503）
+#[derive(Debug)]
+pub enum TokenAcquireError {
+    /// 全池所有可用账号均处于冷却、过热、小憩、冷启动缓冲或短期 429 锁定中
+    PoolCoolingDown {
+        retry_after_secs: u64,
+        reason: String,
+    },
+    /// 账号池为空、无支持该模型的配额、代理全红或全部账号鉴权失效
+    Unavailable(String),
+}
+
+impl std::fmt::Display for TokenAcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PoolCoolingDown { reason, .. } => write!(f, "{}", reason),
+            Self::Unavailable(msg) => write!(f, "{}", msg),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct LastAdvanceRecord {
@@ -191,6 +226,15 @@ impl TokenManager {
         self.tokens
             .get(account_id)
             .and_then(|t| t.max_concurrency.filter(|&n| n > 0))
+    }
+
+    /// 计算指定账号的有效并发槽位数：
+    /// 优先级：单账号单独覆盖 > 页面全局设置 (`max_account_concurrency`) > 默认 2 槽 (`DEFAULT_CONCURRENCY_SLOTS`)
+    pub fn effective_slot_count(&self, account_id: &str) -> usize {
+        let account_max = self.account_max_concurrency(account_id);
+        self.effective_max_concurrency(account_max)
+            .map(|n| (n as usize).max(1))
+            .unwrap_or(DEFAULT_CONCURRENCY_SLOTS)
     }
 
     /// True when account is at its effective concurrency cap.
@@ -1989,6 +2033,1079 @@ impl TokenManager {
         }
     }
 
+    /// 前置容量感知选号并原子锁定并发槽位租约（主推理入口：Claude / OpenAI / Gemini）：
+    /// - 在请求进入账号前一次性完成：微休眠门禁、>200K 过热红线（严格 <3 个）、多并发槽位互斥与冷却延迟（粘性 <=2s 微等 / >2s 果断切号）判定；
+    /// - 返回已就绪的 `AcquiredToken`（含 `SlotLeaseGuard`），彻底消除选号后 Handler 抛 429 中断会话的问题。
+    pub async fn acquire_token_with_lease(
+        &self,
+        quota_group: &str,
+        force_rotate: bool,
+        session_id: Option<&str>,
+        target_model: &str,
+        footprint: RequestFootprint,
+    ) -> Result<AcquiredToken, TokenAcquireError> {
+        // 1. 同步待重载账号（配额保护实时变更）与待清理账号
+        let pending_reload = crate::proxy::server::take_pending_reload_accounts();
+        for account_id in pending_reload {
+            if let Err(e) = self.reload_account(&account_id).await {
+                tracing::warn!("[Quota] Failed to reload account {}: {}", account_id, e);
+            } else {
+                tracing::info!(
+                    "[Quota] Reloaded account {} (protected_models synced)",
+                    account_id
+                );
+            }
+        }
+
+        let pending_delete = crate::proxy::server::take_pending_delete_accounts();
+        for account_id in pending_delete {
+            self.remove_account(&account_id);
+            tracing::info!(
+                "[Proxy] Purged deleted account {} from all caches",
+                account_id
+            );
+        }
+
+        // 2. 进程级冷启动 60s 大包防突刺前置门禁（全局性，与具体账号无关）
+        if let Some(LeaseRejectReason::ColdStartWarmup { retry_after_secs }) =
+            self.pacer.check_global_or_egress_hold("", footprint)
+        {
+            return Err(TokenAcquireError::PoolCoolingDown {
+                retry_after_secs,
+                reason: format!(
+                    "Server cold-start warmup active: holding oversized request ({} tokens, {}B) for {}s.",
+                    footprint.prompt_tokens, footprint.raw_body_len, retry_after_secs
+                ),
+            });
+        }
+
+        // 3. 选号 + 刷新鉴权阶段使用 15s 死锁保护超时（与后续槽位微等睡眠解耦）
+        let timeout_duration = std::time::Duration::from_secs(15);
+        let mut acquired = match tokio::time::timeout(
+            timeout_duration,
+            self.acquire_token_with_lease_internal(
+                quota_group,
+                force_rotate,
+                session_id,
+                target_model,
+                footprint,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(acq)) => acq,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(TokenAcquireError::Unavailable(
+                    "Token acquisition timeout (15s) - system too busy or OAuth refresh stalled"
+                        .to_string(),
+                ));
+            }
+        };
+
+        // 4. 若该租约属于粘性微等（<=2s）或全池冷却兜底（<=5s）预约槽，在此完成冷却微等并正式提升为 InFlight
+        let wait_ms = acquired.lease_guard.reserved_wait_ms();
+        if wait_ms > 0 {
+            tracing::info!(
+                "[HumanizedPacer] Reserved slot on {}: waiting {}ms cooldown before promoting to InFlight",
+                acquired.email,
+                wait_ms
+            );
+            acquired.lease_guard.wait_until_ready().await;
+            acquired.wait_ms = wait_ms;
+        }
+
+        Ok(acquired)
+    }
+
+    async fn refresh_and_resolve_token(
+        &self,
+        mut token: ProxyToken,
+    ) -> Result<(ProxyToken, String), String> {
+        let now = chrono::Utc::now().timestamp();
+        if now >= token.timestamp - 90 {
+            let refresh_mu = self
+                .refresh_locks
+                .entry(token.account_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            let _guard = refresh_mu.lock().await;
+
+            let latest_token_opt = self.tokens.get(&token.account_id).map(|r| r.clone());
+            if let Some(latest) = latest_token_opt {
+                if now < latest.timestamp - 90 {
+                    token = latest;
+                } else {
+                    match crate::modules::oauth::refresh_access_token(
+                        &token.refresh_token,
+                        Some(&token.account_id),
+                    )
+                    .await
+                    {
+                        Ok(token_response) => {
+                            token.access_token = token_response.access_token.clone();
+                            token.expires_in = token_response.expires_in;
+                            token.timestamp = now + token_response.expires_in;
+                            if let Some(rt) = token_response.refresh_token.clone() {
+                                token.refresh_token = rt;
+                            }
+                            if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
+                                entry.access_token = token.access_token.clone();
+                                entry.expires_in = token.expires_in;
+                                entry.timestamp = token.timestamp;
+                                entry.refresh_token = token.refresh_token.clone();
+                            }
+                            let _ = self
+                                .save_refreshed_token(&token.account_id, &token_response)
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Token 刷新失败 ({}): {}，准备回滚租约并尝试下一个账号",
+                                token.email,
+                                e
+                            );
+                            if e.contains("\"invalid_grant\"") || e.contains("invalid_grant") {
+                                let _ = self
+                                    .disable_account(
+                                        &token.account_id,
+                                        &format!("invalid_grant: {}", e),
+                                    )
+                                    .await;
+                            }
+                            return Err(format!("Token refresh failed: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+
+        let project_id = token.project_id.clone().filter(|s| !s.is_empty());
+        let project_id = if let Some(pid) = project_id {
+            pid
+        } else {
+            let refresh_mu = self
+                .refresh_locks
+                .entry(token.account_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            let _guard = refresh_mu.lock().await;
+
+            let cached = self
+                .tokens
+                .get(&token.account_id)
+                .and_then(|t| t.project_id.clone())
+                .filter(|s| !s.is_empty());
+            if let Some(pid) = cached {
+                pid
+            } else {
+                match crate::proxy::project_resolver::fetch_project_id(
+                    &token.access_token,
+                    Some(&token.account_id),
+                )
+                .await
+                {
+                    Ok(pid) => {
+                        if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
+                            entry.project_id = Some(pid.clone());
+                        }
+                        let _ = self.save_project_id(&token.account_id, &pid).await;
+                        pid
+                    }
+                    Err(_) => "bamboo-precept-lgxtn".to_string(),
+                }
+            }
+        };
+
+        Ok((token, project_id))
+    }
+
+    /// 容量感知三层梯队 P2C 选号并原子锁定槽位租约
+    async fn select_and_lease_with_p2c(
+        &self,
+        tokens_snapshot: &[ProxyToken],
+        attempted: &HashSet<String>,
+        billing_target: &str,
+        rate_limit_model_key: &str,
+        target_model: &str,
+        quota_protection_enabled: bool,
+        footprint: RequestFootprint,
+    ) -> (
+        Option<(ProxyToken, SlotLeaseGuard, bool)>,
+        Option<(u64, String)>,
+    ) {
+        use rand::Rng;
+
+        let mut local_raced: HashSet<String> = HashSet::new();
+        let mut shortest_reject: Option<(u64, String)> = None;
+
+        let record_reject = |best: &mut Option<(u64, String)>, secs: u64, msg: String| {
+            let s = secs.max(1);
+            match best {
+                Some((cur, _)) if *cur <= s => {}
+                _ => *best = Some((s, msg)),
+            }
+        };
+
+        loop {
+            let mut tier1_zero_wait_cold: Vec<(&ProxyToken, f64, usize)> = Vec::new();
+            let mut tier2_zero_wait_warm: Vec<(&ProxyToken, f64, usize)> = Vec::new();
+            let mut tier3_short_cooldown: Vec<(&ProxyToken, u64, f64)> = Vec::new();
+
+            for t in tokens_snapshot {
+                if attempted.contains(&t.account_id) || local_raced.contains(&t.account_id) {
+                    continue;
+                }
+                if quota_protection_enabled
+                    && Self::is_model_quota_protected(&t.protected_models, target_model)
+                {
+                    continue;
+                }
+                if self
+                    .is_rate_limited(&t.account_id, Some(rate_limit_model_key))
+                    .await
+                {
+                    let rl_wait = self
+                        .rate_limit_tracker
+                        .get_remaining_wait(&t.account_id, Some(rate_limit_model_key))
+                        .max(1);
+                    record_reject(
+                        &mut shortest_reject,
+                        rl_wait,
+                        format!("Account {} rate-limited ({}s)", t.email, rl_wait),
+                    );
+                    continue;
+                }
+
+                let max_slots = self.effective_slot_count(&t.account_id);
+                match self.pacer.probe_account(&t.account_id, footprint, max_slots) {
+                    AccountProbe::Admissible {
+                        wait_ms,
+                        current_heat,
+                        free_slots,
+                        ..
+                    } => {
+                        if wait_ms == 0 && current_heat < COLD_POOL_HEAT_THRESHOLD {
+                            tier1_zero_wait_cold.push((t, current_heat, free_slots));
+                        } else if wait_ms == 0 {
+                            tier2_zero_wait_warm.push((t, current_heat, free_slots));
+                        } else {
+                            tier3_short_cooldown.push((t, wait_ms, current_heat));
+                        }
+                    }
+                    AccountProbe::Rejected(reason) => {
+                        if let Some(sec) = reason.estimated_recovery_secs() {
+                            record_reject(
+                                &mut shortest_reject,
+                                sec,
+                                format!("Account {} temporarily unavailable ({:?})", t.email, reason),
+                            );
+                        }
+                    }
+                }
+            }
+
+            if !tier1_zero_wait_cold.is_empty() || !tier2_zero_wait_warm.is_empty() {
+                let bucket = if !tier1_zero_wait_cold.is_empty() {
+                    &tier1_zero_wait_cold
+                } else {
+                    &tier2_zero_wait_warm
+                };
+
+                let chosen = if bucket.len() == 1 {
+                    bucket[0].0
+                } else {
+                    let pool_size = bucket.len().min(Self::P2C_POOL_SIZE);
+                    let mut rng = rand::thread_rng();
+                    let pick1 = rng.gen_range(0..pool_size);
+                    let raw_pick2 = rng.gen_range(0..pool_size);
+                    let pick2 = if raw_pick2 == pick1 {
+                        (pick1 + 1) % pool_size
+                    } else {
+                        raw_pick2
+                    };
+
+                    let (c1, h1, f1) = bucket[pick1];
+                    let (c2, h2, f2) = bucket[pick2];
+
+                    if (h1 - h2).abs() >= 0.5 {
+                        if h1 < h2 { c1 } else { c2 }
+                    } else if f1 != f2 {
+                        if f1 > f2 { c1 } else { c2 }
+                    } else {
+                        let s1 = self.bound_session_count(&c1.account_id);
+                        let s2 = self.bound_session_count(&c2.account_id);
+                        if s1 != s2 {
+                            if s1 < s2 { c1 } else { c2 }
+                        } else {
+                            let q1 = c1
+                                .model_quotas
+                                .get(billing_target)
+                                .copied()
+                                .or(c1.remaining_quota)
+                                .unwrap_or(0);
+                            let q2 = c2
+                                .model_quotas
+                                .get(billing_target)
+                                .copied()
+                                .or(c2.remaining_quota)
+                                .unwrap_or(0);
+                            if q1 >= q2 { c1 } else { c2 }
+                        }
+                    }
+                };
+
+                let max_slots = self.effective_slot_count(&chosen.account_id);
+                match self
+                    .pacer
+                    .try_acquire_lease(&chosen.account_id, footprint, max_slots, 0)
+                {
+                    Ok((guard, entered_nap)) => {
+                        return (Some((chosen.clone(), guard, entered_nap)), shortest_reject);
+                    }
+                    Err(_) => {
+                        local_raced.insert(chosen.account_id.clone());
+                        continue;
+                    }
+                }
+            } else if !tier3_short_cooldown.is_empty() {
+                // 全池没有任何 Free 槽位时，兜底挑选剩余冷却最短（<=5s）的单个账号进行预约微等
+                let chosen = tier3_short_cooldown
+                    .iter()
+                    .min_by_key(|(_, w, h)| (*w, (*h * 100.0) as i64))
+                    .map(|(t, _, _)| *t)
+                    .unwrap();
+
+                let max_slots = self.effective_slot_count(&chosen.account_id);
+                match self.pacer.try_acquire_lease(
+                    &chosen.account_id,
+                    footprint,
+                    max_slots,
+                    FALLBACK_MAX_SLOT_WAIT_MS,
+                ) {
+                    Ok((guard, entered_nap)) => {
+                        tracing::info!(
+                            "⏳ [P2C] All open slots busy across pool; reserved shortest-cooldown account {} (wait: {}ms)",
+                            chosen.email,
+                            guard.reserved_wait_ms()
+                        );
+                        return (Some((chosen.clone(), guard, entered_nap)), shortest_reject);
+                    }
+                    Err(_) => {
+                        local_raced.insert(chosen.account_id.clone());
+                        continue;
+                    }
+                }
+            } else {
+                return (None, shortest_reject);
+            }
+        }
+    }
+
+    async fn acquire_token_serial_with_lease(
+        &self,
+        tokens_snapshot: &[ProxyToken],
+        session_id: Option<&str>,
+        target_model: &str,
+        quota_protection_enabled: bool,
+        footprint: RequestFootprint,
+    ) -> Result<AcquiredToken, TokenAcquireError> {
+        let cfg = self.serial_pool.read().await.clone();
+        let scheduling = self.sticky_config.read().await.clone();
+        crate::proxy::sticky_config::warn_serial_pool_scheduling_override(scheduling.mode);
+
+        let normalized_billing =
+            crate::proxy::common::model_mapping::normalize_to_billing_group(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+        let ordered = self.ordered_pool_tokens(tokens_snapshot);
+        if ordered.is_empty() {
+            return Err(TokenAcquireError::Unavailable(
+                "Serial pool exhausted: no available accounts".to_string(),
+            ));
+        }
+
+        let mut preferred_id = self.preferred_account_id.read().await.clone();
+        if preferred_id.is_none() {
+            for t in &ordered {
+                if self
+                    .is_serial_usable(
+                        t,
+                        Some(&normalized_billing),
+                        quota_protection_enabled,
+                        cfg.require_proxy_binding,
+                        false,
+                    )
+                    .await
+                {
+                    let id = t.account_id.clone();
+                    self.set_preferred_account(Some(id.clone())).await;
+                    let _ = self.persist_preferred_to_disk(Some(id.clone())).await;
+                    preferred_id = Some(id);
+                    break;
+                }
+            }
+        }
+
+        let start_idx = preferred_id
+            .as_deref()
+            .and_then(|pid| ordered.iter().position(|t| t.account_id == pid))
+            .unwrap_or(0);
+
+        let mut shortest_reject: Option<(u64, String)> = None;
+        for offset in 0..ordered.len() {
+            let candidate = &ordered[(start_idx + offset) % ordered.len()];
+            if !self
+                .is_serial_usable(
+                    candidate,
+                    Some(&normalized_billing),
+                    quota_protection_enabled,
+                    cfg.require_proxy_binding,
+                    false,
+                )
+                .await
+            {
+                if offset == 0 {
+                    let rate_limited = self
+                        .is_rate_limited(&candidate.account_id, Some(&normalized_billing))
+                        .await;
+                    let reason = if rate_limited {
+                        "rate_limit"
+                    } else if quota_protection_enabled
+                        && Self::is_model_quota_protected(&candidate.protected_models, target_model)
+                    {
+                        "quota_protection"
+                    } else {
+                        "invalid_grant"
+                    };
+                    if cfg.should_advance_on(reason) {
+                        let _ = self.advance_serial_account(reason, Some(target_model)).await;
+                    }
+                }
+                continue;
+            }
+
+            let max_slots = self.effective_slot_count(&candidate.account_id);
+            match self.pacer.try_acquire_lease(
+                &candidate.account_id,
+                footprint,
+                max_slots,
+                STICKY_MAX_SLOT_WAIT_MS,
+            ) {
+                Ok((mut lease_guard, entered_nap)) => {
+                    match Self::get_account_state_on_disk(&candidate.account_path).await {
+                        OnDiskAccountState::Disabled => {
+                            lease_guard.abort_and_rollback();
+                            self.remove_account(&candidate.account_id);
+                            continue;
+                        }
+                        OnDiskAccountState::Unknown => {
+                            lease_guard.abort_and_rollback();
+                            continue;
+                        }
+                        OnDiskAccountState::Enabled => {}
+                    }
+
+                    match self.refresh_and_resolve_token(candidate.clone()).await {
+                        Ok((refreshed, project_id)) => {
+                            if entered_nap {
+                                self.session_accounts
+                                    .retain(|_, v| v != &refreshed.account_id);
+                            } else if let Some(sid) = session_id {
+                                self.session_accounts
+                                    .insert(sid.to_string(), refreshed.account_id.clone());
+                            }
+                            return Ok(AcquiredToken {
+                                access_token: refreshed.access_token,
+                                project_id,
+                                email: refreshed.email,
+                                account_id: refreshed.account_id,
+                                wait_ms: lease_guard.reserved_wait_ms(),
+                                lease_guard,
+                            });
+                        }
+                        Err(_) => {
+                            lease_guard.abort_and_rollback();
+                            continue;
+                        }
+                    }
+                }
+                Err(reason) => {
+                    if let Some(sec) = reason.estimated_recovery_secs() {
+                        match &shortest_reject {
+                            Some((cur, _)) if *cur <= sec => {}
+                            _ => {
+                                shortest_reject = Some((
+                                    sec,
+                                    format!(
+                                        "Serial candidate {} cooling down ({:?})",
+                                        candidate.email, reason
+                                    ),
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((sec, msg)) = shortest_reject {
+            Err(TokenAcquireError::PoolCoolingDown {
+                retry_after_secs: sec.max(1),
+                reason: msg,
+            })
+        } else {
+            Err(TokenAcquireError::Unavailable(
+                "Serial pool exhausted: no available accounts".to_string(),
+            ))
+        }
+    }
+
+    async fn acquire_token_with_lease_internal(
+        &self,
+        quota_group: &str,
+        force_rotate: bool,
+        session_id: Option<&str>,
+        target_model: &str,
+        footprint: RequestFootprint,
+    ) -> Result<AcquiredToken, TokenAcquireError> {
+        let mut tokens_snapshot: Vec<ProxyToken> =
+            self.tokens.iter().map(|e| e.value().clone()).collect();
+        if tokens_snapshot.is_empty() {
+            return Err(TokenAcquireError::Unavailable(
+                "Token pool is empty".to_string(),
+            ));
+        }
+
+        let billing_target =
+            crate::proxy::common::model_mapping::normalize_to_billing_group(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+        let fine_target =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+                .unwrap_or_else(|| target_model.to_string());
+
+        let candidate_count_before = tokens_snapshot.len();
+        tokens_snapshot.retain(|t| {
+            t.model_quotas.contains_key(&billing_target)
+                || t.model_quotas.contains_key(&fine_target)
+                || t.model_quotas.contains_key(target_model)
+        });
+
+        // 严格代理过滤：剔除代理不通 (RED) 的账号
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            let mut proxy_available_tokens = Vec::with_capacity(tokens_snapshot.len());
+            for t in tokens_snapshot {
+                if pool.is_account_proxy_available(&t.account_id).await {
+                    proxy_available_tokens.push(t);
+                } else {
+                    tracing::warn!(
+                        "[Strict Proxy] 账号 {} ({}) 绑定的代理不通 (RED)，已移出候选池",
+                        t.email,
+                        t.account_id
+                    );
+                }
+            }
+            tokens_snapshot = proxy_available_tokens;
+        }
+
+        if tokens_snapshot.is_empty() {
+            if candidate_count_before > 0 {
+                return Err(TokenAcquireError::Unavailable(format!(
+                    "无可用账号：账号配额耗尽或代理不通 (RED) (model: {})",
+                    target_model
+                )));
+            }
+            return Err(TokenAcquireError::Unavailable(
+                "Token pool is empty or all proxies are UNHEALTHY (RED)".to_string(),
+            ));
+        }
+
+        tokens_snapshot.sort_by(|a, b| {
+            let tier_priority = |tier: &Option<String>| {
+                let t = tier.as_deref().unwrap_or("").to_lowercase();
+                if t.contains("ultra") {
+                    0
+                } else if t.contains("pro") {
+                    1
+                } else if t.contains("free") {
+                    2
+                } else {
+                    3
+                }
+            };
+            let tier_cmp =
+                tier_priority(&a.subscription_tier).cmp(&tier_priority(&b.subscription_tier));
+            if tier_cmp != std::cmp::Ordering::Equal {
+                return tier_cmp;
+            }
+
+            let quota_a = a.model_quotas.get(&billing_target).copied().unwrap_or(0);
+            let quota_b = b.model_quotas.get(&billing_target).copied().unwrap_or(0);
+            let quota_cmp = quota_b.cmp(&quota_a);
+            if quota_cmp != std::cmp::Ordering::Equal {
+                return quota_cmp;
+            }
+
+            let health_cmp = b.health_score.total_cmp(&a.health_score);
+            if health_cmp != std::cmp::Ordering::Equal {
+                return health_cmp;
+            }
+
+            let reset_a = a.reset_time.unwrap_or(i64::MAX);
+            let reset_b = b.reset_time.unwrap_or(i64::MAX);
+            reset_a.cmp(&reset_b)
+        });
+
+        let scheduling = self.sticky_config.read().await.clone();
+        use crate::proxy::sticky_config::SchedulingMode;
+
+        let quota_protection_enabled = crate::modules::config::load_app_config()
+            .map(|cfg| cfg.quota_protection.enabled)
+            .unwrap_or(false);
+
+        // 串行号池分支
+        if self.serial_pool.read().await.enabled {
+            return self
+                .acquire_token_serial_with_lease(
+                    &tokens_snapshot,
+                    session_id,
+                    target_model,
+                    quota_protection_enabled,
+                    footprint,
+                )
+                .await;
+        }
+
+        // 固定优先账号分支（仅在非强制轮转时优先尝试）
+        let preferred_id = self.preferred_account_id.read().await.clone();
+        if !force_rotate {
+            if let Some(ref pref_id) = preferred_id {
+                if let Some(preferred_token) = tokens_snapshot
+                    .iter()
+                    .find(|t| &t.account_id == pref_id)
+                    .cloned()
+                {
+                    match Self::get_account_state_on_disk(&preferred_token.account_path).await {
+                        OnDiskAccountState::Disabled => {
+                            self.remove_account(&preferred_token.account_id);
+                            tokens_snapshot.retain(|t| t.account_id != preferred_token.account_id);
+                            let mut preferred = self.preferred_account_id.write().await;
+                            if preferred.as_deref() == Some(pref_id.as_str()) {
+                                *preferred = None;
+                            }
+                            if tokens_snapshot.is_empty() {
+                                return Err(TokenAcquireError::Unavailable(
+                                    "Token pool is empty".to_string(),
+                                ));
+                            }
+                        }
+                        OnDiskAccountState::Unknown => {
+                            tokens_snapshot.retain(|t| t.account_id != preferred_token.account_id);
+                            if tokens_snapshot.is_empty() {
+                                return Err(TokenAcquireError::Unavailable(
+                                    "Token pool is empty".to_string(),
+                                ));
+                            }
+                        }
+                        OnDiskAccountState::Enabled => {
+                            let is_rate_limited = self
+                                .is_rate_limited(&preferred_token.account_id, Some(&fine_target))
+                                .await;
+                            let is_quota_protected = quota_protection_enabled
+                                && Self::is_model_quota_protected(
+                                    &preferred_token.protected_models,
+                                    target_model,
+                                );
+                            if !is_rate_limited && !is_quota_protected {
+                                let max_slots =
+                                    self.effective_slot_count(&preferred_token.account_id);
+                                match self.pacer.try_acquire_lease(
+                                    &preferred_token.account_id,
+                                    footprint,
+                                    max_slots,
+                                    STICKY_MAX_SLOT_WAIT_MS,
+                                ) {
+                                    Ok((mut lease_guard, entered_nap)) => {
+                                        match self.refresh_and_resolve_token(preferred_token).await
+                                        {
+                                            Ok((refreshed, project_id)) => {
+                                                if entered_nap {
+                                                    self.session_accounts.retain(|_, bound_id| {
+                                                        bound_id != &refreshed.account_id
+                                                    });
+                                                }
+                                                return Ok(AcquiredToken {
+                                                    access_token: refreshed.access_token,
+                                                    project_id,
+                                                    email: refreshed.email,
+                                                    account_id: refreshed.account_id,
+                                                    wait_ms: lease_guard.reserved_wait_ms(),
+                                                    lease_guard,
+                                                });
+                                            }
+                                            Err(_) => {
+                                                lease_guard.abort_and_rollback();
+                                            }
+                                        }
+                                    }
+                                    Err(reason) => {
+                                        tracing::info!(
+                                            "🔒 [Preferred Account] {} unavailable for {:?} ({:?}), falling back to pool",
+                                            preferred_token.email,
+                                            footprint.tier,
+                                            reason
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let last_used_snapshot = if quota_group != "image_gen" && session_id.is_none() {
+            self.last_used_account.lock().await.clone()
+        } else {
+            None
+        };
+
+        let total = tokens_snapshot.len();
+        let mut attempted: HashSet<String> = HashSet::new();
+        let mut last_error: Option<String> = None;
+
+        for attempt in 0..total {
+            let rotate = force_rotate || attempt > 0;
+            let mut selected_with_lease: Option<(ProxyToken, SlotLeaseGuard, bool)> = None;
+            let mut need_update_last_used: Option<(String, std::time::Instant)> = None;
+
+            // ===== 模式 A: 粘性会话前置准入检验与预解绑 =====
+            if !rotate
+                && session_id.is_some()
+                && scheduling.mode != SchedulingMode::PerformanceFirst
+            {
+                let sid = session_id.unwrap();
+                if let Some(bound_id) = self.session_accounts.get(sid).map(|v| v.clone()) {
+                    if let Some(bound_token) =
+                        tokens_snapshot.iter().find(|t| t.account_id == bound_id)
+                    {
+                        let acc_id = &bound_token.account_id;
+                        if !attempted.contains(acc_id) {
+                            let reset_sec = self
+                                .rate_limit_tracker
+                                .get_remaining_wait(acc_id, Some(&fine_target));
+                            let is_limited = reset_sec > 0
+                                || self.is_rate_limited(acc_id, Some(&fine_target)).await;
+                            let is_protected = quota_protection_enabled
+                                && Self::is_model_quota_protected(
+                                    &bound_token.protected_models,
+                                    target_model,
+                                );
+
+                            if is_limited {
+                                tracing::info!(
+                                    "Sticky Session: Bound account {} is rate-limited ({}s) for {}, unbinding before request.",
+                                    bound_token.email,
+                                    reset_sec,
+                                    fine_target
+                                );
+                                self.session_accounts.remove(sid);
+                            } else if is_protected {
+                                tracing::info!(
+                                    "Sticky Session: Bound account {} is quota-protected for {}, unbinding before request.",
+                                    bound_token.email,
+                                    target_model
+                                );
+                                self.session_accounts.remove(sid);
+                            } else {
+                                let max_slots = self.effective_slot_count(acc_id);
+                                match self.pacer.try_acquire_lease(
+                                    acc_id,
+                                    footprint,
+                                    max_slots,
+                                    STICKY_MAX_SLOT_WAIT_MS,
+                                ) {
+                                    Ok((guard, entered_nap)) => {
+                                        tracing::debug!(
+                                            "Sticky Session: Reusing bound account {} for session {} (wait: {}ms, tier: {:?})",
+                                            bound_token.email,
+                                            sid,
+                                            guard.reserved_wait_ms(),
+                                            footprint.tier
+                                        );
+                                        if entered_nap {
+                                            // 本轮是触发小憩的最后一轮，立即解绑会话，确保下一轮直接无缝切往新号
+                                            self.session_accounts.retain(|_, v| v != acc_id);
+                                        }
+                                        selected_with_lease =
+                                            Some((bound_token.clone(), guard, entered_nap));
+                                    }
+                                    Err(reason) => {
+                                        // 关键铁律：小憩、>200K 过热（第 3 个大包）、并发槽全忙或冷却延迟 > 2s 时，
+                                        // 在请求发出前立即解绑粘性会话，直接交由模式 C 切换至空闲冷号！
+                                        match &reason {
+                                            LeaseRejectReason::Overheated {
+                                                current_heat,
+                                                projected_heat,
+                                                ..
+                                            } => {
+                                                tracing::info!(
+                                                    "Sticky Session: Pre-unbinding {} before >200K request (heat {:.2} -> {:.2} >= 3.0), switching to cold account.",
+                                                    bound_token.email,
+                                                    current_heat,
+                                                    projected_heat
+                                                );
+                                            }
+                                            LeaseRejectReason::InNap { remaining_secs } => {
+                                                tracing::info!(
+                                                    "Sticky Session: Bound account {} is in micro-nap ({}s left), unbinding and switching.",
+                                                    bound_token.email,
+                                                    remaining_secs
+                                                );
+                                            }
+                                            LeaseRejectReason::CooldownTooLong { wait_ms } => {
+                                                tracing::info!(
+                                                    "Sticky Session: Bound account {} slot cooldown {}ms > 2000ms, decisively unbinding and switching.",
+                                                    bound_token.email,
+                                                    wait_ms
+                                                );
+                                            }
+                                            LeaseRejectReason::SlotsBusy => {
+                                                tracing::info!(
+                                                    "Sticky Session: Bound account {} slots busy / exclusive mutex active, unbinding and switching.",
+                                                    bound_token.email
+                                                );
+                                            }
+                                            _ => {
+                                                tracing::info!(
+                                                    "Sticky Session: Bound account {} rejected ({:?}), unbinding and switching.",
+                                                    bound_token.email,
+                                                    reason
+                                                );
+                                            }
+                                        }
+                                        self.session_accounts.remove(sid);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        self.session_accounts.remove(sid);
+                    }
+                }
+            }
+
+            // ===== 模式 B: 无 session_id 请求的 60s 短窗口复用（严格仅限 session_id.is_none()） =====
+            if selected_with_lease.is_none()
+                && !rotate
+                && session_id.is_none()
+                && quota_group != "image_gen"
+                && scheduling.mode != SchedulingMode::PerformanceFirst
+            {
+                if let Some((ref last_id, last_time)) = last_used_snapshot {
+                    if last_time.elapsed().as_secs() < 60 && !attempted.contains(last_id) {
+                        if let Some(found) =
+                            tokens_snapshot.iter().find(|t| &t.account_id == last_id)
+                        {
+                            let is_limited = self
+                                .is_rate_limited(&found.account_id, Some(&fine_target))
+                                .await;
+                            let is_protected = quota_protection_enabled
+                                && Self::is_model_quota_protected(
+                                    &found.protected_models,
+                                    target_model,
+                                );
+                            let is_warm = self.pacer.is_heat_saturated(&found.account_id);
+                            if !is_limited && !is_protected && !is_warm {
+                                let max_slots = self.effective_slot_count(&found.account_id);
+                                if let Ok((guard, entered_nap)) = self.pacer.try_acquire_lease(
+                                    &found.account_id,
+                                    footprint,
+                                    max_slots,
+                                    STICKY_MAX_SLOT_WAIT_MS,
+                                ) {
+                                    selected_with_lease =
+                                        Some((found.clone(), guard, entered_nap));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ===== 模式 C: 容量感知三层梯队 P2C 选号 =====
+            let mut pool_reject_hint: Option<(u64, String)> = None;
+            if selected_with_lease.is_none() {
+                let (picked, reject_hint) = self
+                    .select_and_lease_with_p2c(
+                        &tokens_snapshot,
+                        &attempted,
+                        &billing_target,
+                        &fine_target,
+                        target_model,
+                        quota_protection_enabled,
+                        footprint,
+                    )
+                    .await;
+                pool_reject_hint = reject_hint;
+
+                if let Some((selected, guard, entered_nap)) = picked {
+                    if session_id.is_none()
+                        && quota_group != "image_gen"
+                        && scheduling.mode != SchedulingMode::PerformanceFirst
+                        && !entered_nap
+                    {
+                        need_update_last_used =
+                            Some((selected.account_id.clone(), std::time::Instant::now()));
+                    }
+
+                    if let Some(sid) = session_id {
+                        if entered_nap {
+                            self.session_accounts
+                                .retain(|_, v| v != &selected.account_id);
+                        } else if scheduling.mode != SchedulingMode::PerformanceFirst {
+                            self.session_accounts
+                                .insert(sid.to_string(), selected.account_id.clone());
+                            tracing::info!(
+                                "Sticky Session: Bound healthy account {} to session {}",
+                                selected.email,
+                                sid
+                            );
+                        }
+                    }
+
+                    selected_with_lease = Some((selected, guard, entered_nap));
+                }
+            }
+
+            let (token, mut lease_guard, _entered_nap) = match selected_with_lease {
+                Some(triple) => triple,
+                None => {
+                    // 全池没有任何账号立即可用：检查是否存在最短 <= 2s 的 429 边界限流可做一次短缓冲同步
+                    if let Some((wait_sec, ref reason_msg)) = pool_reject_hint {
+                        let any_short_429 = tokens_snapshot.iter().any(|t| {
+                            !attempted.contains(&t.account_id)
+                                && !self.pacer.is_in_nap(&t.account_id)
+                                && !(quota_protection_enabled
+                                    && Self::is_model_quota_protected(
+                                        &t.protected_models,
+                                        target_model,
+                                    ))
+                                && {
+                                    let w = self.rate_limit_tracker.get_remaining_wait(
+                                        &t.account_id,
+                                        Some(&fine_target),
+                                    );
+                                    w > 0 && w <= 2
+                                }
+                        });
+
+                        if any_short_429 && wait_sec <= 2 {
+                            tokio::time::sleep(std::time::Duration::from_secs(wait_sec.max(1)))
+                                .await;
+                            self.rate_limit_tracker.cleanup_expired();
+                            let (retry_picked, _) = self
+                                .select_and_lease_with_p2c(
+                                    &tokens_snapshot,
+                                    &attempted,
+                                    &billing_target,
+                                    &fine_target,
+                                    target_model,
+                                    quota_protection_enabled,
+                                    footprint,
+                                )
+                                .await;
+                            if let Some((selected, guard, entered_nap)) = retry_picked {
+                                if let Some(sid) = session_id {
+                                    if !entered_nap
+                                        && scheduling.mode != SchedulingMode::PerformanceFirst
+                                    {
+                                        self.session_accounts
+                                            .insert(sid.to_string(), selected.account_id.clone());
+                                    }
+                                }
+                                (selected, guard, entered_nap)
+                            } else {
+                                return Err(TokenAcquireError::PoolCoolingDown {
+                                    retry_after_secs: wait_sec.max(2),
+                                    reason: reason_msg.clone(),
+                                });
+                            }
+                        } else {
+                            return Err(TokenAcquireError::PoolCoolingDown {
+                                retry_after_secs: wait_sec.max(1),
+                                reason: reason_msg.clone(),
+                            });
+                        }
+                    } else {
+                        return Err(TokenAcquireError::Unavailable(
+                            last_error.unwrap_or_else(|| {
+                                format!(
+                                    "All accounts unavailable or quota-protected for model {}",
+                                    target_model
+                                )
+                            }),
+                        ));
+                    }
+                }
+            };
+
+            // 磁盘禁用安全网校验：若发现账号已被禁用，立即回滚槽位租约与预占热度，切换下一账号
+            match Self::get_account_state_on_disk(&token.account_path).await {
+                OnDiskAccountState::Disabled => {
+                    tracing::warn!(
+                        "Selected account {} is disabled on disk, rolling back lease and retrying",
+                        token.email
+                    );
+                    lease_guard.abort_and_rollback();
+                    attempted.insert(token.account_id.clone());
+                    self.remove_account(&token.account_id);
+                    continue;
+                }
+                OnDiskAccountState::Unknown => {
+                    tracing::warn!(
+                        "Selected account {} state on disk is unavailable, rolling back lease and skipping",
+                        token.email
+                    );
+                    lease_guard.abort_and_rollback();
+                    attempted.insert(token.account_id.clone());
+                    continue;
+                }
+                OnDiskAccountState::Enabled => {}
+            }
+
+            // OAuth Token 刷新与 ProjectID 解析：若鉴权失败，立即回滚租约并切换下一账号
+            match self.refresh_and_resolve_token(token).await {
+                Ok((refreshed, project_id)) => {
+                    if let Some((new_account_id, new_time)) = need_update_last_used {
+                        if quota_group != "image_gen" {
+                            let mut last_used = self.last_used_account.lock().await;
+                            *last_used = Some((new_account_id, new_time));
+                        }
+                    }
+
+                    return Ok(AcquiredToken {
+                        access_token: refreshed.access_token,
+                        project_id,
+                        email: refreshed.email,
+                        account_id: refreshed.account_id,
+                        wait_ms: lease_guard.reserved_wait_ms(),
+                        lease_guard,
+                    });
+                }
+                Err(e) => {
+                    lease_guard.abort_and_rollback();
+                    last_error = Some(e);
+                    attempted.insert(lease_guard.account_id().to_string());
+                    continue;
+                }
+            }
+        }
+
+        Err(TokenAcquireError::Unavailable(
+            last_error.unwrap_or_else(|| "All accounts failed".to_string()),
+        ))
+    }
+
     /// 获取当前可用的 Token（支持粘性会话与智能调度）
     /// 参数 `quota_group` 用于区分 "claude" vs "gemini" 组
     /// 参数 `force_rotate` 为 true 时将忽略锁定，强制切换账号
@@ -2545,9 +3662,10 @@ impl TokenManager {
             }
 
             // 模式 B: 原子化 60s 全局锁定 (针对无 session_id 情况的默认保护)
-            // 【修复】性能优先模式应跳过 60s 锁定；
+            // 【修复】仅在无 session_id 时启用，严禁覆盖已主动解绑的粘性会话；性能优先模式跳过 60s 锁定；
             if target_token.is_none()
                 && !rotate
+                && session_id.is_none()
                 && quota_group != "image_gen"
                 && scheduling.mode != SchedulingMode::PerformanceFirst
             {
@@ -6059,6 +7177,203 @@ mod tests {
             assert!((rem_5h - 0.0).abs() < 1e-6, "expected 0.0, got {}", rem_5h);
             assert!((rem_w - 0.0).abs() < 1e-6, "expected 0.0, got {}", rem_w);
         }
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_sticky_pre_unbind_on_3rd_oversized_and_no_mode_b_ghost() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-sticky-oversize-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, email: &str| {
+            let path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": "test-project"
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "quota": {
+                    "models": [
+                        { "name": "claude-sonnet-4-5-20250929", "percentage": 100 }
+                    ]
+                },
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        write_account("acc1", "acc1@test.com");
+        write_account("acc2", "acc2@test.com");
+
+        let mut manager = TokenManager::new(tmp_root.clone());
+        manager.pacer = Arc::new(crate::proxy::rate_limit::HumanizedPacer::new_warmed());
+        manager.load_accounts().await.unwrap();
+
+        let sid = Some("client-session-alpha");
+        // 模拟现网 260KB 大请求 (>200KB -> Oversized)
+        let fp_oversize = RequestFootprint::new(61_000, 260_575);
+
+        // 第 1 个 >200KB 请求：分配某冷账号并建立粘性绑定
+        let mut acq1 = manager
+            .acquire_token_with_lease(
+                "claude",
+                false,
+                sid,
+                "claude-sonnet-4-5-20250929",
+                fp_oversize,
+            )
+            .await
+            .expect("1st >200KB request should succeed");
+        let first_acc = acq1.account_id.clone();
+        acq1.lease_guard.complete();
+        // 模拟 8~15s 槽位冷却已结束，但仍处于 3 分钟短时间窗口内 (heat ~1.5)
+        manager.pacer.test_clear_slot_cooldowns(&first_acc);
+
+        // 第 2 个 >200KB 请求：粘性复用同一账号 (heat 1.5 -> ~3.0)
+        let mut acq2 = manager
+            .acquire_token_with_lease(
+                "claude",
+                false,
+                sid,
+                "claude-sonnet-4-5-20250929",
+                fp_oversize,
+            )
+            .await
+            .expect("2nd >200KB request should reuse sticky account");
+        assert_eq!(acq2.account_id, first_acc);
+        acq2.lease_guard.complete();
+        manager.pacer.test_clear_slot_cooldowns(&first_acc);
+
+        // 第 3 个 >200KB 请求：请求进入前即触发过热红线 (projected >= 3.0)，
+        // 必须当场解绑 first_acc 并无缝路由至另一冷账号（绝不报错 429，且绝不被 Mode B 鬼打墙拉回！）
+        let mut acq3 = manager
+            .acquire_token_with_lease(
+                "claude",
+                false,
+                sid,
+                "claude-sonnet-4-5-20250929",
+                fp_oversize,
+            )
+            .await
+            .expect("3rd >200KB request must pre-unbind and switch to cold account without 429");
+        assert_ne!(
+            acq3.account_id, first_acc,
+            "3rd >200KB request must switch away from overheated account"
+        );
+        assert_eq!(
+            manager.session_accounts.get("client-session-alpha").map(|v| v.clone()),
+            Some(acq3.account_id.clone()),
+            "session must re-bind to the new cold account"
+        );
+        acq3.lease_guard.complete();
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_sticky_2s_wait_vs_switch_and_free_pool_skips_cooling_slots() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-sticky-2s-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, email: &str| {
+            let path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": "test-project"
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "quota": {
+                    "models": [
+                        { "name": "gemini-2.5-pro", "percentage": 100 }
+                    ]
+                },
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        write_account("acc1", "acc1@test.com");
+        write_account("acc2", "acc2@test.com");
+
+        let mut manager = TokenManager::new(tmp_root.clone());
+        manager.pacer = Arc::new(crate::proxy::rate_limit::HumanizedPacer::new_warmed());
+        manager.update_global_max_concurrency(Some(2));
+        manager.load_accounts().await.unwrap();
+
+        let fp_small = RequestFootprint::new(12_000, 30 * 1024);
+
+        // 先将 session-1 绑定到 acc1
+        manager
+            .session_accounts
+            .insert("session-1".to_string(), "acc1".to_string());
+
+        // 1. 设 acc1 的两个并发槽均在 250ms (<=2s) 冷却期内：
+        // - 自由选号 (session-2) 必须跳过全部槽在冷却中的 acc1，零等待选 acc2！
+        manager
+            .pacer
+            .test_set_all_slots_cooldown("acc1", 2, 250, false);
+        let mut free_acq = manager
+            .acquire_token_with_lease("gemini", false, Some("session-2"), "gemini-2.5-pro", fp_small)
+            .await
+            .expect("session-2 should pick open acc2");
+        assert_eq!(
+            free_acq.account_id, "acc2",
+            "free selection must skip account whose 2 slots are both cooling down"
+        );
+        assert_eq!(free_acq.wait_ms, 0);
+        free_acq.lease_guard.abort_and_rollback();
+
+        // - 粘性会话 (session-1) 发现 acc1 冷却 <= 2s，微等后继续复用 acc1 保缓存！
+        manager
+            .pacer
+            .test_set_all_slots_cooldown("acc1", 2, 120, false);
+        let mut sticky_wait_acq = manager
+            .acquire_token_with_lease("gemini", false, Some("session-1"), "gemini-2.5-pro", fp_small)
+            .await
+            .expect("sticky session should wait <=2s and reuse acc1");
+        assert_eq!(sticky_wait_acq.account_id, "acc1");
+        assert!(sticky_wait_acq.wait_ms > 0 && sticky_wait_acq.wait_ms <= 2000);
+        sticky_wait_acq.lease_guard.abort_and_rollback();
+
+        // 2. 设 acc1 的两个并发槽处于 3200ms (>2s) 冷却期内：
+        // - 粘性会话 (session-1) 果断解绑切往空闲的 acc2！
+        manager
+            .pacer
+            .test_set_all_slots_cooldown("acc1", 2, 3200, false);
+        let mut sticky_switch_acq = manager
+            .acquire_token_with_lease("gemini", false, Some("session-1"), "gemini-2.5-pro", fp_small)
+            .await
+            .expect("sticky session must switch when cooldown > 2s");
+        assert_eq!(sticky_switch_acq.account_id, "acc2");
+        assert_eq!(sticky_switch_acq.wait_ms, 0);
+        sticky_switch_acq.lease_guard.abort_and_rollback();
 
         let _ = std::fs::remove_dir_all(&tmp_root);
     }

@@ -790,7 +790,7 @@ impl Default for ProxyConfig {
             upstream_proxy: UpstreamProxyConfig::default(),
             zai: ZaiConfig::default(),
             scheduling: crate::proxy::sticky_config::StickySessionConfig::default(),
-            max_account_concurrency: None,
+            max_account_concurrency: Some(2),
             experimental: ExperimentalConfig::default(),
             security_monitor: SecurityMonitorConfig::default(),
             preferred_account_id: None, // 默认使用轮询模式

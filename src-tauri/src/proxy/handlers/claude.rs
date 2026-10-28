@@ -801,10 +801,20 @@ pub async fn handle_messages(
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
     let mut force_rotate = false;
     let mut inflight_guard: Option<crate::proxy::account_inflight::AccountInflightGuard> = None;
+    let mut lease_guard: Option<crate::proxy::SlotLeaseGuard> = None;
     let estimated_prompt_tokens =
         crate::proxy::mappers::context_manager::ContextManager::estimate_token_usage(&request_for_body) as u32;
+    let raw_body_len: usize = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| serde_json::to_vec(&request_for_body).map(|b| b.len()).unwrap_or(0));
+    let footprint = crate::proxy::RequestFootprint::new(estimated_prompt_tokens, raw_body_len);
 
     for attempt in 0..max_attempts {
+        // 若上一轮尝试未达上游成功即重试，释放并回滚上一账号的槽位租约与预占热度
+        lease_guard = None;
+
         // 2. 模型路由解析
         let mut mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
             &request_for_body.model,
@@ -835,17 +845,46 @@ pub async fn handle_messages(
             crate::proxy::session_manager::SessionManager::extract_session_id(&request_for_body);
         let session_id = Some(session_id_str.as_str());
 
-        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+        let acquired = match token_manager
+            .acquire_token_with_lease(
                 &config.request_type,
                 force_rotate,
                 session_id,
                 &config.final_model,
+                footprint,
             )
             .await
         {
-            Ok(t) => t,
-            Err(e) => {
+            Ok(acq) => acq,
+            Err(crate::proxy::TokenAcquireError::PoolCoolingDown {
+                retry_after_secs,
+                reason,
+            }) => {
+                tracing::warn!(
+                    "[{}] ⏳ [Capacity Router] Pool cooling down ({} tokens, {}B): {} (Retry-After: {}s)",
+                    trace_id,
+                    estimated_prompt_tokens,
+                    raw_body_len,
+                    reason,
+                    retry_after_secs
+                );
+                let err_json = json!({
+                    "type": "error",
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": format!("All pool accounts are currently cooling down ({}). Please retry in {} seconds.", reason, retry_after_secs)
+                    }
+                });
+                let builder = Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("X-Mapped-Model", mapped_model.as_str())
+                    .header("Retry-After", retry_after_secs.to_string());
+                return builder
+                    .body(Body::from(serde_json::to_string(&err_json).unwrap()))
+                    .unwrap();
+            }
+            Err(crate::proxy::TokenAcquireError::Unavailable(e)) => {
                 let safe_message = if e.contains("invalid_grant") {
                     "OAuth refresh failed (invalid_grant): refresh_token likely revoked/expired; reauthorize account(s) to restore service.".to_string()
                 } else {
@@ -867,61 +906,25 @@ pub async fn handle_messages(
             }
         };
 
+        let access_token = acquired.access_token;
+        let project_id = acquired.project_id;
+        let email = acquired.email;
+        let account_id = acquired.account_id;
+        lease_guard = Some(acquired.lease_guard);
+
         last_email = Some(email.clone());
-        info!("✓ Using account: {} (type: {})", email, config.request_type);
+        info!(
+            "✓ Using account: {} (type: {}, tier: {:?})",
+            email, config.request_type, footprint.tier
+        );
 
         let need_new = match inflight_guard.as_ref() {
             Some(g) => g.account_id() != account_id.as_str(),
             None => true,
         };
         if need_new {
-            if !token_manager.try_replace_inflight(&mut inflight_guard, &account_id) {
-                tracing::warn!(
-                    "[{}] Account {} at concurrency cap, rotating",
-                    trace_id,
-                    email
-                );
-                force_rotate = true;
-                continue;
-            }
+            token_manager.replace_inflight(&mut inflight_guard, &account_id);
         }
-
-        // [Heat Preflight] 请求开始时按预估 tokens 预判拦截（替代完成后记账，杜绝并发穿透）
-        let raw_body_len: usize = headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or_else(|| serde_json::to_vec(&request_for_body).map(|b| b.len()).unwrap_or(0));
-        if let Some(retry_after) = token_manager
-            .pacer
-            .preflight_check(&account_id, estimated_prompt_tokens, raw_body_len)
-        {
-            tracing::warn!(
-                "[{}] 🛑 [Heat Preflight] Rejecting {} ({} tokens, {} bytes) with 429 Retry-After: {}s",
-                trace_id,
-                email,
-                estimated_prompt_tokens,
-                raw_body_len,
-                retry_after
-            );
-            let err_json = json!({
-                "type": "error",
-                "error": {
-                    "type": "rate_limit_error",
-                    "message": format!("All pool accounts are currently cooling down from high-volume prompt workloads. Please retry in {} seconds.", retry_after)
-                }
-            });
-            let builder = Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("Retry-After", retry_after.to_string());
-            return builder.body(Body::from(serde_json::to_string(&err_json).unwrap())).unwrap();
-        }
-
-        // [Heat Preflight] 放行后立即按预估 tokens 预占热度
-        token_manager
-            .pacer
-            .preallocate_heat(&account_id, estimated_prompt_tokens, raw_body_len);
 
         // ===== 【优化】后台任务智能检测与降级 =====
         // 使用新的检测系统，支持 5 大类关键词和多 Flash 模型策略
@@ -1435,6 +1438,9 @@ pub async fn handle_messages(
 
                 match first_data_chunk {
                     Some(bytes) => {
+                        if let Some(g) = lease_guard.as_mut() {
+                            g.mark_upstream_accepted();
+                        }
                         // We have data! Construct the combined stream
                         let stream_rest = claude_stream;
                         let combined_stream = futures::stream::once(async move { Ok(bytes) })
@@ -1489,18 +1495,20 @@ pub async fn handle_messages(
                             if let Some(p) = peak {
                                 builder = builder.header("X-In-Flight-Peak", p.to_string());
                             }
-                            let pacer_guard = token_manager.begin_request_pacing(&account_id, Some(raw_estimated as u32));
-                            let pacer_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(pacer_guard)));
-                            let pacer_clone = pacer_arc.clone();
-                            let inflight_arc = std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
+                            let lease_arc =
+                                std::sync::Arc::new(std::sync::Mutex::new(lease_guard.take()));
+                            let lease_clone = lease_arc.clone();
+                            let inflight_arc =
+                                std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
                             let inflight_clone = inflight_arc.clone();
                             let stream_with_pacer = async_stream::stream! {
                                 let _guard_hold = inflight_clone;
+                                let _lease_hold = lease_clone;
                                 let mut inner = Box::pin(combined_stream);
                                 while let Some(item) = inner.next().await {
                                     yield item;
                                 }
-                                if let Ok(mut g) = pacer_clone.lock() {
+                                if let Ok(mut g) = _lease_hold.lock() {
                                     if let Some(mut guard) = g.take() {
                                         guard.complete();
                                     }
@@ -1516,7 +1524,9 @@ pub async fn handle_messages(
 
                             match collect_stream_to_json(Box::pin(combined_stream)).await {
                                 Ok(full_response) => {
-                                    token_manager.pacer.mark_request_completed(&account_id, Some(raw_estimated as u32));
+                                    if let Some(mut guard) = lease_guard.take() {
+                                        guard.complete();
+                                    }
                                     info!(
                                         "[{}] ✓ Stream collected and converted to JSON",
                                         trace_id
@@ -1568,6 +1578,9 @@ pub async fn handle_messages(
                     }
                 }
             } else {
+                if let Some(g) = lease_guard.as_mut() {
+                    g.mark_upstream_accepted();
+                }
                 // 处理非流式响应
                 let bytes = match response.bytes().await {
                     Ok(b) => b,
@@ -1654,6 +1667,9 @@ pub async fn handle_messages(
                     cache_info
                 );
 
+                if let Some(mut guard) = lease_guard.take() {
+                    guard.complete();
+                }
                 let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
                 let headers = crate::proxy::account_inflight::account_headers(
                     &email,

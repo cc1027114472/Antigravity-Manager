@@ -1925,21 +1925,37 @@ print(response.choices[0].message.content)`;
                                                         {t('proxy.config.concurrency.global_max')}
                                                         <HelpTooltip text={t('proxy.config.concurrency.global_max_tooltip')} />
                                                     </label>
-                                                    <input
-                                                        type="number"
-                                                        min={0}
-                                                        className="input input-bordered input-xs w-24 font-mono"
-                                                        placeholder={t('proxy.config.concurrency.unlimited')}
-                                                        value={appConfig.proxy.max_account_concurrency || ''}
-                                                        onChange={(e) => {
-                                                            const raw = e.target.value.trim();
-                                                            const n = raw === '' ? undefined : parseInt(raw, 10);
-                                                            updateProxyConfig({
-                                                                max_account_concurrency:
-                                                                    n && n > 0 ? n : undefined,
-                                                            });
-                                                        }}
-                                                    />
+                                                    <div className="flex items-center gap-1.5">
+                                                        {[1, 2, 3].map((preset) => {
+                                                            const activeCount = appConfig.proxy.max_account_concurrency ?? 2;
+                                                            const isActive = activeCount === preset;
+                                                            return (
+                                                                <button
+                                                                    key={preset}
+                                                                    type="button"
+                                                                    onClick={() => updateProxyConfig({ max_account_concurrency: preset })}
+                                                                    className={`btn btn-xs px-2.5 font-mono ${isActive ? 'btn-primary' : 'btn-ghost bg-white/70 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700'}`}
+                                                                >
+                                                                    {preset}
+                                                                </button>
+                                                            );
+                                                        })}
+                                                        <input
+                                                            type="number"
+                                                            min={1}
+                                                            className="input input-bordered input-xs w-20 font-mono"
+                                                            placeholder="2"
+                                                            value={appConfig.proxy.max_account_concurrency ?? 2}
+                                                            onChange={(e) => {
+                                                                const raw = e.target.value.trim();
+                                                                const n = raw === '' ? undefined : parseInt(raw, 10);
+                                                                updateProxyConfig({
+                                                                    max_account_concurrency:
+                                                                        n && n > 0 ? n : 2,
+                                                                });
+                                                            }}
+                                                        />
+                                                    </div>
                                                 </div>
                                                 <p className="text-[10px] text-gray-500 dark:text-gray-400 leading-relaxed">
                                                     {t('proxy.config.concurrency.global_max_hint')}

@@ -45,11 +45,16 @@ pub use config::ProxyPoolConfig;
 pub use config::SerialPoolConfig;
 pub use config::ZaiConfig;
 pub use config::ZaiDispatchMode;
-pub use rate_limit::{HumanizedPacer, RequestCompletionGuard};
+#[allow(unused_imports)]
+pub use rate_limit::{
+    HumanizedPacer, RequestCompletionGuard, RequestFootprint, SlotLeaseGuard, TrafficTier,
+    DEFAULT_CONCURRENCY_SLOTS, STICKY_MAX_SLOT_WAIT_MS,
+};
 pub use security::ProxySecurityConfig;
 pub use server::AxumServer;
 pub use signature_cache::SignatureCache;
-pub use token_manager::TokenManager;
+#[allow(unused_imports)]
+pub use token_manager::{AcquiredToken, TokenAcquireError, TokenManager};
 
 #[cfg(test)]
 pub mod tests;

@@ -49,9 +49,37 @@ const COLD_START_WARMUP_SECS: u64 = 60;
 /// token refresh / small traffic can settle on the same TLS identity first.
 const EGRESS_RECOVERY_COOLDOWN_SECS: u64 = 90;
 
-fn is_oversized_burst(prompt_tokens: u32, raw_body_len: usize) -> bool {
-    raw_body_len > 200 * 1024 || prompt_tokens > 100_000
-}
+/// 默认单账号并发槽位数（未在页面或账号单独配置时默认 2 并发槽）
+pub const DEFAULT_CONCURRENCY_SLOTS: usize = 2;
+
+/// 粘性会话允许等待单账号槽位冷却释放的最大毫秒数（<= 2s 微等保缓存，> 2s 果断换号）
+pub const STICKY_MAX_SLOT_WAIT_MS: u64 = 2000;
+
+/// 全号池均处于冷却延迟中时，兜底允许预约等待最短冷却槽位的最大毫秒数
+pub const FALLBACK_MAX_SLOT_WAIT_MS: u64 = 5000;
+
+/// 流量分级物理字节与 Token 边界
+pub const MEDIUM_BODY_BYTES: usize = 100 * 1024;
+pub const OVERSIZE_BODY_BYTES: usize = 200 * 1024;
+pub const MEDIUM_TOKENS: u32 = 100_000;
+pub const OVERSIZE_TOKENS: u32 = 200_000;
+
+/// 热度半衰期：180 秒（3 分钟）指数衰减
+const HEAT_HALF_LIFE_SECS: f64 = 180.0;
+
+/// 各分级单次热度增量：
+/// - Normal (<=100K): +0.0
+/// - Medium (100K~200K, 含 130K): +0.5
+/// - Oversized (>200K): +1.5
+const MEDIUM_HEAT_INCREMENT: f64 = 0.5;
+const OVERSIZE_HEAT_INCREMENT: f64 = 1.5;
+
+/// 超大请求（>200K）准入红线：推演热度 (current_heat + 1.5) >= 3.0 即拒绝进入该账号。
+/// 保证单账号在短时间窗口内承接 >200K 的请求严格少于 3 个（最多允许 2 个：1.5 -> ~2.9 < 3.0，第 3 个 >= 3.0 进门前拦截换号）。
+pub const OVERSIZE_HEAT_CAP: f64 = 3.0;
+
+/// 冷号池优选线：Heat < 1.5 视为清凉账号，在自由选号（P2C）中享受最高优先级
+pub const COLD_POOL_HEAT_THRESHOLD: f64 = 1.5;
 
 fn remaining_recovery_hold_secs(elapsed_secs: u64) -> Option<u64> {
     if elapsed_secs >= EGRESS_RECOVERY_COOLDOWN_SECS {
@@ -61,44 +89,202 @@ fn remaining_recovery_hold_secs(elapsed_secs: u64) -> Option<u64> {
     }
 }
 
-/// 大任务热度极限熔断线：合成热度达到该值即拒绝 >30K tokens 任务。
-/// 由 2.0 放大到 4.0 —— 30K~100K 任务允许连发 3 个，100K+ 任务冷号可放行 1 个，
-/// 保证正常对话/大上下文顺畅，同时仍能拦住同一账号连续大任务风暴。
-const HEAT_CRITICAL_THRESHOLD: f64 = 4.0;
+/// 请求流量四级分级（L1 日常轻量 / L2 中大请求 / L3 超大高危；L4 为账号轮次微小憩）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrafficTier {
+    /// <= 100KB 且 < 100K tokens：低延迟（0.8s~1.8s），热度 +0.0，占用 1 槽
+    Normal,
+    /// (100KB..=200KB) 或 [100K..=200K] tokens（含 130K 典型请求）：少量延迟（2.0s~3.8s），热度 +0.5，占用 1 槽
+    Medium,
+    /// > 200KB 或 > 200K tokens：充分冷却（8.0s~15.0s），热度 +1.5（短时严格 < 3 个），独占全部并发槽（与小请求互斥）
+    Oversized,
+}
 
-/// 超大体量（>200KB）软拦截线：账号热度 >= 该值即拒绝（由 0.5 放大到 1.0）
-const OVERSIZE_HEAT_THRESHOLD: f64 = 1.0;
+/// 前置提取的请求体量特征（在选号前算清，供 TokenManager 容量感知路由使用）
+#[derive(Debug, Clone, Copy)]
+pub struct RequestFootprint {
+    pub prompt_tokens: u32,
+    pub raw_body_len: usize,
+    pub tier: TrafficTier,
+}
 
-/// 单账号拟人化节奏与风控状态
+impl Default for RequestFootprint {
+    fn default() -> Self {
+        Self::new(0, 0)
+    }
+}
+
+impl RequestFootprint {
+    pub fn new(prompt_tokens: u32, raw_body_len: usize) -> Self {
+        let tier = if raw_body_len > OVERSIZE_BODY_BYTES || prompt_tokens > OVERSIZE_TOKENS {
+            TrafficTier::Oversized
+        } else if raw_body_len > MEDIUM_BODY_BYTES || prompt_tokens >= MEDIUM_TOKENS {
+            TrafficTier::Medium
+        } else {
+            TrafficTier::Normal
+        };
+        Self {
+            prompt_tokens,
+            raw_body_len,
+            tier,
+        }
+    }
+
+    pub fn is_oversized(&self) -> bool {
+        self.tier == TrafficTier::Oversized
+    }
+
+    pub fn heat_increment(&self) -> f64 {
+        match self.tier {
+            TrafficTier::Normal => 0.0,
+            TrafficTier::Medium => MEDIUM_HEAT_INCREMENT,
+            TrafficTier::Oversized => OVERSIZE_HEAT_INCREMENT,
+        }
+    }
+}
+
+/// 单个并发槽位的完整生命周期阶段（占用期 = 实际请求耗时 + 计算出的冷却延迟）
+#[derive(Debug, Clone)]
+pub enum SlotPhase {
+    /// 槽位空闲打开，可零等待进入
+    Free,
+    /// 已被粘性微等（<=2s）或全池兜底请求原子预约锁定，等待 `ready_at` 到达后转为 InFlight
+    Reserved {
+        lease_id: u64,
+        ready_at: std::time::Instant,
+        restore_cooldown: Option<(std::time::Instant, bool)>,
+        exclusive: bool,
+    },
+    /// 请求正在执行中（真实网络流式/非流式耗时阶段，槽位闭合）
+    InFlight {
+        lease_id: u64,
+        started_at: std::time::Instant,
+        exclusive: bool,
+    },
+    /// 响应已结束，但正处于计算出的冷却延迟倒计时内（槽位保持闭合，直至 `until` 才重新打开）
+    CoolingDown {
+        until: std::time::Instant,
+        exclusive: bool,
+    },
+}
+
+/// 账号前置准入拒绝原因（供路由层静默解绑切号或统计全池最短恢复秒数）
+#[derive(Debug, Clone)]
+pub enum LeaseRejectReason {
+    /// 服务冷启动前 60s 缓冲（拦截超大请求突刺）
+    ColdStartWarmup { retry_after_secs: u64 },
+    /// 专属代理刚从 RED 恢复 GREEN 未满 90s 稳定期
+    EgressRecovery { retry_after_secs: u64 },
+    /// 账号处于 20~30 轮强制微小憩期间（休眠期全封闭，大小请求一律禁入）
+    InNap { remaining_secs: u64 },
+    /// 超大请求（>200K）触发热度红线（projected_heat >= 3.0，限制第 3 个大包进入）
+    Overheated {
+        current_heat: f64,
+        projected_heat: f64,
+        retry_after_secs: u64,
+    },
+    /// 并发槽全部处于执行中（InFlight/Reserved）或触发大小请求互斥锁
+    SlotsBusy,
+    /// 槽位处于冷却延迟或 60s RPM 限制中，且所需等待毫秒数超过当前模式上限（如粘性 > 2000ms）
+    CooldownTooLong { wait_ms: u64 },
+}
+
+impl LeaseRejectReason {
+    /// 若全池账号均被拒绝，折算该账号最早可恢复接单的秒数（用于全局兜底 Retry-After）
+    pub fn estimated_recovery_secs(&self) -> Option<u64> {
+        match self {
+            Self::ColdStartWarmup { retry_after_secs } => Some(*retry_after_secs),
+            Self::EgressRecovery { retry_after_secs } => Some(*retry_after_secs),
+            Self::InNap { remaining_secs } => Some((*remaining_secs).max(1)),
+            Self::Overheated {
+                retry_after_secs, ..
+            } => Some((*retry_after_secs).max(5)),
+            Self::CooldownTooLong { wait_ms } => Some(((*wait_ms + 999) / 1000).max(1)),
+            Self::SlotsBusy => Some(5),
+        }
+    }
+}
+
+/// 无副作用探测结果（供 P2C 候选池分层与比选使用）
+#[derive(Debug, Clone)]
+pub enum AccountProbe {
+    Admissible {
+        wait_ms: u64,
+        current_heat: f64,
+        free_slots: usize,
+        total_slots: usize,
+    },
+    Rejected(LeaseRejectReason),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InternalSlotEval {
+    Ready { free_slots: usize, total_slots: usize },
+    NeedWait { wait_ms: u64, total_slots: usize },
+    Busy,
+}
+
+/// 单账号拟人化节奏、多并发槽位与热度风控状态
 #[derive(Debug, Clone)]
 pub struct AccountPacerState {
     /// 最近一次发起请求时间
     pub last_request_time: std::time::Instant,
     /// 最近一次流/响应完全结束的时间（EOF/[DONE]）
     pub last_response_completed_at: Option<std::time::Instant>,
-    /// 下一次允许发起请求的最早时间点 (含 Post-Response Jitter + TPM 扩展)
+    /// 下一次允许发起请求的最早时间点 (兼容单槽查询)
     pub next_allowed_request_at: std::time::Instant,
-    /// 过去 60 秒内的请求时间戳历史（用于滚动 60s RPM，压在 10~12 次以内）
+    /// 过去 60 秒内的请求时间戳历史（用于滚动 60s RPM，单号上限 10 次）
     pub rolling_requests: std::collections::VecDeque<std::time::Instant>,
-    /// 累计请求计数
+    /// 历史累计请求总计数
     pub request_counter: u64,
+    /// 当前小憩周期内已累计的对话轮数
+    pub turns_since_nap: u64,
+    /// 本周期触发强制小憩的目标轮数（每次休眠后重新随机抽取 20..=30）
+    pub next_nap_threshold: u64,
     /// 当前波段基础间隔 (ms)
     pub current_interval_ms: u64,
     /// 微休眠截止时间
     pub nap_until: Option<std::time::Instant>,
     /// 保护阈值浮动
     pub threshold_jitter: i32,
-    /// 大任务累积热度积分（半衰期指数衰减）
+    /// 大任务累积热度积分（180s 半衰期指数衰减）
     pub massive_heat: f64,
     /// 上次更新热度的时间
     pub last_heat_updated_at: std::time::Instant,
+    /// 多并发槽位表（槽位生命周期 = 实际请求耗时 + 计算延迟）
+    pub slots: Vec<SlotPhase>,
 }
 
-/// 单账号拟人化流控与防均质化调度器
+impl AccountPacerState {
+    pub fn new_default(account_id: &str, now: std::time::Instant, slot_count: usize) -> Self {
+        use rand::Rng;
+        let n = slot_count.max(1);
+        let next_nap_threshold = rand::thread_rng().gen_range(20..=30);
+        Self {
+            last_request_time: now,
+            last_response_completed_at: None,
+            next_allowed_request_at: now,
+            rolling_requests: std::collections::VecDeque::new(),
+            request_counter: 0,
+            turns_since_nap: 0,
+            next_nap_threshold,
+            current_interval_ms: 1200,
+            nap_until: None,
+            threshold_jitter: HumanizedPacer::get_threshold_jitter(account_id),
+            massive_heat: 0.0,
+            last_heat_updated_at: now,
+            slots: vec![SlotPhase::Free; n],
+        }
+    }
+}
+
+/// 单账号拟人化流控、并发槽位锁与防均质化调度器
 pub struct HumanizedPacer {
     account_states: DashMap<String, AccountPacerState>,
     /// 服务进程启动时刻，用于冷启动平滑缓冲（重启后前 60s 限制大请求突刺）
     started_at: std::time::Instant,
+    /// 全局递增租约 ID 生成器
+    next_lease_id: std::sync::atomic::AtomicU64,
 }
 
 impl HumanizedPacer {
@@ -106,49 +292,81 @@ impl HumanizedPacer {
         Self {
             account_states: DashMap::new(),
             started_at: std::time::Instant::now(),
+            next_lease_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
-    /// 计算从响应结束（EOF/[DONE]）后的基础冷却时间（1.5s ~ 3.5s 泊松/随机抖动）以及大 Prompt TPM 补偿
-    pub fn compute_cooldown_ms(prompt_tokens: Option<u32>) -> u64 {
+    /// 测试或特殊场景下跳过冷启动 60s 窗口的构造函数
+    #[allow(dead_code)]
+    pub fn new_warmed() -> Self {
+        Self {
+            account_states: DashMap::new(),
+            started_at: std::time::Instant::now()
+                .checked_sub(Duration::from_secs(COLD_START_WARMUP_SECS + 10))
+                .unwrap_or_else(std::time::Instant::now),
+            next_lease_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_clear_slot_cooldowns(&self, account_id: &str) {
+        if let Some(mut entry) = self.account_states.get_mut(account_id) {
+            let n = entry.slots.len().max(1);
+            entry.slots = vec![SlotPhase::Free; n];
+            entry.next_allowed_request_at = std::time::Instant::now();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_set_all_slots_cooldown(
+        &self,
+        account_id: &str,
+        slot_count: usize,
+        cooldown_ms: u64,
+        exclusive: bool,
+    ) {
+        let now = std::time::Instant::now();
+        let until = now + Duration::from_millis(cooldown_ms);
+        let mut entry = self
+            .account_states
+            .entry(account_id.to_string())
+            .or_insert_with(|| AccountPacerState::new_default(account_id, now, slot_count));
+        entry.slots = vec![SlotPhase::CoolingDown { until, exclusive }; slot_count.max(1)];
+    }
+
+    /// 根据四级流量分级计算响应结束后的槽位冷却延迟（毫秒）：
+    /// - L1 Normal (<=100KB 且 <100K tokens)：低延迟 800ms ~ 1800ms（严格 <= 2000ms，保障粘性对话顺畅）
+    /// - L2 Medium (100K~200K, 含 130K)：少量平滑延迟 2000ms ~ 3800ms
+    /// - L3 Oversized (>200KB 或 >200K tokens)：充分冷却 8000ms ~ 15000ms（期间独占全槽闭合）
+    pub fn compute_footprint_cooldown_ms(footprint: RequestFootprint) -> u64 {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        // 基础冷却：1500ms ~ 3500ms (1500ms + 0~2000ms 随机抖动)
-        let base_delay: u64 = rng.gen_range(1500..=3500);
+        match footprint.tier {
+            TrafficTier::Normal => {
+                if footprint.prompt_tokens <= 30_000 && footprint.raw_body_len <= 50 * 1024 {
+                    rng.gen_range(800..=1500)
+                } else {
+                    rng.gen_range(1100..=1800)
+                }
+            }
+            TrafficTier::Medium => rng.gen_range(2000..=3800),
+            TrafficTier::Oversized => rng.gen_range(8000..=15_000),
+        }
+    }
 
-        // TPM 动态保护补偿：平滑阶梯延时，既保证大请求后有充分的人性化停顿，又保留号池弹性
-        let tokens = prompt_tokens.unwrap_or(0);
-        let tpm_penalty: u64 = if tokens > 250_000 {
-            // 超巨型上下文 (>250K Tokens)：平滑追加 20s ~ 35s 延迟
-            rng.gen_range(20_000..=35_000)
-        } else if tokens > 150_000 {
-            // 极大上下文 (150K~250K Tokens)：追加 12s ~ 22s 延迟
-            rng.gen_range(12_000..=22_000)
-        } else if tokens > 50_000 {
-            // 较大上下文 (50K~150K Tokens)：追加 6s ~ 12s 延迟
-            rng.gen_range(6_000..=12_000)
-        } else if tokens > 15_000 {
-            // 中等上下文 (15K~50K Tokens)：追加 2s ~ 5s 延迟
-            rng.gen_range(2_000..=5_000)
-        } else {
-            0
-        };
-
-        base_delay + tpm_penalty
+    /// 兼容旧签名：按 prompt_tokens 折算冷却时间
+    pub fn compute_cooldown_ms(prompt_tokens: Option<u32>) -> u64 {
+        let fp = RequestFootprint::new(prompt_tokens.unwrap_or(0), 0);
+        Self::compute_footprint_cooldown_ms(fp)
     }
 
     /// 获取账号当前需要的拟人化波段间隔（毫秒，1000ms ~ 5000ms），带有正弦潮汐波与正态随机抖动
-    pub fn compute_wave_interval_ms(counter: u64, account_id: &str) -> u64 {
+    pub fn compute_wave_interval_ms(counter: u64, _account_id: &str) -> u64 {
         use rand::Rng;
-        // 波段周期：约每 10~14 次请求一个涨落周期
         let wave_phase = (counter as f64) * std::f64::consts::PI / 6.0;
-        let sine_component = (wave_phase.sin() + 1.0) / 2.0; // 0.0 ~ 1.0
-
-        // 基础波段范围：1200ms ~ 4200ms
+        let sine_component = (wave_phase.sin() + 1.0) / 2.0;
         let base_interval = 1200.0 + sine_component * 3000.0;
-        // 随机拟人抖动：-400ms ~ +600ms
         let jitter: f64 = rand::thread_rng().gen_range(-400.0..=600.0);
-
         let final_ms = (base_interval + jitter).round() as i64;
         final_ms.clamp(1000, 5000) as u64
     }
@@ -180,195 +398,743 @@ impl HumanizedPacer {
             if let Some(nap_until) = entry.nap_until {
                 let now = std::time::Instant::now();
                 if now < nap_until {
-                    return Some((nap_until - now).as_secs());
+                    return Some(((nap_until - now).as_millis() as u64 + 999) / 1000);
                 }
             }
         }
         None
+    }
+
+    fn decayed_heat_at(massive_heat: f64, last_updated: std::time::Instant, now: std::time::Instant) -> f64 {
+        let elapsed_secs = now.saturating_duration_since(last_updated).as_secs_f64();
+        let decayed = massive_heat * (0.5f64).powf(elapsed_secs / HEAT_HALF_LIFE_SECS);
+        if decayed < 0.05 {
+            0.0
+        } else {
+            decayed
+        }
+    }
+
+    /// 计算当账号过热（current_heat + 1.5 >= 3.0，即 current_heat >= 1.5）时，衰减回 < 1.5 所需的秒数
+    fn heat_recovery_secs(current_heat: f64) -> u64 {
+        let target_heat = OVERSIZE_HEAT_CAP - OVERSIZE_HEAT_INCREMENT; // 1.5
+        if current_heat < target_heat {
+            return 0;
+        }
+        let secs = HEAT_HALF_LIFE_SECS * (current_heat / target_heat).log2();
+        (secs.ceil() as u64).clamp(5, 300)
     }
 
     /// 获取账号当前的大任务热度积分（按 180 秒半衰期指数衰减）
     pub fn get_account_heat(&self, account_id: &str) -> f64 {
         if let Some(entry) = self.account_states.get(account_id) {
-            let elapsed_secs = entry.last_heat_updated_at.elapsed().as_secs_f64();
-            // 半衰期 180 秒（3 分钟）：heat = previous_heat * (0.5)^(elapsed / 180.0)
-            let decayed = entry.massive_heat * (0.5f64).powf(elapsed_secs / 180.0);
-            if decayed < 0.05 {
-                0.0
-            } else {
-                decayed
-            }
+            Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, std::time::Instant::now())
         } else {
             0.0
         }
     }
 
-    /// 大任务热度的单次增量（与 mark_request_completed 的阶梯一致）：
-    /// 只有 >=130K tokens 的"超大请求"才加热度 2.0；130K 以下一律不加（0.0）。
-    /// 即：正常对话（<130K tokens）与热度计分完全无关，
-    ///     热度只由真正的高危超大请求（>=130K）驱动，避免误伤普通大任务。
-    fn heat_increment_for_tokens(tokens: u32) -> f64 {
-        if tokens >= 130_000 {
-            2.0
-        } else {
-            0.0
-        }
+    /// 账号热度是否达到清凉池分界线 (Heat >= 1.5)
+    pub fn is_heat_saturated(&self, account_id: &str) -> bool {
+        self.get_account_heat(account_id) >= COLD_POOL_HEAT_THRESHOLD
     }
 
-    /// 请求开始时的合成热度：当前热度 + 本次预估任务将带来的热度增量
-    /// （用于"请求开始时按预估 tokens 预判拦截"，避免完成后才记账导致的并发穿透）
-    pub fn projected_heat(&self, account_id: &str, prompt_tokens: u32) -> f64 {
-        let current = self.get_account_heat(account_id);
-        let added = Self::heat_increment_for_tokens(prompt_tokens);
-        current + added
+    /// 推演给定请求进入后账号的合成热度
+    pub fn projected_heat_for_footprint(&self, account_id: &str, footprint: RequestFootprint) -> f64 {
+        self.get_account_heat(account_id) + footprint.heat_increment()
     }
 
-    /// [Preflight] 大任务开始前预判拦截：
-    /// 返回 Some(retry_after_secs) 表示应立即 429 拒绝；None 表示放行。
-    /// 规则：
-    /// 0. 冷启动缓冲：服务启动后前 COLD_START_WARMUP_SECS 秒内，超大请求（>200KB 或 >100K tokens）一律 429 缓一缓，
-    ///    防止 docker restart 后积压请求瞬间突刺上游（发版封号高峰的根因）；
-    /// 1. >200KB 超大请求（TOS 高危）：账号热度 >= 1.0 即拒绝，强制回冷窗口；
-    ///    且不再直接放行，继续走 token 预判（堵住"冷号+超大请求"裂缝）；
-    /// 2. >100K tokens 超大任务且合成热度 >= HEAT_CRITICAL_THRESHOLD(4.0) 即拒绝：
-    ///    100K 以内的请求与热度完全无关（不加热、不拦截），热度只防护 >=130K 驱动的超大请求风暴。
-    pub fn preflight_check(
-        &self,
-        account_id: &str,
-        prompt_tokens: u32,
-        raw_body_len: usize,
-    ) -> Option<u64> {
-        let current = self.get_account_heat(account_id);
+    /// 刷新已到期的冷却槽位，并动态对齐目标并发槽数 `target_slots`
+    fn refresh_and_sync_slots(
+        entry: &mut AccountPacerState,
+        now: std::time::Instant,
+        target_slots: usize,
+    ) {
+        let cap = target_slots.max(1);
 
-        // 0. 冷启动平滑缓冲：重启后前 60s 内，超大请求一律 429 Retry-After 30s
-        let uptime_secs = self.started_at.elapsed().as_secs();
-        if uptime_secs < COLD_START_WARMUP_SECS && is_oversized_burst(prompt_tokens, raw_body_len)
-        {
-            tracing::warn!(
-                "🛡️ [Cold-Start Warmup] Account {} large request ({} tokens, {}B) within first {}s after start. Rejecting 429 Retry-After 30s.",
-                account_id,
-                prompt_tokens,
-                raw_body_len,
-                COLD_START_WARMUP_SECS
-            );
-            return Some(30);
-        }
-
-        // 0b. 专属代理刚从 RED 回绿：先让 token/配额走同一套 Chrome132 身份，再放行超大推理。
-        if is_oversized_burst(prompt_tokens, raw_body_len) {
-            if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                if let Some(elapsed) = pool.dedicated_recovery_elapsed_secs(account_id) {
-                    if let Some(wait) = remaining_recovery_hold_secs(elapsed) {
-                        tracing::warn!(
-                            "🛡️ [Egress Recovery] Account {} large request ({} tokens, {}B) {}s after dedicated proxy GREEN. Rejecting 429 Retry-After {}s.",
-                            account_id,
-                            prompt_tokens,
-                            raw_body_len,
-                            elapsed,
-                            wait
-                        );
-                        return Some(wait);
-                    }
+        // 1. 将已过期的 CoolingDown 槽释放为 Free
+        for slot in entry.slots.iter_mut() {
+            if let SlotPhase::CoolingDown { until, .. } = slot {
+                if now >= *until {
+                    *slot = SlotPhase::Free;
                 }
             }
         }
 
-        // 1. 超大体量（>200KB = TOS 高危物理特征）：软拦截，要求账号热度低于 1.0
-        if raw_body_len > 200 * 1024 {
-            if current >= OVERSIZE_HEAT_THRESHOLD {
-                tracing::warn!(
-                    "🛑 [Heat Preflight] Account {} oversized payload ({} bytes) but heat {:.2} >= {:.1}. Rejecting 429.",
-                    account_id,
-                    raw_body_len,
-                    current,
-                    OVERSIZE_HEAT_THRESHOLD
-                );
-                return Some(25);
+        // 检查当前是否处于大请求独占状态（Reserved / InFlight / CoolingDown 且 exclusive=true）
+        let active_exclusive_cooldown: Option<std::time::Instant> =
+            entry.slots.iter().find_map(|s| match s {
+                SlotPhase::CoolingDown {
+                    until,
+                    exclusive: true,
+                } if *until > now => Some(*until),
+                _ => None,
+            });
+        let has_active_exclusive_inflight = entry.slots.iter().any(|s| {
+            matches!(
+                s,
+                SlotPhase::Reserved {
+                    exclusive: true,
+                    ..
+                } | SlotPhase::InFlight {
+                    exclusive: true,
+                    ..
+                }
+            )
+        });
+
+        // 2. 扩容槽位（若用户在页面调大了并发数）
+        while entry.slots.len() < cap {
+            if let Some(until) = active_exclusive_cooldown {
+                entry.slots.push(SlotPhase::CoolingDown {
+                    until,
+                    exclusive: true,
+                });
+            } else if has_active_exclusive_inflight {
+                // 大请求执行期间不开放额外新槽位，维持互斥
+                break;
+            } else {
+                entry.slots.push(SlotPhase::Free);
             }
-            // 注意：不再 return None 直接放行，继续走 token 预判，堵住毒 IP 利用"冷号+超大请求"的裂缝
         }
 
-        // 2. 超大任务热度预判：>100K tokens 且合成热度 >= 4.0 → 429（100K 以内与热度无关）
-        if prompt_tokens > 100_000 {
-            let projected = self.projected_heat(account_id, prompt_tokens);
-            if projected >= HEAT_CRITICAL_THRESHOLD {
-                tracing::warn!(
-                    "🛑 [Heat Preflight] Account {} projected heat {:.2} >= {:.1} for {} tokens. Rejecting 429.",
-                    account_id,
-                    projected,
-                    HEAT_CRITICAL_THRESHOLD,
-                    prompt_tokens
-                );
-                return Some(20);
+        // 3. 缩容多余的 Free 槽位（若用户在页面调小了并发数，优先回收空闲槽，不破坏活跃租约）
+        while entry.slots.len() > cap {
+            if let Some(free_idx) = entry
+                .slots
+                .iter()
+                .rposition(|s| matches!(s, SlotPhase::Free))
+            {
+                entry.slots.remove(free_idx);
+            } else {
+                break;
             }
         }
+    }
+
+    /// 计算滚动 60s RPM 所需等待毫秒数（单账号 60 秒上限 10 次）
+    fn clean_and_compute_rpm_wait_ms(entry: &mut AccountPacerState, now: std::time::Instant) -> u64 {
+        let cutoff = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
+        while let Some(&front) = entry.rolling_requests.front() {
+            if front < cutoff {
+                entry.rolling_requests.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if entry.rolling_requests.len() >= 10 {
+            if let Some(&oldest) = entry.rolling_requests.front() {
+                if now >= oldest {
+                    let elapsed = now.duration_since(oldest).as_millis() as u64;
+                    if elapsed < 60_000 {
+                        return 60_000 - elapsed;
+                    }
+                } else {
+                    // 含未来预约时间点
+                    return (oldest - now).as_millis() as u64 + 60_000;
+                }
+            }
+        }
+        0
+    }
+
+    /// 评估当前槽位表对给定请求的准入状态（含大小请求互斥与全部槽位延迟计算）
+    fn evaluate_slots(
+        entry: &AccountPacerState,
+        now: std::time::Instant,
+        target_slots: usize,
+        is_oversized: bool,
+        rpm_wait_ms: u64,
+    ) -> InternalSlotEval {
+        let cap = target_slots.max(1);
+
+        // 1. 只要存在正在执行或预约中的大请求独占锁，任何新请求一律互斥禁入
+        let has_exclusive_running = entry.slots.iter().any(|s| {
+            matches!(
+                s,
+                SlotPhase::Reserved {
+                    exclusive: true,
+                    ..
+                } | SlotPhase::InFlight {
+                    exclusive: true,
+                    ..
+                }
+            )
+        });
+        if has_exclusive_running {
+            return InternalSlotEval::Busy;
+        }
+
+        let active_count = entry
+            .slots
+            .iter()
+            .filter(|s| matches!(s, SlotPhase::Reserved { .. } | SlotPhase::InFlight { .. }))
+            .count();
+
+        if is_oversized {
+            // 大请求（>200K）独占全部槽位：只要有任意 1 个小请求在执行或预约，互斥禁入！
+            if active_count > 0 {
+                return InternalSlotEval::Busy;
+            }
+            // 所有槽均非 InFlight/Reserved，检查是否全部 Free 或需要等所有槽冷却彻底结束
+            let mut max_cooldown_until: Option<std::time::Instant> = None;
+            for slot in &entry.slots {
+                if let SlotPhase::CoolingDown { until, .. } = slot {
+                    if *until > now {
+                        max_cooldown_until = Some(match max_cooldown_until {
+                            Some(cur_max) => cur_max.max(*until),
+                            None => *until,
+                        });
+                    }
+                }
+            }
+            // 同时兼容旧接口直接写入的 next_allowed_request_at
+            if entry.next_allowed_request_at > now {
+                max_cooldown_until = Some(match max_cooldown_until {
+                    Some(cur_max) => cur_max.max(entry.next_allowed_request_at),
+                    None => entry.next_allowed_request_at,
+                });
+            }
+
+            let slot_wait = max_cooldown_until
+                .map(|u| u.saturating_duration_since(now).as_millis() as u64)
+                .unwrap_or(0);
+            let total_wait = slot_wait.max(rpm_wait_ms);
+            if total_wait == 0 {
+                InternalSlotEval::Ready {
+                    free_slots: cap,
+                    total_slots: cap,
+                }
+            } else {
+                InternalSlotEval::NeedWait {
+                    wait_ms: total_wait,
+                    total_slots: cap,
+                }
+            }
+        } else {
+            // 普通/中大请求（占用 1 个槽）：
+            // 若活跃槽已达并发上限，直接满载禁入
+            if active_count >= cap {
+                return InternalSlotEval::Busy;
+            }
+
+            // 若存在刚结束的大请求独占冷却，所有槽都在等该独占冷却走完
+            if let Some(excl_until) = entry.slots.iter().find_map(|s| match s {
+                SlotPhase::CoolingDown {
+                    until,
+                    exclusive: true,
+                } if *until > now => Some(*until),
+                _ => None,
+            }) {
+                let wait = excl_until
+                    .saturating_duration_since(now)
+                    .as_millis() as u64;
+                return InternalSlotEval::NeedWait {
+                    wait_ms: wait.max(rpm_wait_ms),
+                    total_slots: cap,
+                };
+            }
+
+            let free_slots = entry
+                .slots
+                .iter()
+                .take(cap)
+                .filter(|s| matches!(s, SlotPhase::Free))
+                .count();
+
+            // 兼容直接调用 mark_request_completed 的单槽旧测试路径
+            let legacy_wait = if entry.next_allowed_request_at > now && entry.slots.iter().all(|s| matches!(s, SlotPhase::Free)) {
+                entry.next_allowed_request_at.saturating_duration_since(now).as_millis() as u64
+            } else {
+                0
+            };
+
+            if free_slots > 0 && legacy_wait == 0 {
+                if rpm_wait_ms == 0 {
+                    InternalSlotEval::Ready {
+                        free_slots,
+                        total_slots: cap,
+                    }
+                } else {
+                    InternalSlotEval::NeedWait {
+                        wait_ms: rpm_wait_ms,
+                        total_slots: cap,
+                    }
+                }
+            } else if free_slots > 0 && legacy_wait > 0 {
+                InternalSlotEval::NeedWait {
+                    wait_ms: legacy_wait.max(rpm_wait_ms),
+                    total_slots: cap,
+                }
+            } else {
+                // 所有未执行的槽均处于 CoolingDown 延迟期：找出最早打开的那个槽
+                let min_until = entry
+                    .slots
+                    .iter()
+                    .take(cap)
+                    .filter_map(|s| match s {
+                        SlotPhase::CoolingDown { until, .. } if *until > now => Some(*until),
+                        _ => None,
+                    })
+                    .min();
+
+                match min_until {
+                    Some(u) => {
+                        let wait = u.saturating_duration_since(now).as_millis() as u64;
+                        InternalSlotEval::NeedWait {
+                            wait_ms: wait.max(rpm_wait_ms),
+                            total_slots: cap,
+                        }
+                    }
+                    None => InternalSlotEval::Busy,
+                }
+            }
+        }
+    }
+
+    /// 检查进程级冷启动与专属代理恢复期对超大请求的限制
+    pub fn check_global_or_egress_hold(
+        &self,
+        account_id: &str,
+        footprint: RequestFootprint,
+    ) -> Option<LeaseRejectReason> {
+        if !footprint.is_oversized() {
+            return None;
+        }
+
+        let uptime_secs = self.started_at.elapsed().as_secs();
+        if uptime_secs < COLD_START_WARMUP_SECS {
+            let remain = (COLD_START_WARMUP_SECS - uptime_secs).max(5);
+            return Some(LeaseRejectReason::ColdStartWarmup {
+                retry_after_secs: remain,
+            });
+        }
+
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            if let Some(elapsed) = pool.dedicated_recovery_elapsed_secs(account_id) {
+                if let Some(wait) = remaining_recovery_hold_secs(elapsed) {
+                    return Some(LeaseRejectReason::EgressRecovery {
+                        retry_after_secs: wait,
+                    });
+                }
+            }
+        }
+
         None
     }
 
-    /// [Preflight] 请求开始时立即按预估 tokens（及 raw body 大小）预占热度，
-    /// 保证大请求在流式传输期间（尚未完成记账前）热度就已生效，并发请求会立刻看到热号而绕开。
-    pub fn preallocate_heat(&self, account_id: &str, prompt_tokens: u32, raw_body_len: usize) {
+    /// 前置无副作用探测（供 P2C 选号器在全部候选账号上做准入过滤与梯队划分）
+    pub fn probe_account(
+        &self,
+        account_id: &str,
+        footprint: RequestFootprint,
+        max_slots: usize,
+    ) -> AccountProbe {
+        if let Some(hold) = self.check_global_or_egress_hold(account_id, footprint) {
+            return AccountProbe::Rejected(hold);
+        }
+
         let now = std::time::Instant::now();
-        let mut entry = self.account_states.entry(account_id.to_string()).or_insert_with(|| {
-            AccountPacerState {
-                last_request_time: now,
-                last_response_completed_at: None,
-                next_allowed_request_at: now,
-                rolling_requests: std::collections::VecDeque::new(),
-                request_counter: 0,
-                current_interval_ms: 2000,
-                nap_until: None,
-                threshold_jitter: Self::get_threshold_jitter(account_id),
-                massive_heat: 0.0,
-                last_heat_updated_at: now,
+        let cap = max_slots.max(1);
+
+        if let Some(mut entry) = self.account_states.get_mut(account_id) {
+            // 1. 小憩门禁（休眠期内全类型请求禁入）
+            if let Some(nap) = entry.nap_until {
+                if now < nap {
+                    let rem = ((nap - now).as_millis() as u64 + 999) / 1000;
+                    return AccountProbe::Rejected(LeaseRejectReason::InNap {
+                        remaining_secs: rem.max(1),
+                    });
+                } else {
+                    entry.nap_until = None;
+                }
             }
-        });
 
-        let elapsed_secs = entry.last_heat_updated_at.elapsed().as_secs_f64();
-        let decayed_heat = entry.massive_heat * (0.5f64).powf(elapsed_secs / 180.0);
+            // 2. 热度门禁（>200K 超大请求推演 >= 3.0 即拦截，严格限制短时 < 3 个）
+            let current_heat = Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
+            if footprint.is_oversized() {
+                let projected = current_heat + footprint.heat_increment();
+                if projected >= OVERSIZE_HEAT_CAP {
+                    return AccountProbe::Rejected(LeaseRejectReason::Overheated {
+                        current_heat,
+                        projected_heat: projected,
+                        retry_after_secs: Self::heat_recovery_secs(current_heat),
+                    });
+                }
+            }
 
-        // >200KB 直接按 >=130K tokens 的高危档预占 2.0 热度，锁定账号冷却窗口
-        let effective_tokens = if raw_body_len > 200 * 1024 {
-            prompt_tokens.max(130_000)
+            // 3. 并发槽位与延迟计算
+            Self::refresh_and_sync_slots(&mut entry, now, cap);
+            let rpm_wait_ms = Self::clean_and_compute_rpm_wait_ms(&mut entry, now);
+            match Self::evaluate_slots(&entry, now, cap, footprint.is_oversized(), rpm_wait_ms) {
+                InternalSlotEval::Ready {
+                    free_slots,
+                    total_slots,
+                } => AccountProbe::Admissible {
+                    wait_ms: 0,
+                    current_heat,
+                    free_slots,
+                    total_slots,
+                },
+                InternalSlotEval::NeedWait {
+                    wait_ms,
+                    total_slots,
+                } => {
+                    if wait_ms <= FALLBACK_MAX_SLOT_WAIT_MS {
+                        AccountProbe::Admissible {
+                            wait_ms,
+                            current_heat,
+                            free_slots: 0,
+                            total_slots,
+                        }
+                    } else {
+                        AccountProbe::Rejected(LeaseRejectReason::CooldownTooLong { wait_ms })
+                    }
+                }
+                InternalSlotEval::Busy => AccountProbe::Rejected(LeaseRejectReason::SlotsBusy),
+            }
         } else {
-            prompt_tokens
-        };
-        let added = Self::heat_increment_for_tokens(effective_tokens);
-
-        entry.massive_heat = decayed_heat + added;
-        entry.last_heat_updated_at = now;
-
-        if added > 0.0 {
-            tracing::info!(
-                "🔥 [HumanizedPacer] Account {} heat pre-allocated at start: {:.2} (+{:.1} from {} tokens, body {}B)",
-                account_id,
-                entry.massive_heat,
-                added,
-                effective_tokens,
-                raw_body_len
-            );
+            // 全新冷账号：全部槽位空闲打开、零热度、零延迟
+            AccountProbe::Admissible {
+                wait_ms: 0,
+                current_heat: 0.0,
+                free_slots: cap,
+                total_slots: cap,
+            }
         }
     }
 
-    /// 账号热度是否达到饱和警戒线 (Heat >= 1.5)，饱和账号应避免连续承接新的大任务
-    pub fn is_heat_saturated(&self, account_id: &str) -> bool {
-        self.get_account_heat(account_id) >= 1.5
+    /// 原子化前置准入与槽位租约获取：
+    /// - 若通过准入且 `wait_ms <= max_wait_ms`，当场原子锁定槽位（`InFlight` 或 `Reserved`）、预占热度并推进轮次计数；
+    /// - 返回 `Ok((SlotLeaseGuard, entered_nap_for_future))`；
+    /// - 若不满足准入，返回 `Err(LeaseRejectReason)`，不产生任何状态污染。
+    pub fn try_acquire_lease(
+        self: & std::sync::Arc<Self>,
+        account_id: &str,
+        footprint: RequestFootprint,
+        max_slots: usize,
+        max_wait_ms: u64,
+    ) -> Result<(SlotLeaseGuard, bool), LeaseRejectReason> {
+        use rand::Rng;
+
+        if let Some(hold) = self.check_global_or_egress_hold(account_id, footprint) {
+            return Err(hold);
+        }
+
+        let now = std::time::Instant::now();
+        let cap = max_slots.max(1);
+        let mut entry = self
+            .account_states
+            .entry(account_id.to_string())
+            .or_insert_with(|| AccountPacerState::new_default(account_id, now, cap));
+
+        // 1. 小憩硬门禁
+        if let Some(nap) = entry.nap_until {
+            if now < nap {
+                let rem = ((nap - now).as_millis() as u64 + 999) / 1000;
+                return Err(LeaseRejectReason::InNap {
+                    remaining_secs: rem.max(1),
+                });
+            } else {
+                entry.nap_until = None;
+            }
+        }
+
+        // 2. 大请求过热前置硬门禁（进门前限制第 3 个大包）
+        let current_heat = Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
+        let added_heat = footprint.heat_increment();
+        if footprint.is_oversized() {
+            let projected = current_heat + added_heat;
+            if projected >= OVERSIZE_HEAT_CAP {
+                return Err(LeaseRejectReason::Overheated {
+                    current_heat,
+                    projected_heat: projected,
+                    retry_after_secs: Self::heat_recovery_secs(current_heat),
+                });
+            }
+        }
+
+        // 3. 槽位同步与准入评估
+        Self::refresh_and_sync_slots(&mut entry, now, cap);
+        let rpm_wait_ms = Self::clean_and_compute_rpm_wait_ms(&mut entry, now);
+        let wait_ms = match Self::evaluate_slots(&entry, now, cap, footprint.is_oversized(), rpm_wait_ms) {
+            InternalSlotEval::Ready { .. } => 0,
+            InternalSlotEval::NeedWait { wait_ms, .. } => {
+                if wait_ms > max_wait_ms {
+                    return Err(LeaseRejectReason::CooldownTooLong { wait_ms });
+                }
+                wait_ms
+            }
+            InternalSlotEval::Busy => return Err(LeaseRejectReason::SlotsBusy),
+        };
+
+        // 4. 通过全部门禁！原子分配租约 ID 并锁定槽位
+        let lease_id = self
+            .next_lease_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ready_at = now + Duration::from_millis(wait_ms);
+        let is_exclusive = footprint.is_oversized();
+
+        if is_exclusive {
+            // 超大请求独占锁死全部槽位
+            while entry.slots.len() < cap {
+                entry.slots.push(SlotPhase::Free);
+            }
+            for slot in entry.slots.iter_mut() {
+                let prev_cd = match *slot {
+                    SlotPhase::CoolingDown { until, exclusive } if until > now => {
+                        Some((until, exclusive))
+                    }
+                    _ => None,
+                };
+                if wait_ms == 0 {
+                    *slot = SlotPhase::InFlight {
+                        lease_id,
+                        started_at: now,
+                        exclusive: true,
+                    };
+                } else {
+                    *slot = SlotPhase::Reserved {
+                        lease_id,
+                        ready_at,
+                        restore_cooldown: prev_cd,
+                        exclusive: true,
+                    };
+                }
+            }
+        } else {
+            // 普通/中大请求锁定 1 个槽位（优先挑 Free 槽，否则挑最早结束冷却的 CoolingDown 槽）
+            let target_idx = if let Some(idx) = entry
+                .slots
+                .iter()
+                .take(cap)
+                .position(|s| matches!(s, SlotPhase::Free))
+            {
+                idx
+            } else {
+                entry
+                    .slots
+                    .iter()
+                    .take(cap)
+                    .enumerate()
+                    .filter_map(|(idx, s)| match s {
+                        SlotPhase::CoolingDown { until, .. } => Some((idx, *until)),
+                        _ => None,
+                    })
+                    .min_by_key(|(_, u)| *u)
+                    .map(|(idx, _)| idx)
+                    .ok_or(LeaseRejectReason::SlotsBusy)?
+            };
+
+            let prev_cd = match entry.slots[target_idx] {
+                SlotPhase::CoolingDown { until, exclusive } if until > now => {
+                    Some((until, exclusive))
+                }
+                _ => None,
+            };
+            entry.slots[target_idx] = if wait_ms == 0 {
+                SlotPhase::InFlight {
+                    lease_id,
+                    started_at: now,
+                    exclusive: false,
+                }
+            } else {
+                SlotPhase::Reserved {
+                    lease_id,
+                    ready_at,
+                    restore_cooldown: prev_cd,
+                    exclusive: false,
+                }
+            };
+        }
+
+        // 5. 预占热度、记录滚动 RPM 与推进 20~30 轮微小憩计数
+        entry.massive_heat = current_heat + added_heat;
+        entry.last_heat_updated_at = now;
+        entry.last_request_time = ready_at;
+        entry.request_counter += 1;
+        entry.turns_since_nap += 1;
+        entry.rolling_requests.push_back(ready_at);
+
+        if added_heat > 0.0 {
+            tracing::info!(
+                "🔥 [HumanizedPacer] Account {} heat pre-allocated: {:.2} (+{:.1} from {:?}, {} tokens, {}B)",
+                account_id,
+                entry.massive_heat,
+                added_heat,
+                footprint.tier,
+                footprint.prompt_tokens,
+                footprint.raw_body_len
+            );
+        }
+
+        let mut entered_nap = false;
+        if entry.turns_since_nap >= entry.next_nap_threshold {
+            let mut rng = rand::thread_rng();
+            let nap_secs = rng.gen_range(120..=300);
+            entry.nap_until = Some(ready_at + Duration::from_secs(nap_secs));
+            entry.turns_since_nap = 0;
+            entry.next_nap_threshold = rng.gen_range(20..=30);
+            entered_nap = true;
+            tracing::info!(
+                "[HumanizedPacer] Account {} reached turn quota, entering micro-nap for {}s (next cycle: {} turns)",
+                account_id,
+                nap_secs,
+                entry.next_nap_threshold
+            );
+        }
+
+        let guard = SlotLeaseGuard {
+            pacer: std::sync::Arc::clone(self),
+            account_id: account_id.to_string(),
+            lease_id,
+            footprint,
+            preallocated_heat: added_heat,
+            recorded_at: ready_at,
+            reserved_wait_ms: wait_ms,
+            triggered_nap: entered_nap,
+            upstream_accepted: false,
+            finished: false,
+        };
+
+        Ok((guard, entered_nap))
     }
 
-    /// 账号热度是否达到极限熔断线 (Heat >= HEAT_CRITICAL_THRESHOLD，已由 2.0 放大到 4.0 以便正常对话顺畅)
-    pub fn is_heat_critical(&self, account_id: &str) -> bool {
-        self.get_account_heat(account_id) >= HEAT_CRITICAL_THRESHOLD
+    fn promote_reserved_to_inflight(&self, account_id: &str, lease_id: u64) {
+        let now = std::time::Instant::now();
+        if let Some(mut entry) = self.account_states.get_mut(account_id) {
+            for slot in entry.slots.iter_mut() {
+                if let SlotPhase::Reserved {
+                    lease_id: id,
+                    exclusive,
+                    ..
+                } = *slot
+                {
+                    if id == lease_id {
+                        *slot = SlotPhase::InFlight {
+                            lease_id,
+                            started_at: now,
+                            exclusive,
+                        };
+                    }
+                }
+            }
+        }
     }
 
-    /// 检查账号距离下一次允许发起请求还需要等待多少毫秒
-    /// 结合了三层速率约束：
-    /// 0. 拟人化微小憩检查 (Micro-Nap，休眠期内强制等待满秒数)
-    /// 1. 响应结束后的 Post-Response Delay + Jitter 冷却
-    /// 2. 滚动 60 秒 RPM 漏桶（单账号上限 10 次 / 60 秒）
+    fn complete_lease(&self, account_id: &str, lease_id: u64, footprint: RequestFootprint) {
+        let now = std::time::Instant::now();
+        let cooldown_ms = Self::compute_footprint_cooldown_ms(footprint);
+        let until = now + Duration::from_millis(cooldown_ms);
+
+        if let Some(mut entry) = self.account_states.get_mut(account_id) {
+            let decayed = Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
+            entry.massive_heat = decayed;
+            entry.last_heat_updated_at = now;
+            entry.last_response_completed_at = Some(now);
+            entry.current_interval_ms = cooldown_ms;
+
+            let mut matched_any = false;
+            for slot in entry.slots.iter_mut() {
+                match *slot {
+                    SlotPhase::InFlight {
+                        lease_id: id,
+                        exclusive,
+                        ..
+                    }
+                    | SlotPhase::Reserved {
+                        lease_id: id,
+                        exclusive,
+                        ..
+                    } if id == lease_id => {
+                        *slot = SlotPhase::CoolingDown { until, exclusive };
+                        matched_any = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            if matched_any {
+                tracing::debug!(
+                    "[HumanizedPacer] Account {} lease #{} completed ({:?}), slot closed for +{}ms cooldown",
+                    account_id,
+                    lease_id,
+                    footprint.tier,
+                    cooldown_ms
+                );
+            }
+        }
+    }
+
+    fn rollback_lease(
+        &self,
+        account_id: &str,
+        lease_id: u64,
+        preallocated_heat: f64,
+        recorded_at: std::time::Instant,
+        triggered_nap: bool,
+    ) {
+        let now = std::time::Instant::now();
+        if let Some(mut entry) = self.account_states.get_mut(account_id) {
+            // 1. 还原槽位状态（回退到预约前的剩余冷却或直接 Free）
+            for slot in entry.slots.iter_mut() {
+                match *slot {
+                    SlotPhase::Reserved {
+                        lease_id: id,
+                        restore_cooldown,
+                        ..
+                    } if id == lease_id => {
+                        if let Some((u, prev_excl)) = restore_cooldown {
+                            if u > now {
+                                *slot = SlotPhase::CoolingDown {
+                                    until: u,
+                                    exclusive: prev_excl,
+                                };
+                            } else {
+                                *slot = SlotPhase::Free;
+                            }
+                        } else {
+                            *slot = SlotPhase::Free;
+                        }
+                    }
+                    SlotPhase::InFlight { lease_id: id, .. } if id == lease_id => {
+                        *slot = SlotPhase::Free;
+                    }
+                    _ => {}
+                }
+            }
+
+            // 2. 退回预占但未实际消耗的热度
+            if preallocated_heat > 0.0 {
+                let decayed =
+                    Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
+                entry.massive_heat = (decayed - preallocated_heat).max(0.0);
+                entry.last_heat_updated_at = now;
+            }
+
+            // 3. 回退未生效的轮次与滚动 RPM 时间戳
+            if let Some(pos) = entry
+                .rolling_requests
+                .iter()
+                .rposition(|t| *t == recorded_at)
+            {
+                entry.rolling_requests.remove(pos);
+            }
+            entry.request_counter = entry.request_counter.saturating_sub(1);
+            if triggered_nap {
+                entry.nap_until = None;
+                entry.turns_since_nap = entry.next_nap_threshold.saturating_sub(1);
+            } else {
+                entry.turns_since_nap = entry.turns_since_nap.saturating_sub(1);
+            }
+        }
+    }
+
+    /// 检查账号距离下一次允许发起普通请求还需要等待多少毫秒（兼容状态查询与测试）
     pub fn get_required_wait_ms(&self, account_id: &str) -> u64 {
         let now = std::time::Instant::now();
         if let Some(mut entry) = self.account_states.get_mut(account_id) {
-            // 0. Micro-Nap 检查：休眠中需严格等待休眠结束
             let nap_wait = if let Some(nap) = entry.nap_until {
                 if nap > now {
                     (nap - now).as_millis() as u64
@@ -379,72 +1145,43 @@ impl HumanizedPacer {
                 0
             };
 
-            // 1. Post-Response 冷却检查
-            let cooldown_wait = if entry.next_allowed_request_at > now {
-                (entry.next_allowed_request_at - now).as_millis() as u64
-            } else {
-                0
+            let cap = entry.slots.len().max(1);
+            Self::refresh_and_sync_slots(&mut entry, now, cap);
+            let rpm_wait = Self::clean_and_compute_rpm_wait_ms(&mut entry, now);
+
+            let slot_wait = match Self::evaluate_slots(&entry, now, cap, false, rpm_wait) {
+                InternalSlotEval::Ready { .. } => 0,
+                InternalSlotEval::NeedWait { wait_ms, .. } => wait_ms,
+                InternalSlotEval::Busy => STICKY_MAX_SLOT_WAIT_MS + 1000,
             };
 
-            // 2. 滚动 60 秒 RPM 漏桶检查（限制滚动 60s 内最多 10 次请求）
-            let cutoff = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
-            while let Some(&front) = entry.rolling_requests.front() {
-                if front < cutoff {
-                    entry.rolling_requests.pop_front();
-                } else {
-                    break;
-                }
-            }
-
-            // 单账号 60 秒上限设为 10 次
-            let rpm_wait = if entry.rolling_requests.len() >= 10 {
-                if let Some(&oldest) = entry.rolling_requests.front() {
-                    let elapsed = now.duration_since(oldest).as_millis() as u64;
-                    if elapsed < 60_000 {
-                        60_000 - elapsed
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-
-            return nap_wait.max(cooldown_wait).max(rpm_wait);
+            return nap_wait.max(slot_wait).max(rpm_wait);
         }
         0
     }
 
-    /// 记录账号发起了一次请求，推进其计数并将其记入 60s 滚动窗口
+    /// 记录账号发起了一次轻量请求（供非槽位租约路径兼容使用）
     pub fn mark_request_started(&self, account_id: &str) {
         use rand::Rng;
         let now = std::time::Instant::now();
-        let mut entry = self.account_states.entry(account_id.to_string()).or_insert_with(|| {
-            AccountPacerState {
-                last_request_time: now,
-                last_response_completed_at: None,
-                next_allowed_request_at: now,
-                rolling_requests: std::collections::VecDeque::new(),
-                request_counter: 0,
-                current_interval_ms: 2000,
-                nap_until: None,
-                threshold_jitter: Self::get_threshold_jitter(account_id),
-                massive_heat: 0.0,
-                last_heat_updated_at: now,
-            }
-        });
+        let mut entry = self
+            .account_states
+            .entry(account_id.to_string())
+            .or_insert_with(|| {
+                AccountPacerState::new_default(account_id, now, DEFAULT_CONCURRENCY_SLOTS)
+            });
 
         entry.last_request_time = now;
         entry.request_counter += 1;
+        entry.turns_since_nap += 1;
         entry.rolling_requests.push_back(now);
 
-        // 连续处理 20~35 次请求后，随机进入一段 2~5 分钟的微休眠，让流量流转到其它账号
-        let nap_trigger_count = 20 + ((account_id.len() * 3) % 15) as u64;
-        if entry.request_counter % nap_trigger_count == 0 {
-            let nap_secs = rand::thread_rng().gen_range(120..=300);
+        if entry.turns_since_nap >= entry.next_nap_threshold {
+            let mut rng = rand::thread_rng();
+            let nap_secs = rng.gen_range(120..=300);
             entry.nap_until = Some(now + Duration::from_secs(nap_secs));
+            entry.turns_since_nap = 0;
+            entry.next_nap_threshold = rng.gen_range(20..=30);
             tracing::info!(
                 "[HumanizedPacer] Account {} entering micro-nap for {}s to prevent quota homogenization",
                 account_id,
@@ -453,49 +1190,108 @@ impl HumanizedPacer {
         }
     }
 
-    /// 当响应完全结束（Stream EOF / JSON 聚合完毕）时调用，记录结束时间并计算下一次随机冷却时长
+    /// 兼容旧路径：当响应完成时记录冷却截止时间
     pub fn mark_request_completed(&self, account_id: &str, prompt_tokens: Option<u32>) {
         let now = std::time::Instant::now();
         let cooldown_ms = Self::compute_cooldown_ms(prompt_tokens);
         let next_allowed = now + Duration::from_millis(cooldown_ms);
 
-        let mut entry = self.account_states.entry(account_id.to_string()).or_insert_with(|| {
-            AccountPacerState {
-                last_request_time: now,
-                last_response_completed_at: Some(now),
-                next_allowed_request_at: next_allowed,
-                rolling_requests: std::collections::VecDeque::new(),
-                request_counter: 1,
-                current_interval_ms: cooldown_ms,
-                nap_until: None,
-                threshold_jitter: Self::get_threshold_jitter(account_id),
-                massive_heat: 0.0,
-                last_heat_updated_at: now,
-            }
-        });
+        let mut entry = self
+            .account_states
+            .entry(account_id.to_string())
+            .or_insert_with(|| {
+                AccountPacerState::new_default(account_id, now, DEFAULT_CONCURRENCY_SLOTS)
+            });
 
-        // 1. 完成时不再重复累加大任务热度：
-        //    热度已在请求开始时通过 preallocate_heat 按预估 tokens 预占，
-        //    此处仅做时间衰减刷新（保持 last_heat_updated_at 持续滚动，避免老年热度永久挂账）
-        let elapsed_secs = entry.last_heat_updated_at.elapsed().as_secs_f64();
-        let decayed_heat = entry.massive_heat * (0.5f64).powf(elapsed_secs / 180.0);
-        entry.massive_heat = if decayed_heat < 0.05 { 0.0 } else { decayed_heat };
+        let decayed = Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
+        entry.massive_heat = decayed;
         entry.last_heat_updated_at = now;
-
         entry.last_response_completed_at = Some(now);
         entry.next_allowed_request_at = next_allowed;
         entry.current_interval_ms = cooldown_ms;
-
-        tracing::debug!(
-            "[HumanizedPacer] Account {} response completed, cooldown set to {}ms (next allowed at +{}ms)",
-            account_id,
-            cooldown_ms,
-            cooldown_ms
-        );
     }
 }
 
-/// 请求生命周期看门狗：无论是正常完成还是客户端异常断连（Drop），均在结束瞬间触发 mark_request_completed
+/// 并发槽位与热度生命周期租约守卫（RAII）：
+/// - 选号通过瞬间即锁定槽位与预占热度；
+/// - 若上游返回 200 OK（`mark_upstream_accepted`），则在流结束或客户端断连（Drop）时自动将槽位转入 `CoolingDown(实际结束时刻 + 计算延迟)`；
+/// - 若未达上游即失败重试（`upstream_accepted == false`），Drop 或 `abort_and_rollback` 时自动退回预占热度并释放槽位。
+pub struct SlotLeaseGuard {
+    pacer: std::sync::Arc<HumanizedPacer>,
+    account_id: String,
+    lease_id: u64,
+    footprint: RequestFootprint,
+    preallocated_heat: f64,
+    recorded_at: std::time::Instant,
+    reserved_wait_ms: u64,
+    triggered_nap: bool,
+    upstream_accepted: bool,
+    finished: bool,
+}
+
+impl SlotLeaseGuard {
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn reserved_wait_ms(&self) -> u64 {
+        self.reserved_wait_ms
+    }
+
+    /// 若租约通过预约微等（如粘性会话 <= 2s 槽位冷却）获得，异步等待槽位冷却到期并正式转为 InFlight
+    pub async fn wait_until_ready(&mut self) {
+        if self.reserved_wait_ms > 0 {
+            let sleep_ms = self.reserved_wait_ms;
+            self.reserved_wait_ms = 0;
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            self.pacer
+                .promote_reserved_to_inflight(&self.account_id, self.lease_id);
+        }
+    }
+
+    /// 标记上游已成功受理请求（HTTP 200），此后无论正常结束或客户端中途断流均走完整冷却延迟
+    pub fn mark_upstream_accepted(&mut self) {
+        self.upstream_accepted = true;
+    }
+
+    /// 响应正常完成：将槽位从 InFlight 转入 CoolingDown（持续闭合直至计算延迟走完）
+    pub fn complete(&mut self) {
+        if !self.finished {
+            self.upstream_accepted = true;
+            self.pacer
+                .complete_lease(&self.account_id, self.lease_id, self.footprint);
+            self.finished = true;
+        }
+    }
+
+    /// 请求未达上游或瞬时失败需要切号重试：退回预占热度与轮次，立即释放槽位
+    pub fn abort_and_rollback(&mut self) {
+        if !self.finished {
+            self.pacer.rollback_lease(
+                &self.account_id,
+                self.lease_id,
+                self.preallocated_heat,
+                self.recorded_at,
+                self.triggered_nap,
+            );
+            self.finished = true;
+        }
+    }
+}
+
+impl Drop for SlotLeaseGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            if self.upstream_accepted {
+                self.complete();
+            } else {
+                self.abort_and_rollback();
+            }
+        }
+    }
+}
+
+/// 兼容旧接口的请求生命周期看门狗
 pub struct RequestCompletionGuard {
     pacer: std::sync::Arc<HumanizedPacer>,
     account_id: String,
@@ -519,7 +1315,8 @@ impl RequestCompletionGuard {
 
     pub fn complete(&mut self) {
         if !self.completed {
-            self.pacer.mark_request_completed(&self.account_id, self.prompt_tokens);
+            self.pacer
+                .mark_request_completed(&self.account_id, self.prompt_tokens);
             self.completed = true;
         }
     }
@@ -1313,23 +2110,14 @@ mod tests {
 
     #[test]
     fn test_humanized_pacer_nap_countdown() {
-        let pacer = HumanizedPacer::new();
+        let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
         assert_eq!(pacer.get_nap_remaining_seconds("non_existent"), None);
 
         let now = std::time::Instant::now();
-        pacer.account_states.insert(
-            "test_acc".to_string(),
-            AccountPacerState {
-                last_request_time: now,
-                last_response_completed_at: None,
-                next_allowed_request_at: now,
-                rolling_requests: std::collections::VecDeque::new(),
-                request_counter: 25,
-                current_interval_ms: 2000,
-                nap_until: Some(now + Duration::from_secs(120)),
-                threshold_jitter: 0,
-            },
-        );
+        let mut state = AccountPacerState::new_default("test_acc", now, 2);
+        state.request_counter = 25;
+        state.nap_until = Some(now + Duration::from_secs(120));
+        pacer.account_states.insert("test_acc".to_string(), state);
 
         assert!(pacer.is_in_nap("test_acc"));
         let remaining = pacer.get_nap_remaining_seconds("test_acc");
@@ -1340,29 +2128,49 @@ mod tests {
         // 休眠中的账号在 get_required_wait_ms 中必须强制等待满休眠时长
         let wait_ms = pacer.get_required_wait_ms("test_acc");
         assert!(wait_ms >= 118_000 && wait_ms <= 120_000);
+
+        // 小憩期间大小请求一律在前置准入阶段被拒绝 (InNap)
+        let normal_fp = RequestFootprint::new(10_000, 20 * 1024);
+        let oversize_fp = RequestFootprint::new(250_000, 250 * 1024);
+        assert!(matches!(
+            pacer.try_acquire_lease("test_acc", normal_fp, 2, 2000),
+            Err(LeaseRejectReason::InNap { .. })
+        ));
+        assert!(matches!(
+            pacer.try_acquire_lease("test_acc", oversize_fp, 2, 2000),
+            Err(LeaseRejectReason::InNap { .. })
+        ));
     }
 
     #[test]
     fn test_humanized_pacer_cooldown_and_rolling_rpm() {
-        let pacer = HumanizedPacer::new();
+        let pacer = HumanizedPacer::new_warmed();
         let acc = "test_pacer_acc";
 
-        // 1. 完成请求后，应该有至少 1500ms 的冷却延迟
-        pacer.mark_request_completed(acc, None);
+        // 1. L1 Normal (<=100KB 且 <100K tokens)：低延迟 800ms ~ 1800ms
+        pacer.mark_request_completed(acc, Some(20_000));
         let wait = pacer.get_required_wait_ms(acc);
-        assert!(wait >= 1400 && wait <= 3600);
+        assert!(wait >= 700 && wait <= 1850, "Normal wait was {}ms", wait);
 
-        // 2. 超大 Prompt 应追加额外的 TPM 保护惩罚
-        pacer.mark_request_completed(acc, Some(35_000));
-        let wait_large = pacer.get_required_wait_ms(acc);
-        assert!(wait_large >= 2900 && wait_large <= 6600);
+        // 2. L2 Medium (130K tokens)：少量延迟 2000ms ~ 3800ms
+        pacer.mark_request_completed(acc, Some(130_000));
+        let wait_medium = pacer.get_required_wait_ms(acc);
+        assert!(
+            wait_medium >= 1900 && wait_medium <= 3850,
+            "Medium wait was {}ms",
+            wait_medium
+        );
 
-        // 2.1 极大 Prompt (>300K Tokens) 应追加 10s~16s 的大额 TPM 冷却
-        pacer.mark_request_completed(acc, Some(450_000));
+        // 3. L3 Oversized (>200K tokens)：充分冷却 8000ms ~ 15000ms
+        pacer.mark_request_completed(acc, Some(250_000));
         let wait_huge = pacer.get_required_wait_ms(acc);
-        assert!(wait_huge >= 11_400 && wait_huge <= 19_600);
+        assert!(
+            wait_huge >= 7900 && wait_huge <= 15_100,
+            "Oversized wait was {}ms",
+            wait_huge
+        );
 
-        // 3. 模拟 10 次请求打满 60s 滚动 RPM
+        // 4. 模拟 10 次请求打满 60s 滚动 RPM
         let now = std::time::Instant::now();
         if let Some(mut entry) = pacer.account_states.get_mut(acc) {
             entry.next_allowed_request_at = now; // 清空冷却以便测试 RPM
@@ -1373,5 +2181,152 @@ mod tests {
         }
         let rpm_wait = pacer.get_required_wait_ms(acc);
         assert!(rpm_wait > 58_000 && rpm_wait <= 60_000);
+    }
+
+    #[test]
+    fn test_footprint_tiers_and_oversized_strict_less_than_3_cap() {
+        let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
+        let acc = "heat_cap_acc";
+
+        // 分级校验：<100KB -> Normal, 130KB -> Medium, >200KB -> Oversized
+        let fp_normal = RequestFootprint::new(25_000, 80 * 1024);
+        let fp_medium = RequestFootprint::new(60_000, 130 * 1024);
+        let fp_oversize = RequestFootprint::new(61_000, 255 * 1024);
+        assert_eq!(fp_normal.tier, TrafficTier::Normal);
+        assert_eq!(fp_medium.tier, TrafficTier::Medium);
+        assert_eq!(fp_oversize.tier, TrafficTier::Oversized);
+
+        // 第 1 个 >200K 请求：heat 0.0 -> 1.5，放行
+        let (mut g1, _) = pacer
+            .try_acquire_lease(acc, fp_oversize, 2, 0)
+            .expect("1st oversized should pass");
+        g1.complete();
+        // 手动跳过槽位冷却以专测短时间热度门禁
+        if let Some(mut entry) = pacer.account_states.get_mut(acc) {
+            entry.slots = vec![SlotPhase::Free; 2];
+        }
+        assert!(pacer.get_account_heat(acc) >= 1.45);
+
+        // 第 2 个 >200K 请求：projected ~2.99 < 3.0，放行
+        let (mut g2, _) = pacer
+            .try_acquire_lease(acc, fp_oversize, 2, 0)
+            .expect("2nd oversized should pass");
+        g2.complete();
+        if let Some(mut entry) = pacer.account_states.get_mut(acc) {
+            entry.slots = vec![SlotPhase::Free; 2];
+        }
+        assert!(pacer.get_account_heat(acc) >= 2.9);
+
+        // 第 3 个 >200K 请求：projected ~4.49 >= 3.0，必须在进门前被 Overheated 拒绝！（严格 < 3 个）
+        let third = pacer.try_acquire_lease(acc, fp_oversize, 2, 2000);
+        assert!(
+            matches!(third, Err(LeaseRejectReason::Overheated { .. })),
+            "3rd oversized must be rejected pre-admission"
+        );
+
+        // 但 130KB 中等请求与 <=100KB 普通请求不受过热硬封锁，仍可正常进入空闲槽
+        let (mut gm, _) = pacer
+            .try_acquire_lease(acc, fp_medium, 2, 0)
+            .expect("Medium 130KB request should still be allowed on warm account");
+        gm.abort_and_rollback();
+    }
+
+    #[test]
+    fn test_two_slot_lifecycle_sticky_2s_wait_and_mutual_exclusion() {
+        let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
+        let acc = "slot_acc";
+        let fp_small = RequestFootprint::new(15_000, 40 * 1024);
+        let fp_large = RequestFootprint::new(220_000, 220 * 1024);
+
+        // 1. 2 并发槽下，连续进入 2 个小请求均成功闭合槽位
+        let (mut s1, _) = pacer
+            .try_acquire_lease(acc, fp_small, 2, 0)
+            .expect("slot 1 open");
+        // 有 1 个小请求在执行时，大请求 (>200K) 必须互斥拒绝！
+        assert!(matches!(
+            pacer.try_acquire_lease(acc, fp_large, 2, 2000),
+            Err(LeaseRejectReason::SlotsBusy)
+        ));
+
+        let (mut s2, _) = pacer
+            .try_acquire_lease(acc, fp_small, 2, 0)
+            .expect("slot 2 open");
+        // 2 个槽全处于 InFlight 时，第 3 个小请求即使在粘性模式下也立即拒绝
+        assert!(matches!(
+            pacer.try_acquire_lease(acc, fp_small, 2, 2000),
+            Err(LeaseRejectReason::SlotsBusy)
+        ));
+
+        // 2. 两个小请求结束响应，进入 800~1800ms (<=2s) 冷却期：两个槽在冷却延迟内依然闭合！
+        s1.complete();
+        s2.complete();
+
+        // 自由选号模式 (max_wait_ms = 0) 不允许进入全部处于冷却延迟的账号
+        assert!(matches!(
+            pacer.try_acquire_lease(acc, fp_small, 2, 0),
+            Err(LeaseRejectReason::CooldownTooLong { .. })
+        ));
+
+        // 粘性会话模式 (max_wait_ms = 2000)：因延迟 <= 2s，成功原子预约最早冷却槽位！
+        let (mut s_reserved, _) = pacer
+            .try_acquire_lease(acc, fp_small, 2, STICKY_MAX_SLOT_WAIT_MS)
+            .expect("sticky session should reserve slot when cooldown <= 2s");
+        assert!(
+            s_reserved.reserved_wait_ms() > 0 && s_reserved.reserved_wait_ms() <= 2000,
+            "reserved wait should be within 2s"
+        );
+        // 若中途回滚，槽位退回原冷却状态，不污染计数
+        s_reserved.abort_and_rollback();
+
+        // 3. 若两个槽冷却剩余 > 2s（例如 130K Medium 请求冷却 2.5s~3.8s），粘性会话 (>2s) 果断拒绝以触发换号
+        if let Some(mut entry) = pacer.account_states.get_mut(acc) {
+            let until = std::time::Instant::now() + Duration::from_millis(3000);
+            entry.slots = vec![
+                SlotPhase::CoolingDown {
+                    until,
+                    exclusive: false,
+                },
+                SlotPhase::CoolingDown {
+                    until,
+                    exclusive: false,
+                },
+            ];
+        }
+        assert!(matches!(
+            pacer.try_acquire_lease(acc, fp_small, 2, STICKY_MAX_SLOT_WAIT_MS),
+            Err(LeaseRejectReason::CooldownTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_turn_based_micro_nap_20_to_30_turns() {
+        let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
+        let acc = "nap_turn_acc";
+        let fp = RequestFootprint::new(5_000, 10 * 1024);
+
+        let mut nap_triggered_at = None;
+        for turn in 1..=31 {
+            // 清空冷却与滚动 RPM 仅测试轮次小憩
+            if let Some(mut entry) = pacer.account_states.get_mut(acc) {
+                entry.slots = vec![SlotPhase::Free; 2];
+                entry.rolling_requests.clear();
+            }
+            let (mut guard, entered_nap) = pacer
+                .try_acquire_lease(acc, fp, 2, 0)
+                .expect("should admit until nap triggers");
+            guard.complete();
+            if entered_nap {
+                nap_triggered_at = Some(turn);
+                break;
+            }
+        }
+
+        let triggered_turn = nap_triggered_at.expect("must trigger micro-nap within 20..=30 turns");
+        assert!(
+            (20..=30).contains(&triggered_turn),
+            "nap triggered at turn {}, expected 20..=30",
+            triggered_turn
+        );
+        assert!(pacer.is_in_nap(acc));
     }
 }
