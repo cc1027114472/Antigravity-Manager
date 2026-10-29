@@ -76,6 +76,7 @@ pub struct UpstreamClient {
     default_client: RwLock<Client>,
     proxy_pool: Option<Arc<crate::proxy::proxy_pool::ProxyPoolManager>>,
     client_cache: DashMap<String, Client>, // proxy_id -> Client
+    client_cache_gen: DashMap<String, u64>, // proxy_id -> evict_generation
     user_agent_override: RwLock<Option<String>>,
 }
 
@@ -104,6 +105,7 @@ impl UpstreamClient {
             default_client: RwLock::new(default_client),
             proxy_pool,
             client_cache: DashMap::new(),
+            client_cache_gen: DashMap::new(),
             user_agent_override: RwLock::new(None),
         }
     }
@@ -152,6 +154,7 @@ impl UpstreamClient {
     pub fn clear_client_cache(&self) {
         let size = self.client_cache.len();
         self.client_cache.clear();
+        self.client_cache_gen.clear();
         if size > 0 {
             tracing::info!("UpstreamClient cleared {} cached per-proxy clients", size);
         }
@@ -243,18 +246,34 @@ impl UpstreamClient {
                 match pool.get_proxy_for_account(acc_id).await {
                     Ok(Some(proxy_cfg)) => {
                         let entry_id = proxy_cfg.entry_id.clone();
-                        // Check cache
-                        if let Some(client) = self.client_cache.get(&entry_id) {
-                            return Ok((client.clone(), Some(entry_id)));
+                        let cur_gen = pool.proxy_evict_generation(&entry_id);
+                        let cached_gen = self.client_cache_gen.get(&entry_id).map(|g| *g.value());
+
+                        // Check cache & verify evict_generation matches so stale/half-open SOCKS5/TLS sockets are discarded
+                        if cached_gen == Some(cur_gen) {
+                            if let Some(client) = self.client_cache.get(&entry_id) {
+                                return Ok((client.clone(), Some(entry_id)));
+                            }
+                        } else if cached_gen.is_some() {
+                            self.client_cache.remove(&entry_id);
+                            tracing::info!(
+                                "Evicted stale cached HTTP/TLS client for proxy {} (gen {:?} -> {})",
+                                entry_id,
+                                cached_gen,
+                                cur_gen
+                            );
                         }
+
                         // Build new client and cache it
                         match self.build_client_with_proxy(proxy_cfg.clone()) {
                             Ok(client) => {
                                 self.client_cache
                                     .insert(entry_id.clone(), client.clone());
+                                self.client_cache_gen.insert(entry_id.clone(), cur_gen);
                                 tracing::info!(
-                                    "Using ProxyPool proxy ID: {} for account: {}",
+                                    "Using ProxyPool proxy ID: {} (gen={}) for account: {}",
                                     entry_id,
+                                    cur_gen,
                                     acc_id
                                 );
                                 return Ok((client, Some(entry_id)));
@@ -596,6 +615,22 @@ impl UpstreamClient {
                                 error: err_msg.clone(),
                             });
                             last_err = Some(err_msg);
+
+                            if egress_proxy_id.is_some() {
+                                self.record_egress_outcome(
+                                    egress_proxy_id.as_deref(),
+                                    crate::proxy::proxy_pool::EgressUsageStatus::Failed,
+                                );
+                                if let (Some(pool), Some(ref id)) = (&self.proxy_pool, &egress_proxy_id) {
+                                    let pool_clone = Arc::clone(pool);
+                                    let proxy_id_str = id.clone();
+                                    tokio::spawn(async move {
+                                        pool_clone.mark_proxy_unhealthy(&proxy_id_str).await;
+                                    });
+                                }
+                                // 专属代理超时：立即熔断退出端点循环，严禁在同一条卡死代理上继续重试 sandbox 端点！
+                                break;
+                            }
                             continue;
                         }
                     }
@@ -722,6 +757,11 @@ impl UpstreamClient {
                             error: msg.clone(),
                         });
                         last_err = Some(msg);
+
+                        // 若是专属代理传输层故障，该代理已被置为 RED，严禁在同一条故障代理上继续重试 sandbox 端点
+                        if egress_proxy_id.is_some() && Self::is_egress_transport_error(&e) {
+                            break;
+                        }
 
                         // 如果是最后一个端点，退出循环
                         if !has_next {

@@ -116,12 +116,23 @@ pub struct ProxyPoolManager {
     green_confirm_streak: Arc<DashMap<String, u8>>,
 
     /// Instant the node last transitioned RED → GREEN in this process.
-    /// Used to hold oversized generateContent until the egress looks "settled".
+    /// Used to hold traffic until the egress tunnel is completely settled.
     green_at: Arc<DashMap<String, Instant>>,
+
+    /// Monotonic generation counter bumped whenever a proxy turns RED or fails transport,
+    /// allowing [`UpstreamClient`] to evict its stale cached HTTP/TLS client pool for that proxy
+    /// without touching the proxy configuration or account bindings.
+    evict_generation: Arc<DashMap<String, u64>>,
 }
 
-/// Health probes that must succeed in a row before a RED node is marked GREEN.
-const GREEN_CONFIRM_SUCCESSES: u8 = 2;
+/// Health probes that must succeed in a row (each with latency <= [`MAX_HEALTHY_LATENCY_MS`])
+/// before a RED node is marked GREEN.
+pub const GREEN_CONFIRM_SUCCESSES: u8 = 3;
+
+/// Maximum acceptable latency (ms) for a proxy health probe (`generate_204`).
+/// Probes taking longer than 2500ms indicate severe tunnel congestion or packet loss
+/// and are treated as unhealthy to prevent mid-stream resets on Google endpoints.
+pub const MAX_HEALTHY_LATENCY_MS: u64 = 2500;
 
 /// Next `(is_healthy, confirm_streak)` after one health probe.
 fn next_health_state(was_healthy: bool, probe_ok: bool, streak: u8) -> (bool, u8) {
@@ -167,18 +178,34 @@ impl ProxyPoolManager {
             egress_usage: Arc::new(DashMap::new()),
             green_confirm_streak: Arc::new(DashMap::new()),
             green_at: Arc::new(DashMap::new()),
+            evict_generation: Arc::new(DashMap::new()),
         }
+    }
+
+    fn bump_evict_generation_map(map: &DashMap<String, u64>, proxy_id: &str) {
+        let mut entry = map.entry(proxy_id.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    /// Current client-cache eviction generation for `proxy_id` (0 if never turned RED).
+    pub fn proxy_evict_generation(&self, proxy_id: &str) -> u64 {
+        self.evict_generation
+            .get(proxy_id)
+            .map(|v| *v.value())
+            .unwrap_or(0)
     }
 
     fn note_proxy_turned_red(&self, proxy_id: &str) {
         self.green_confirm_streak.remove(proxy_id);
         self.green_at.remove(proxy_id);
+        Self::bump_evict_generation_map(&self.evict_generation, proxy_id);
     }
 
     fn note_proxy_turned_green(&self, proxy_id: &str) {
         self.green_confirm_streak.remove(proxy_id);
         self.green_at
             .insert(proxy_id.to_string(), Instant::now());
+        Self::bump_evict_generation_map(&self.evict_generation, proxy_id);
     }
 
     /// Seconds since this account's dedicated pool node last recovered GREEN.
@@ -207,6 +234,7 @@ impl ProxyPoolManager {
             proxy_id
         );
         if status == EgressUsageStatus::Failed {
+            Self::bump_evict_generation_map(&self.evict_generation, proxy_id);
             let pool_config = Arc::clone(&self.config);
             let streak = Arc::clone(&self.green_confirm_streak);
             let green_at = Arc::clone(&self.green_at);
@@ -1201,11 +1229,11 @@ impl ProxyPoolManager {
         }
         let proxy_cfg = proxy_res.unwrap();
 
-        // Residential proxies often need >10s; keep a bit of headroom for CONNECT + TLS.
+        // Probe timeout 8s; healthy threshold requires latency <= MAX_HEALTHY_LATENCY_MS (2500ms).
         let client_result = Client::builder()
             .proxy(proxy_cfg.proxy)
             .emulation(Emulation::Chrome132)
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(8))
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36")
             .build();
 
@@ -1222,7 +1250,18 @@ impl ProxyPoolManager {
             Ok(resp) => {
                 let latency = start.elapsed().as_millis() as u64;
                 if resp.status().is_success() {
-                    (true, Some(latency))
+                    if latency <= MAX_HEALTHY_LATENCY_MS {
+                        (true, Some(latency))
+                    } else {
+                        tracing::warn!(
+                            "Proxy {} ({}) health check latency too high: {}ms > {}ms threshold (treated as UNHEALTHY)",
+                            entry.name,
+                            entry.url,
+                            latency,
+                            MAX_HEALTHY_LATENCY_MS
+                        );
+                        (false, Some(latency))
+                    }
                 } else {
                     tracing::warn!(
                         "Proxy {} health check status error: {} ({}ms)",
@@ -1248,9 +1287,9 @@ impl ProxyPoolManager {
     }
 
     /// 红色节点递增退避重探间隔（秒）：
-    /// 变红后依次按 3s → 6s → 9s → 20s 重探，之后保持 20s 连续退避探测直到恢复。
-    /// 既保证瞬时抖动最快 3s 内回绿，又避免对持续宕机的节点高频空探。
-    const RED_RECHECK_BACKOFF_SECS: [u64; 4] = [3, 6, 9, 20];
+    /// 变红后依次按 10s → 15s → 20s → 30s 重探，配合 GREEN_CONFIRM_SUCCESSES = 3（且每次 <= 2500ms），
+    /// 确保代理在断流后必须经过至少 45s 的连续稳定低延迟探测才允许回绿，杜绝频繁闪断带病接单。
+    const RED_RECHECK_BACKOFF_SECS: [u64; 4] = [10, 15, 20, 30];
 
     /// 启动健康检查循环（退避自愈探测）
     ///
@@ -1525,7 +1564,9 @@ mod tests {
         assert_eq!(next_health_state(true, false, 0), (false, 0));
         assert_eq!(next_health_state(false, false, 1), (false, 0));
         assert_eq!(next_health_state(false, true, 0), (false, 1));
-        assert_eq!(next_health_state(false, true, 1), (true, 0));
+        assert_eq!(next_health_state(false, true, 1), (false, 2));
+        assert_eq!(next_health_state(false, true, 2), (true, 0));
+        assert_eq!(next_health_state(false, false, 2), (false, 0));
         assert_eq!(next_health_state(false, false, 0), (false, 0));
     }
 

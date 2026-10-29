@@ -45,9 +45,11 @@ const FAILURE_COUNT_EXPIRY_SECONDS: u64 = 3600;
 /// 防止 docker restart 后积压请求瞬间涌入触发 Google 风控（TOS_VIOLATION）
 const COLD_START_WARMUP_SECS: u64 = 60;
 
-/// Dedicated proxy just recovered GREEN: hold oversized generateContent so
-/// token refresh / small traffic can settle on the same TLS identity first.
-const EGRESS_RECOVERY_COOLDOWN_SECS: u64 = 90;
+/// Dedicated proxy just recovered GREEN:
+/// - Phase 1 (0..60s): hold ALL traffic tiers (Normal / Medium / Oversized) so the proxy tunnel settles completely.
+/// - Phase 2 (60..180s): allow Normal traffic to warm up TLS identity, hold Medium and Oversized requests.
+pub const EGRESS_SETTLE_ALL_TRAFFIC_SECS: u64 = 60;
+pub const EGRESS_RECOVERY_COOLDOWN_SECS: u64 = 180;
 
 /// 默认单账号并发槽位数（未在页面或账号单独配置时默认 2 并发槽）
 pub const DEFAULT_CONCURRENCY_SLOTS: usize = 2;
@@ -64,8 +66,16 @@ pub const OVERSIZE_BODY_BYTES: usize = 200 * 1024;
 pub const MEDIUM_TOKENS: u32 = 100_000;
 pub const OVERSIZE_TOKENS: u32 = 200_000;
 
-/// 热度半衰期：180 秒（3 分钟）指数衰减
-const HEAT_HALF_LIFE_SECS: f64 = 180.0;
+/// 热度半衰期：600 秒（10 分钟）指数衰减，防止 3 分钟内衰减过快放进第 3 个大包
+const HEAT_HALF_LIFE_SECS: f64 = 600.0;
+
+/// 超大请求（>200K）10 分钟滑动时间窗硬上限：任意 600 秒内严格 < 3 个（最多允许 2 个）
+pub const OVERSIZE_WINDOW_SECS: u64 = 600;
+pub const MAX_OVERSIZE_IN_WINDOW: usize = 2;
+
+/// OAuth Token 刚刷新后的大包保护期（60 秒）：
+/// 新签发的 ya29 Access Token 前 60 秒内严禁直接承接 >200KB 超大请求，仅允许 loadCodeAssist 握手与中小请求热身
+pub const TOKEN_REFRESH_WARMUP_OVERSIZE_SECS: u64 = 60;
 
 /// 各分级单次热度增量：
 /// - Normal (<=100K): +0.0
@@ -81,11 +91,13 @@ pub const OVERSIZE_HEAT_CAP: f64 = 3.0;
 /// 冷号池优选线：Heat < 1.5 视为清凉账号，在自由选号（P2C）中享受最高优先级
 pub const COLD_POOL_HEAT_THRESHOLD: f64 = 1.5;
 
-fn remaining_recovery_hold_secs(elapsed_secs: u64) -> Option<u64> {
-    if elapsed_secs >= EGRESS_RECOVERY_COOLDOWN_SECS {
-        None
+pub fn remaining_recovery_hold_secs_for_tier(elapsed_secs: u64, tier: TrafficTier) -> Option<u64> {
+    if elapsed_secs < EGRESS_SETTLE_ALL_TRAFFIC_SECS {
+        Some((EGRESS_SETTLE_ALL_TRAFFIC_SECS - elapsed_secs).max(5))
+    } else if elapsed_secs < EGRESS_RECOVERY_COOLDOWN_SECS && tier != TrafficTier::Normal {
+        Some((EGRESS_RECOVERY_COOLDOWN_SECS - elapsed_secs).max(10))
     } else {
-        Some((EGRESS_RECOVERY_COOLDOWN_SECS - elapsed_secs).max(15))
+        None
     }
 }
 
@@ -173,8 +185,10 @@ pub enum SlotPhase {
 pub enum LeaseRejectReason {
     /// 服务冷启动前 60s 缓冲（拦截超大请求突刺）
     ColdStartWarmup { retry_after_secs: u64 },
-    /// 专属代理刚从 RED 恢复 GREEN 未满 90s 稳定期
+    /// 专属代理刚从 RED 恢复 GREEN 未满 180s 稳定期
     EgressRecovery { retry_after_secs: u64 },
+    /// OAuth Access Token 刚完成刷新未满 60s，严禁直接作为首包或热身期承接 >200K 超大请求
+    TokenRefreshWarmup { retry_after_secs: u64 },
     /// 账号处于 20~30 轮强制微小憩期间（休眠期全封闭，大小请求一律禁入）
     InNap { remaining_secs: u64 },
     /// 超大请求（>200K）触发热度红线（projected_heat >= 3.0，限制第 3 个大包进入）
@@ -195,6 +209,7 @@ impl LeaseRejectReason {
         match self {
             Self::ColdStartWarmup { retry_after_secs } => Some(*retry_after_secs),
             Self::EgressRecovery { retry_after_secs } => Some(*retry_after_secs),
+            Self::TokenRefreshWarmup { retry_after_secs } => Some(*retry_after_secs),
             Self::InNap { remaining_secs } => Some((*remaining_secs).max(1)),
             Self::Overheated {
                 retry_after_secs, ..
@@ -235,6 +250,8 @@ pub struct AccountPacerState {
     pub next_allowed_request_at: std::time::Instant,
     /// 过去 60 秒内的请求时间戳历史（用于滚动 60s RPM，单号上限 10 次）
     pub rolling_requests: std::collections::VecDeque<std::time::Instant>,
+    /// 过去 600 秒（10 分钟）内的超大请求（>200K）时间戳历史（严格限制 < 3 个，即最多 2 个）
+    pub oversized_history: std::collections::VecDeque<std::time::Instant>,
     /// 历史累计请求总计数
     pub request_counter: u64,
     /// 当前小憩周期内已累计的对话轮数
@@ -247,10 +264,12 @@ pub struct AccountPacerState {
     pub nap_until: Option<std::time::Instant>,
     /// 保护阈值浮动
     pub threshold_jitter: i32,
-    /// 大任务累积热度积分（180s 半衰期指数衰减）
+    /// 大任务累积热度积分（600s 半衰期指数衰减）
     pub massive_heat: f64,
     /// 上次更新热度的时间
     pub last_heat_updated_at: std::time::Instant,
+    /// 最近一次完成 OAuth Access Token 刷新的时间（刷新后前 60s 禁止承接 >200K 超大包）
+    pub last_oauth_refresh_at: Option<std::time::Instant>,
     /// 多并发槽位表（槽位生命周期 = 实际请求耗时 + 计算延迟）
     pub slots: Vec<SlotPhase>,
 }
@@ -265,6 +284,7 @@ impl AccountPacerState {
             last_response_completed_at: None,
             next_allowed_request_at: now,
             rolling_requests: std::collections::VecDeque::new(),
+            oversized_history: std::collections::VecDeque::new(),
             request_counter: 0,
             turns_since_nap: 0,
             next_nap_threshold,
@@ -273,6 +293,7 @@ impl AccountPacerState {
             threshold_jitter: HumanizedPacer::get_threshold_jitter(account_id),
             massive_heat: 0.0,
             last_heat_updated_at: now,
+            last_oauth_refresh_at: None,
             slots: vec![SlotPhase::Free; n],
         }
     }
@@ -422,7 +443,31 @@ impl HumanizedPacer {
             return 0;
         }
         let secs = HEAT_HALF_LIFE_SECS * (current_heat / target_heat).log2();
-        (secs.ceil() as u64).clamp(5, 300)
+        (secs.ceil() as u64).clamp(5, 600)
+    }
+
+    /// 清理超过 600s 的超大请求历史，并检查是否已满 2 个（若满 2 个则返回距离最早 1 个滑出窗口的秒数）
+    fn clean_and_compute_oversize_window_wait_secs(
+        entry: &mut AccountPacerState,
+        now: std::time::Instant,
+    ) -> Option<u64> {
+        let window = Duration::from_secs(OVERSIZE_WINDOW_SECS);
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        while let Some(&front) = entry.oversized_history.front() {
+            if front < cutoff {
+                entry.oversized_history.pop_front();
+            } else {
+                break;
+            }
+        }
+        if entry.oversized_history.len() >= MAX_OVERSIZE_IN_WINDOW {
+            if let Some(&oldest) = entry.oversized_history.front() {
+                let elapsed = now.saturating_duration_since(oldest).as_secs();
+                return Some(OVERSIZE_WINDOW_SECS.saturating_sub(elapsed).clamp(5, OVERSIZE_WINDOW_SECS));
+            }
+            return Some(60);
+        }
+        None
     }
 
     /// 获取账号当前的大任务热度积分（按 180 秒半衰期指数衰减）
@@ -693,27 +738,52 @@ impl HumanizedPacer {
         }
     }
 
-    /// 检查进程级冷启动与专属代理恢复期对超大请求的限制
+    /// 记录账号刚完成一次 OAuth Access Token 刷新（开启 60s 新 Token 保护期，期间禁止直接承接 >200K 超大请求）
+    pub fn note_oauth_refreshed(&self, account_id: &str) {
+        let now = std::time::Instant::now();
+        let mut entry = self
+            .account_states
+            .entry(account_id.to_string())
+            .or_insert_with(|| AccountPacerState::new_default(account_id, now, 1));
+        entry.last_oauth_refresh_at = Some(now);
+    }
+
+    /// 检查进程级冷启动、专属代理恢复期与新 OAuth Token 保护期对请求的限制：
+    /// - 进程冷启动前 60s：仅拦截 Oversized 请求突刺；
+    /// - 专属代理从 RED 恢复 GREEN：
+    ///   1. 前 60s（静默期）：拦截所有流量（Normal / Medium / Oversized），确保代理网络彻底稳定后再发包；
+    ///   2. 60..180s（预热期）：放行 Normal 轻量流量热身，拦截 Medium 和 Oversized 请求；
+    /// - OAuth Token 刚刷新后前 60s：放行 Normal / Medium 流量，拦截 Oversized（>200K）超大请求。
     pub fn check_global_or_egress_hold(
         &self,
         account_id: &str,
         footprint: RequestFootprint,
     ) -> Option<LeaseRejectReason> {
-        if !footprint.is_oversized() {
-            return None;
-        }
+        if footprint.is_oversized() {
+            let uptime_secs = self.started_at.elapsed().as_secs();
+            if uptime_secs < COLD_START_WARMUP_SECS {
+                let remain = (COLD_START_WARMUP_SECS - uptime_secs).max(5);
+                return Some(LeaseRejectReason::ColdStartWarmup {
+                    retry_after_secs: remain,
+                });
+            }
 
-        let uptime_secs = self.started_at.elapsed().as_secs();
-        if uptime_secs < COLD_START_WARMUP_SECS {
-            let remain = (COLD_START_WARMUP_SECS - uptime_secs).max(5);
-            return Some(LeaseRejectReason::ColdStartWarmup {
-                retry_after_secs: remain,
-            });
+            if let Some(entry) = self.account_states.get(account_id) {
+                if let Some(refreshed_at) = entry.last_oauth_refresh_at {
+                    let elapsed = refreshed_at.elapsed().as_secs();
+                    if elapsed < TOKEN_REFRESH_WARMUP_OVERSIZE_SECS {
+                        let remain = (TOKEN_REFRESH_WARMUP_OVERSIZE_SECS - elapsed).max(5);
+                        return Some(LeaseRejectReason::TokenRefreshWarmup {
+                            retry_after_secs: remain,
+                        });
+                    }
+                }
+            }
         }
 
         if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
             if let Some(elapsed) = pool.dedicated_recovery_elapsed_secs(account_id) {
-                if let Some(wait) = remaining_recovery_hold_secs(elapsed) {
+                if let Some(wait) = remaining_recovery_hold_secs_for_tier(elapsed, footprint.tier) {
                     return Some(LeaseRejectReason::EgressRecovery {
                         retry_after_secs: wait,
                     });
@@ -751,15 +821,19 @@ impl HumanizedPacer {
                 }
             }
 
-            // 2. 热度门禁（>200K 超大请求推演 >= 3.0 即拦截，严格限制短时 < 3 个）
+            // 2. 热度与 10 分钟大包窗口双重硬门禁（>200K 超大请求推演 >= 3.0 或 600s 内已满 2 个即拦截，严格限制 < 3 个）
             let current_heat = Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
             if footprint.is_oversized() {
                 let projected = current_heat + footprint.heat_increment();
-                if projected >= OVERSIZE_HEAT_CAP {
+                let window_wait = Self::clean_and_compute_oversize_window_wait_secs(&mut entry, now);
+                if projected >= OVERSIZE_HEAT_CAP || window_wait.is_some() {
+                    let retry_secs = Self::heat_recovery_secs(current_heat)
+                        .max(window_wait.unwrap_or(0))
+                        .max(5);
                     return AccountProbe::Rejected(LeaseRejectReason::Overheated {
                         current_heat,
-                        projected_heat: projected,
-                        retry_after_secs: Self::heat_recovery_secs(current_heat),
+                        projected_heat: projected.max(OVERSIZE_HEAT_CAP),
+                        retry_after_secs: retry_secs,
                     });
                 }
             }
@@ -841,16 +915,20 @@ impl HumanizedPacer {
             }
         }
 
-        // 2. 大请求过热前置硬门禁（进门前限制第 3 个大包）
+        // 2. 大请求过热与 10 分钟窗口双重前置硬门禁（进门前限制第 3 个大包）
         let current_heat = Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
         let added_heat = footprint.heat_increment();
         if footprint.is_oversized() {
             let projected = current_heat + added_heat;
-            if projected >= OVERSIZE_HEAT_CAP {
+            let window_wait = Self::clean_and_compute_oversize_window_wait_secs(&mut entry, now);
+            if projected >= OVERSIZE_HEAT_CAP || window_wait.is_some() {
+                let retry_secs = Self::heat_recovery_secs(current_heat)
+                    .max(window_wait.unwrap_or(0))
+                    .max(5);
                 return Err(LeaseRejectReason::Overheated {
                     current_heat,
-                    projected_heat: projected,
-                    retry_after_secs: Self::heat_recovery_secs(current_heat),
+                    projected_heat: projected.max(OVERSIZE_HEAT_CAP),
+                    retry_after_secs: retry_secs,
                 });
             }
         }
@@ -949,13 +1027,16 @@ impl HumanizedPacer {
             };
         }
 
-        // 5. 预占热度、记录滚动 RPM 与推进 20~30 轮微小憩计数
+        // 5. 预占热度、记录滚动 RPM / 10 分钟大包历史与推进 20~30 轮微小憩计数
         entry.massive_heat = current_heat + added_heat;
         entry.last_heat_updated_at = now;
         entry.last_request_time = ready_at;
         entry.request_counter += 1;
         entry.turns_since_nap += 1;
         entry.rolling_requests.push_back(ready_at);
+        if footprint.is_oversized() {
+            entry.oversized_history.push_back(ready_at);
+        }
 
         if added_heat > 0.0 {
             tracing::info!(
@@ -1105,12 +1186,21 @@ impl HumanizedPacer {
                 }
             }
 
-            // 2. 退回预占但未实际消耗的热度
+            // 2. 退回预占但未实际消耗的热度与超大请求时间窗记录
             if preallocated_heat > 0.0 {
                 let decayed =
                     Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
                 entry.massive_heat = (decayed - preallocated_heat).max(0.0);
                 entry.last_heat_updated_at = now;
+            }
+            if preallocated_heat >= OVERSIZE_HEAT_INCREMENT {
+                if let Some(pos) = entry
+                    .oversized_history
+                    .iter()
+                    .rposition(|t| *t == recorded_at)
+                {
+                    entry.oversized_history.remove(pos);
+                }
             }
 
             // 3. 回退未生效的轮次与滚动 RPM 时间戳
@@ -2328,5 +2418,118 @@ mod tests {
             triggered_turn
         );
         assert!(pacer.is_in_nap(acc));
+    }
+
+    #[test]
+    fn test_two_stage_egress_recovery_hold() {
+        // Phase 1 (0..60s): ALL tiers (Normal, Medium, Oversized) are held
+        assert_eq!(
+            remaining_recovery_hold_secs_for_tier(15, TrafficTier::Normal),
+            Some(45)
+        );
+        assert_eq!(
+            remaining_recovery_hold_secs_for_tier(15, TrafficTier::Medium),
+            Some(45)
+        );
+        assert_eq!(
+            remaining_recovery_hold_secs_for_tier(15, TrafficTier::Oversized),
+            Some(45)
+        );
+
+        // Phase 2 (60..180s): Normal is allowed, Medium and Oversized are still held
+        assert_eq!(
+            remaining_recovery_hold_secs_for_tier(90, TrafficTier::Normal),
+            None
+        );
+        assert_eq!(
+            remaining_recovery_hold_secs_for_tier(90, TrafficTier::Medium),
+            Some(90)
+        );
+        assert_eq!(
+            remaining_recovery_hold_secs_for_tier(90, TrafficTier::Oversized),
+            Some(90)
+        );
+
+        // Phase 3 (>=180s): ALL tiers allowed
+        assert_eq!(
+            remaining_recovery_hold_secs_for_tier(180, TrafficTier::Oversized),
+            None
+        );
+    }
+
+    #[test]
+    fn test_oversize_10min_window_blocks_3rd_even_after_3min() {
+        let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
+        let acc = "win10m_acc";
+        let fp_oversize = RequestFootprint::new(65_000, 250 * 1024);
+
+        // Admit 2 oversized requests
+        let (mut g1, _) = pacer
+            .try_acquire_lease(acc, fp_oversize, 2, 0)
+            .expect("1st oversized admitted");
+        g1.complete();
+        pacer.test_clear_slot_cooldowns(acc);
+
+        let (mut g2, _) = pacer
+            .try_acquire_lease(acc, fp_oversize, 2, 0)
+            .expect("2nd oversized admitted");
+        g2.complete();
+        pacer.test_clear_slot_cooldowns(acc);
+
+        // Simulate 200s (3m20s) passing — previously 180s half-life would let heat decay < 1.5
+        if let Some(mut entry) = pacer.account_states.get_mut(acc) {
+            let past = std::time::Instant::now() - Duration::from_secs(200);
+            entry.last_heat_updated_at = past;
+            entry.oversized_history.clear();
+            entry.oversized_history.push_back(past);
+            entry.oversized_history.push_back(past);
+        }
+
+        // 3rd oversized within 10 minutes must STILL be rejected!
+        assert!(matches!(
+            pacer.try_acquire_lease(acc, fp_oversize, 2, 2000),
+            Err(LeaseRejectReason::Overheated { .. })
+        ));
+    }
+
+    #[test]
+    fn test_oauth_token_refresh_warmup_blocks_oversized_allows_normal_and_medium() {
+        let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
+        let acc = "fresh_oauth_acc";
+        let fp_normal = RequestFootprint::new(15_000, 30 * 1024);
+        let fp_medium = RequestFootprint::new(130_000, 140 * 1024);
+        let fp_oversize = RequestFootprint::new(65_000, 240 * 1024);
+
+        // Mark account as having just refreshed its OAuth token
+        pacer.note_oauth_refreshed(acc);
+
+        // Oversized (>200KB) must be blocked during 60s TokenRefreshWarmup
+        assert!(matches!(
+            pacer.try_acquire_lease(acc, fp_oversize, 2, 2000),
+            Err(LeaseRejectReason::TokenRefreshWarmup { .. })
+        ));
+
+        // Normal and Medium are allowed during the 60s warmup
+        let (mut g_norm, _) = pacer
+            .try_acquire_lease(acc, fp_normal, 2, 0)
+            .expect("Normal tier must be allowed after OAuth refresh");
+        g_norm.complete();
+        pacer.test_clear_slot_cooldowns(acc);
+
+        let (mut g_med, _) = pacer
+            .try_acquire_lease(acc, fp_medium, 2, 0)
+            .expect("Medium tier must be allowed after OAuth refresh");
+        g_med.complete();
+        pacer.test_clear_slot_cooldowns(acc);
+
+        // Simulate 61s elapsed since OAuth refresh -> Oversized now allowed
+        if let Some(mut entry) = pacer.account_states.get_mut(acc) {
+            entry.last_oauth_refresh_at =
+                Some(std::time::Instant::now() - Duration::from_secs(61));
+        }
+        let (mut g_over, _) = pacer
+            .try_acquire_lease(acc, fp_oversize, 2, 0)
+            .expect("Oversized must be allowed after 60s OAuth warmup expires");
+        g_over.complete();
     }
 }

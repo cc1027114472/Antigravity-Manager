@@ -190,10 +190,21 @@ async fn fetch_project_id(
                 ));
                 return (None, None);
             }
+            if let Some(elapsed) = pool.dedicated_recovery_elapsed_secs(id) {
+                if elapsed < crate::proxy::rate_limit::EGRESS_SETTLE_ALL_TRAFFIC_SECS {
+                    crate::modules::logger::log_info(&format!(
+                        "⏳ 代理恢复静默期 ({}s < {}s)：跳过账号 {} 的 loadCodeAssist 探测，等待网络完全稳定",
+                        elapsed,
+                        crate::proxy::rate_limit::EGRESS_SETTLE_ALL_TRAFFIC_SECS,
+                        email
+                    ));
+                    return (None, None);
+                }
+            }
         }
     }
 
-    let (client, _route) = match create_standard_client(account_id, 15).await {
+    let (client, route) = match create_standard_client(account_id, 15).await {
         Ok(res) => res,
         Err(e) => {
             crate::modules::logger::log_warn(&format!(
@@ -284,6 +295,11 @@ async fn fetch_project_id(
                 "❌ [{}] loadCodeAssist network error: {}",
                 email, e
             ));
+            if let crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } = &route {
+                if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                    pool.mark_proxy_unhealthy(entry_id).await;
+                }
+            }
         }
     }
 
@@ -316,6 +332,18 @@ pub async fn fetch_quota_with_cache(
                 crate::modules::logger::log_warn(&err_msg);
                 return Err(AppError::Network(err_msg, None));
             }
+            if let Some(elapsed) = pool.dedicated_recovery_elapsed_secs(id) {
+                if elapsed < crate::proxy::rate_limit::EGRESS_SETTLE_ALL_TRAFFIC_SECS {
+                    let err_msg = format!(
+                        "代理恢复静默期 ({}s < {}s)：暂缓刷新账号 {} 配额，等待代理隧道完全稳定",
+                        elapsed,
+                        crate::proxy::rate_limit::EGRESS_SETTLE_ALL_TRAFFIC_SECS,
+                        email
+                    );
+                    crate::modules::logger::log_info(&err_msg);
+                    return Err(AppError::Network(err_msg, None));
+                }
+            }
         }
     }
 
@@ -328,7 +356,7 @@ pub async fn fetch_quota_with_cache(
 
     // We keep project_id to store in the DB, but we NO LONGER force inject it into payload if it's absent
 
-    let (client, _route) = match create_standard_client(account_id, 15).await {
+    let (client, route) = match create_standard_client(account_id, 15).await {
         Ok(res) => res,
         Err(e) => {
             return Err(AppError::Network(e, None));
@@ -492,16 +520,12 @@ pub async fn fetch_quota_with_cache(
                         "Quota API request failed at {}: {}",
                         ep_url, e
                     ));
-                    if let Some(id) = account_id {
+                    if let crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } = &route {
                         if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                            let pool_clone = std::sync::Arc::clone(&pool);
-                            let acc_id_owned = id.to_string();
-                            tokio::spawn(async move {
-                                if let Ok(Some(cfg)) = pool_clone.get_proxy_for_account(&acc_id_owned).await {
-                                    pool_clone.mark_proxy_unhealthy(&cfg.entry_id).await;
-                                }
-                            });
+                            pool.mark_proxy_unhealthy(entry_id).await;
                         }
+                        // 代理隧道网络报错时已将该节点置 RED，不再在死隧道上重试备用端点
+                        return Err(AppError::from(e));
                     }
                     last_error = Some(AppError::from(e));
                     if has_next {
