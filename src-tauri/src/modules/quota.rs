@@ -283,11 +283,26 @@ async fn fetch_project_id(
                     return (project_id, subscription_tier);
                 }
             } else {
+                let status = res.status();
+                let text = res.text().await.unwrap_or_default();
                 crate::modules::logger::log_warn(&format!(
-                    "⚠️  [{}] loadCodeAssist failed: Status: {}",
+                    "⚠️  [{}] loadCodeAssist failed: Status: {}, Body: {}",
                     email,
-                    res.status()
+                    status,
+                    text
                 ));
+                if status == rquest::StatusCode::FORBIDDEN
+                    || text.contains("TOS_VIOLATION")
+                    || text.contains("PERMISSION_DENIED")
+                    || text.contains("disabled in this account")
+                {
+                    if let Some(id) = account_id {
+                        let _ = crate::modules::account::mark_account_forbidden(
+                            id,
+                            &format!("loadCodeAssist 403 Forbidden: {}", text),
+                        );
+                    }
+                }
             }
         }
         Err(e) => {

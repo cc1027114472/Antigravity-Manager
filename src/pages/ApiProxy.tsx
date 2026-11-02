@@ -36,6 +36,7 @@ import DebouncedSlider from '../components/common/DebouncedSlider';
 import { listAccounts } from '../services/accountService';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
 import AdvancedThinking from '../components/settings/AdvancedThinking';
+import PayloadGuardSettings from '../components/settings/PayloadGuardSettings';
 import { CircuitBreakerConfig } from '../types/config';
 
 interface ProxyStatus {
@@ -774,7 +775,7 @@ export default function ApiProxy() {
 
     const updateSchedulingConfig = (updates: Partial<StickySessionConfig>) => {
         if (!appConfig) return;
-        const currentScheduling = appConfig.proxy.scheduling || { mode: 'Balance', max_wait_seconds: 60 };
+        const currentScheduling = appConfig.proxy.scheduling || { mode: 'CacheFirst', max_wait_seconds: 300 };
         const newScheduling = { ...currentScheduling, ...updates };
 
         const newAppConfig = {
@@ -1864,7 +1865,7 @@ print(response.choices[0].message.content)`;
                                                 {(['CacheFirst', 'Balance', 'PerformanceFirst'] as const).map(mode => (
                                                     <label
                                                         key={mode}
-                                                        className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-all duration-200 ${(appConfig.proxy.scheduling?.mode || 'Balance') === mode
+                                                        className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-all duration-200 ${(appConfig.proxy.scheduling?.mode || 'CacheFirst') === mode
                                                             ? 'border-indigo-500 bg-indigo-50/30 dark:bg-indigo-900/10'
                                                             : 'border-gray-100 dark:border-base-200 hover:border-indigo-200'
                                                             }`}
@@ -1872,7 +1873,7 @@ print(response.choices[0].message.content)`;
                                                         <input
                                                             type="radio"
                                                             className="radio radio-xs radio-primary mt-1"
-                                                            checked={(appConfig.proxy.scheduling?.mode || 'Balance') === mode}
+                                                            checked={(appConfig.proxy.scheduling?.mode || 'CacheFirst') === mode}
                                                             onChange={() => updateSchedulingConfig({ mode })}
                                                         />
                                                         <div className="space-y-1">
@@ -1900,7 +1901,7 @@ print(response.choices[0].message.content)`;
                                                         <HelpTooltip text={t('proxy.config.scheduling.max_wait_tooltip')} />
                                                     </label>
                                                     <span className="text-xs font-mono text-indigo-600 font-bold">
-                                                        {appConfig.proxy.scheduling?.max_wait_seconds || 60}s
+                                                        {appConfig.proxy.scheduling?.max_wait_seconds || 300}s
                                                     </span>
                                                 </div>
                                                 <input
@@ -1908,9 +1909,9 @@ print(response.choices[0].message.content)`;
                                                     min="0"
                                                     max="300"
                                                     step="10"
-                                                    disabled={(appConfig.proxy.scheduling?.mode || 'Balance') !== 'CacheFirst'}
+                                                    disabled={(appConfig.proxy.scheduling?.mode || 'CacheFirst') !== 'CacheFirst'}
                                                     className="range range-indigo range-xs"
-                                                    value={appConfig.proxy.scheduling?.max_wait_seconds || 60}
+                                                    value={appConfig.proxy.scheduling?.max_wait_seconds || 300}
                                                     onChange={(e) => updateSchedulingConfig({ max_wait_seconds: parseInt(e.target.value) })}
                                                 />
                                                 <div className="flex justify-between px-1 mt-1 text-[10px] text-gray-400 font-mono">
@@ -1961,6 +1962,16 @@ print(response.choices[0].message.content)`;
                                                     {t('proxy.config.concurrency.global_max_hint')}
                                                 </p>
                                             </div>
+
+                                            {/* [NEW] Payload Guard (请求大小安全防护) */}
+                                            <PayloadGuardSettings
+                                                config={appConfig.proxy.payload_guard}
+                                                onChange={(newPayloadGuard) =>
+                                                    updateProxyConfig({
+                                                        payload_guard: newPayloadGuard,
+                                                    })
+                                                }
+                                            />
 
                                             <div className="p-3 bg-amber-50 dark:bg-amber-900/10 border border-amber-100 dark:border-amber-900/20 rounded-xl">
                                                 <p className="text-[10px] text-amber-700 dark:text-amber-500 leading-relaxed">

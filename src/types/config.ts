@@ -27,7 +27,21 @@ export interface ProxyConfig {
     global_system_prompt?: GlobalSystemPromptConfig;
     image_thinking_mode?: 'enabled' | 'disabled'; // [NEW] 图像思维模式开关
     enable_g1_credits?: boolean; // [NEW] 是否注入 Google One AI 信用额度 (默认 false，避免扣减 G1 额度及 403 风险)
+    payload_guard?: PayloadGuardConfig; // [NEW] 上下文与请求大小安全防护配置
     proxy_pool?: ProxyPoolConfig;
+}
+
+// ============================================================================
+// Payload Guard 配置 (控制单次请求最大输入 Token，防止触发风控或封号)
+// ============================================================================
+
+export interface PayloadGuardConfig {
+    /** 是否启用请求大小防护 */
+    enabled: boolean;
+    /** 单次请求允许的最大输入 Tokens (默认 150000, 设为 0 表示不限制) */
+    max_input_tokens: number;
+    /** 字节粗筛换算比例 (每 Token 对应最大预估字节数，默认 4.0) */
+    bytes_per_token_ceiling?: number;
 }
 
 // ============================================================================

@@ -386,7 +386,7 @@
     "account": {
       "title": "Account Settings",
       "auto_refresh": "Background Auto Refresh",
-      "auto_refresh_desc": "Automatically refresh all account quotas in the background. This is required for quota protection and smart warmup.",
+      "auto_refresh_desc": "Periodically refresh all account quotas from upstream. With local ledger, quota protection functions even when disabled.",
       "always_on": "Always On",
       "refresh_interval": "Refresh Interval (minutes)",
       "auto_sync": "Auto Sync Current Account",
@@ -837,6 +837,12 @@
         "global_max_tooltip": "Max overlapping in-flight requests per account. Empty or 0 = unlimited. Override per account in Accounts.",
         "global_max_hint": "Same semantics as traffic-log in-flight peak. When capped, rotate to another account (no queue).",
         "unlimited": "Unlimited"
+      },
+      "payload_guard": {
+        "title": "Context Size Protection (Payload Guard)",
+        "tooltip": "Computes token count before the request enters accounts. Oversized requests return 413 immediately, preventing account ban or TOS violations caused by heavy prompts.",
+        "description": "Per-request input token limit. Updates take effect immediately without restarting the service.",
+        "max_tokens": "Max Input Tokens"
       },
       "serial_pool": {
         "title": "Serial Account Pool",

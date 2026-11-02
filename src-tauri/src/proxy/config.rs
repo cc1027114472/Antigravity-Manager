@@ -721,6 +721,32 @@ pub struct ProxyConfig {
     /// 默认 false：不注入，完全使用基础 5 小时免费额度，避免消耗 G1 点数并降低 403 风险
     #[serde(default)]
     pub enable_g1_credits: bool,
+
+    /// 请求包体与上下文防护配置 (防止超大请求导致账号被封)
+    #[serde(default)]
+    pub payload_guard: PayloadGuardConfig,
+}
+
+/// 上下文与请求包体大小安全防护配置 (Payload Guard)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PayloadGuardConfig {
+    /// 是否启用请求大小防护
+    pub enabled: bool,
+    /// 单次请求允许的最大输入 Tokens (默认 150_000, 设为 0 表示不限制)
+    pub max_input_tokens: u32,
+    /// 字节粗筛换算比例 (每 Token 对应最大预估字节数，默认 4.0)
+    pub bytes_per_token_ceiling: f32,
+}
+
+impl Default for PayloadGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_input_tokens: 150_000,
+            bytes_per_token_ceiling: 4.0,
+        }
+    }
 }
 
 /// 串行号池配置（一期：默认关，不改变现网调度）
@@ -802,6 +828,7 @@ impl Default for ProxyConfig {
             image_thinking_mode: None,
             serial_pool: SerialPoolConfig::default(),
             enable_g1_credits: false,
+            payload_guard: PayloadGuardConfig::default(),
         }
     }
 }

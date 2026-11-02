@@ -385,7 +385,7 @@
     "account": {
       "title": "账号设置",
       "auto_refresh": "后台自动刷新",
-      "auto_refresh_desc": "后台自动刷新所有账号的配额信息，这是额度保护和智能预热的基础。",
+      "auto_refresh_desc": "后台定期向上游同步刷新所有账号的配额信息。开启本地账本后，即使关闭此项也可享受实时配额保护。",
       "always_on": "始终开启",
       "refresh_interval": "刷新间隔（分钟）",
       "auto_sync": "自动获取当前账号",
@@ -830,6 +830,12 @@
         "global_max_tooltip": "每个账号同时进行中的重叠请求数上限。留空或 0 表示无限。账号管理里可按号覆盖。",
         "global_max_hint": "与流量日志中的「并发峰值」同一语义。触达上限时自动换号，不排队。",
         "unlimited": "无限"
+      },
+      "payload_guard": {
+        "title": "请求上下文大小防护 (Payload Guard)",
+        "tooltip": "在请求进入账号前计算 Token 数量。超限请求直接返回 413 拦截，避免大 Prompt 突刺打穿账号或触发 Google TOS 封号。",
+        "description": "单次请求最大输入限制，修改后即时热生效，无需重启服务。",
+        "max_tokens": "最大输入限制"
       },
       "serial_pool": {
         "title": "串行号池",

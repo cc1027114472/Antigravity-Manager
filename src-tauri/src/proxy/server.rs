@@ -140,6 +140,7 @@ pub struct AppState {
     pub port: u16,                     // [NEW] 本地监听端口 (v4.0.8 修复)
     pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [FIX Web Mode]
     pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [FIX Web Mode]
+    pub payload_guard: Arc<RwLock<crate::proxy::config::PayloadGuardConfig>>, // [NEW] 请求包体与上下文防护配置
 }
 
 // 为 AppState 实现 FromRef，以便中间件提取 security 状态
@@ -306,6 +307,7 @@ pub struct AxumServer {
     pub token_manager: Arc<TokenManager>, // [NEW] 暴露出 TokenManager 供反代服务复用
     pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [NEW] 代理池配置状态
     pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [NEW] 暴露代理池管理器供命令调用
+    pub payload_guard: Arc<RwLock<crate::proxy::config::PayloadGuardConfig>>, // [NEW] 请求包体与上下文防护配置
 }
 
 impl AxumServer {
@@ -374,6 +376,16 @@ impl AxumServer {
         tracing::info!("User-Agent 配置已热更新: {:?}", config.user_agent_override);
     }
 
+    pub async fn update_payload_guard(&self, config: &crate::proxy::config::ProxyConfig) {
+        let mut guard = self.payload_guard.write().await;
+        *guard = config.payload_guard.clone();
+        tracing::info!(
+            "Payload guard 配置已热更新: enabled={}, max_input_tokens={}",
+            guard.enabled,
+            guard.max_input_tokens
+        );
+    }
+
     pub async fn set_running(&self, running: bool) {
         let mut r = self.is_running.write().await;
         *r = running;
@@ -398,6 +410,7 @@ impl AxumServer {
         integration: crate::modules::integration::SystemManager,
         cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
         proxy_pool_config: crate::proxy::config::ProxyPoolConfig, // [NEW]
+        payload_guard_config: crate::proxy::config::PayloadGuardConfig, // [NEW]
     ) -> Result<(Self, tokio::task::JoinHandle<()>), String> {
         let custom_mapping_state = Arc::new(tokio::sync::RwLock::new(custom_mapping));
         let proxy_state = Arc::new(tokio::sync::RwLock::new(upstream_proxy.clone()));
@@ -437,6 +450,15 @@ impl AxumServer {
         let recovery_cancel = tokio_util::sync::CancellationToken::new();
         let _recovery_handle = auto_recovery.clone().start_loop(recovery_cancel);
 
+        let mut guard_cfg = payload_guard_config.clone();
+        if let Ok(val) = std::env::var("ABV_MAX_INPUT_TOKENS") {
+            if let Ok(limit) = val.parse::<u32>() {
+                guard_cfg.max_input_tokens = limit;
+                guard_cfg.enabled = limit > 0;
+            }
+        }
+        let payload_guard_state = Arc::new(RwLock::new(guard_cfg));
+
         let state = AppState {
             token_manager: token_manager.clone(),
             auto_recovery: auto_recovery.clone(),
@@ -464,13 +486,14 @@ impl AxumServer {
             port,
             proxy_pool_state: proxy_pool_state.clone(),
             proxy_pool_manager: proxy_pool_manager.clone(),
+            payload_guard: payload_guard_state.clone(),
         };
 
         // 构建路由 - 使用新架构的 handlers！
         use crate::proxy::handlers;
         use crate::proxy::middleware::{
             admin_auth_middleware, auth_middleware, cors_layer, ip_filter_middleware,
-            monitor_middleware, service_status_middleware,
+            monitor_middleware, payload_guard_middleware, service_status_middleware,
         };
 
         // 1. 构建主 AI 代理路由 (遵循 auth_mode 配置)
@@ -549,8 +572,8 @@ impl AxumServer {
             .route("/v1/api/event_logging", post(silent_ok_handler))
             // 应用 AI 服务特定的层
             // 注意：Axum layer 执行顺序是从下往上（洋葱模型）
-            // 请求: ip_filter -> auth -> monitor -> handler
-            // 响应: handler -> monitor -> auth -> ip_filter
+            // 请求: ip_filter -> payload_guard -> auth -> monitor -> handler
+            // 响应: handler -> monitor -> auth -> payload_guard -> ip_filter
             // monitor 需要在 auth 之后执行才能获取 UserTokenIdentity
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -559,6 +582,10 @@ impl AxumServer {
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                payload_guard_middleware,
             ))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -898,6 +925,7 @@ impl AxumServer {
             token_manager: token_manager.clone(),
             proxy_pool_state,
             proxy_pool_manager,
+            payload_guard: payload_guard_state.clone(),
         };
 
         // 在新任务中启动服务器
@@ -1572,6 +1600,12 @@ async fn admin_save_config(
     {
         let mut pool = state.proxy_pool_state.write().await;
         *pool = new_config.clone().proxy.proxy_pool;
+    }
+
+    // 更新 payload guard 配置
+    {
+        let mut guard = state.payload_guard.write().await;
+        *guard = new_config.clone().proxy.payload_guard;
     }
 
     // 串行号池 + 调度 + preferred 热更新

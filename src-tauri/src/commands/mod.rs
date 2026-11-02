@@ -468,6 +468,11 @@ pub async fn save_config(
             .axum_server
             .update_proxy_pool(config.proxy.proxy_pool.clone())
             .await;
+        // [NEW] 更新 Payload Guard 配置
+        instance
+            .axum_server
+            .update_payload_guard(&config.proxy)
+            .await;
         // 更新熔断配置
         instance
             .token_manager

@@ -717,12 +717,11 @@ function Settings() {
                                             <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{t('settings.account.auto_refresh_desc')}</p>
                                         </div>
                                     </div>
-                                    <label className={`relative inline-flex items-center ${formData.quota_protection.enabled ? 'cursor-not-allowed opacity-80' : 'cursor-pointer'}`}>
+                                    <label className="relative inline-flex items-center cursor-pointer">
                                         <input
                                             type="checkbox"
                                             className="sr-only peer"
                                             checked={formData.auto_refresh}
-                                            disabled={formData.quota_protection.enabled}
                                             onChange={async (e) => {
                                                 const enabled = e.target.checked;
                                                 const newConfig = { ...formData, auto_refresh: enabled };
@@ -735,7 +734,7 @@ function Settings() {
                                                 }
                                             }}
                                         />
-                                        <div className={`w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500 shadow-inner ${formData.quota_protection.enabled ? 'peer-checked:bg-blue-500' : ''}`}></div>
+                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500 shadow-inner"></div>
                                     </label>
                                 </div>
 
@@ -817,17 +816,9 @@ function Settings() {
                                 <QuotaProtection
                                     config={formData.quota_protection}
                                     onChange={async (newConfig) => {
-                                        const updates: any = {
-                                            quota_protection: newConfig
-                                        };
-                                        // 联动逻辑：开启配额保护时，强制开启后台自动刷新 (不仅仅是预热)
-                                        if (newConfig.enabled) {
-                                            updates.auto_refresh = true;
-                                        }
-
                                         const newFormData = {
                                             ...formData,
-                                            ...updates
+                                            quota_protection: newConfig
                                         };
                                         setFormData(newFormData);
 
@@ -1301,7 +1292,7 @@ function Settings() {
                                         // to prevent race conditions where old memory state rolls back new manual changes
                                         if (!silent) {
                                             // Hot reload: save immediately for manual changes
-                                            saveConfig({ ...updatedFormData, auto_refresh: true })
+                                            saveConfig(updatedFormData)
                                                 .then(() => {
                                                     console.log('Proxy config saved');
                                                 })

@@ -1858,12 +1858,12 @@ impl TokenManager {
         now_ts >= t.timestamp - Self::OAUTH_PRE_REFRESH_WINDOW_SECS
     }
 
-    /// 检查 Token 对 >200KB 超大请求是否处于不安全期：
+    /// 检查 Token 对 Medium/Oversized 请求（>50K tokens 或 >200KB）是否处于不安全期：
     /// 1. 距离过期 <= 120s（即将/已过期，禁止大包撞在途刷新）；
-    /// 2. Token 签发未满 60 秒（新签发 Token 预热期，禁止新 Token 早期直接承接 >200KB 超大请求）。
+    /// 2. Token 签发未满 60 秒（新签发 Token 预热期，禁止新 Token 早期直接承接 >50K tokens / >200KB 请求）。
     /// 注：通过 (t.timestamp - t.expires_in) 倒推签发时刻，对重启免疫、全刷新路径天然统一！
     #[inline]
-    fn token_unsafe_for_oversize(t: &ProxyToken, now_ts: i64) -> bool {
+    fn token_unsafe_for_medium_or_oversized(t: &ProxyToken, now_ts: i64) -> bool {
         if Self::token_needs_oauth_refresh(t, now_ts) {
             return true;
         }
@@ -2005,28 +2005,59 @@ impl TokenManager {
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "⚠️ [TokenManager] 账号 {} 后台新 Token loadCodeAssist 握手失败: {}，冷却 30s",
-                                latest.email,
-                                e
-                            );
-                            bg_cooldown.insert(
-                                latest.account_id.clone(),
-                                std::time::Instant::now() + std::time::Duration::from_secs(30),
-                            );
+                            let is_forbidden = e.contains("403")
+                                || e.contains("TOS_VIOLATION")
+                                || e.contains("PERMISSION_DENIED")
+                                || e.contains("disabled in this account");
+                            if is_forbidden {
+                                tracing::error!(
+                                    "🚫 [TokenManager] 账号 {} 后台新 Token loadCodeAssist 发现已被 Google 封禁 (403/TOS_VIOLATION)，立即标记 forbidden 并从号池移除: {}",
+                                    latest.email,
+                                    e
+                                );
+                                let _ = crate::modules::account::mark_account_forbidden(&latest.account_id, &e);
+                                tokens_map.remove(&latest.account_id);
+                                bg_cooldown.remove(&latest.account_id);
+                            } else {
+                                tracing::warn!(
+                                    "⚠️ [TokenManager] 账号 {} 后台新 Token loadCodeAssist 握手失败: {}，冷却 30s",
+                                    latest.email,
+                                    e
+                                );
+                                bg_cooldown.insert(
+                                    latest.account_id.clone(),
+                                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                                );
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "⚠️ [TokenManager] 账号 {} 后台 OAuth 刷新失败: {}，触发 30s 失败冷却防风暴",
-                        latest.email,
-                        e
-                    );
-                    bg_cooldown.insert(
-                        latest.account_id.clone(),
-                        std::time::Instant::now() + std::time::Duration::from_secs(30),
-                    );
+                    let err_str = e.to_string();
+                    let is_revoked = err_str.contains("403")
+                        || err_str.contains("invalid_grant")
+                        || err_str.contains("account disabled")
+                        || err_str.contains("Token has been expired or revoked");
+                    if is_revoked {
+                        tracing::error!(
+                            "🚫 [TokenManager] 账号 {} 后台 OAuth 刷新凭证失效/被拒，立即标记 forbidden 并从号池移除: {}",
+                            latest.email,
+                            err_str
+                        );
+                        let _ = crate::modules::account::mark_account_forbidden(&latest.account_id, &err_str);
+                        tokens_map.remove(&latest.account_id);
+                        bg_cooldown.remove(&latest.account_id);
+                    } else {
+                        tracing::warn!(
+                            "⚠️ [TokenManager] 账号 {} 后台 OAuth 刷新失败: {}，触发 30s 失败冷却防风暴",
+                            latest.email,
+                            e
+                        );
+                        bg_cooldown.insert(
+                            latest.account_id.clone(),
+                            std::time::Instant::now() + std::time::Duration::from_secs(30),
+                        );
+                    }
                 }
             }
         });
@@ -2423,6 +2454,20 @@ impl TokenManager {
                     let _ = self.save_project_id(&token.account_id, &pid).await;
                 }
                 Err(e) => {
+                    let is_forbidden = e.contains("403")
+                        || e.contains("TOS_VIOLATION")
+                        || e.contains("PERMISSION_DENIED")
+                        || e.contains("disabled in this account");
+                    if is_forbidden {
+                        tracing::error!(
+                            "🚫 [TokenManager] 账号 {} 新 Token loadCodeAssist 握手检测到 Google 403 封号，立即标记 forbidden 并移除: {}",
+                            token.email,
+                            e
+                        );
+                        let _ = self.set_forbidden(&token.account_id, &e).await;
+                        return Err(format!("Account forbidden during loadCodeAssist handshake: {}", e));
+                    }
+
                     tracing::warn!(
                         "⚠️ [TokenManager] 账号 {} 新 Token loadCodeAssist 握手失败: {}，代理隧道异常，标记 RED 并中止换号",
                         token.email,
@@ -2548,11 +2593,11 @@ impl TokenManager {
                     continue;
                 }
 
-                // 铁律：当请求为 >200KB 超大包且候选账号 OAuth Token 处于不安全期（临期 <=120s 或新签发未满 60s）时，
+                // 铁律：当请求为 Medium/Oversized（>50K tokens 或 >200KB）且候选账号 OAuth Token 处于不安全期（临期 <=120s 或新签发未满 60s）时，
                 // 路由层严禁选它执行在途刷新 + 首包裸发大包：
                 // - 若 Token 临期：触发后台安全刷新与 40B 握手预热（受 30s 失败退避保护）；
                 // - 直接跳过该账号，改选拥有已预热稳定 Token 的健康账号！
-                if footprint.is_oversized() && Self::token_unsafe_for_oversize(t, now_ts) {
+                if footprint.is_medium_or_oversized() && Self::token_unsafe_for_medium_or_oversized(t, now_ts) {
                     if Self::token_needs_oauth_refresh(t, now_ts) {
                         self.spawn_background_oauth_refresh_and_warmup(t.clone());
                     }
@@ -2560,7 +2605,7 @@ impl TokenManager {
                         &mut shortest_reject,
                         15,
                         format!(
-                            "Account {} refreshing/warming up OAuth token before >200K request",
+                            "Account {} refreshing/warming up OAuth token before Medium/Oversized (>50K/200KB) request",
                             t.email
                         ),
                     );
@@ -2775,7 +2820,7 @@ impl TokenManager {
             }
 
             let now_ts = chrono::Utc::now().timestamp();
-            if footprint.is_oversized() && Self::token_unsafe_for_oversize(candidate, now_ts) {
+            if footprint.is_medium_or_oversized() && Self::token_unsafe_for_medium_or_oversized(candidate, now_ts) {
                 if Self::token_needs_oauth_refresh(candidate, now_ts) {
                     self.spawn_background_oauth_refresh_and_warmup((*candidate).clone());
                 }
@@ -2785,7 +2830,7 @@ impl TokenManager {
                         shortest_reject = Some((
                             15,
                             format!(
-                                "Serial candidate {} warming up OAuth token before >200K request",
+                                "Serial candidate {} warming up OAuth token before Medium/Oversized (>50K/200KB) request",
                                 candidate.email
                             ),
                         ))
@@ -3026,11 +3071,11 @@ impl TokenManager {
                                     target_model,
                                 );
                             let now_ts = chrono::Utc::now().timestamp();
-                            let needs_oversize_refresh_skip = footprint.is_oversized()
-                                && Self::token_unsafe_for_oversize(&preferred_token, now_ts);
+                            let needs_oversize_refresh_skip = footprint.is_medium_or_oversized()
+                                && Self::token_unsafe_for_medium_or_oversized(&preferred_token, now_ts);
                             if needs_oversize_refresh_skip {
                                 tracing::info!(
-                                    "🔒 [Preferred Account] {} OAuth token expiring or warming up before >200K request, falling back to pool",
+                                    "🔒 [Preferred Account] {} OAuth token expiring or warming up before Medium/Oversized (>50K/200KB) request, falling back to pool",
                                     preferred_token.email
                                 );
                                 if Self::token_needs_oauth_refresh(&preferred_token, now_ts) {
@@ -3143,14 +3188,21 @@ impl TokenManager {
                                     target_model
                                 );
                                 self.session_accounts.remove(sid);
-                            } else if footprint.is_oversized()
-                                && Self::token_unsafe_for_oversize(
+                            } else if self.pacer.is_heat_saturated(acc_id) {
+                                tracing::info!(
+                                    "Sticky Session: Bound account {} is heat-saturated ({:.2} >= threshold), unbinding before request to route to cold account.",
+                                    bound_token.email,
+                                    self.pacer.get_account_heat(acc_id)
+                                );
+                                self.session_accounts.remove(sid);
+                            } else if footprint.is_medium_or_oversized()
+                                && Self::token_unsafe_for_medium_or_oversized(
                                     bound_token,
                                     chrono::Utc::now().timestamp(),
                                 )
                             {
                                 tracing::info!(
-                                    "Sticky Session: Pre-unbinding {} before >200K request because OAuth token is expiring or warming up (<60s); switching to active account.",
+                                    "Sticky Session: Pre-unbinding {} before Medium/Oversized (>50K/200KB) request because OAuth token is expiring or warming up (<60s); switching to active account.",
                                     bound_token.email
                                 );
                                 self.session_accounts.remove(sid);
@@ -3261,8 +3313,8 @@ impl TokenManager {
                                     target_model,
                                 );
                             let is_warm = self.pacer.is_heat_saturated(&found.account_id);
-                            let needs_oversize_refresh_skip = footprint.is_oversized()
-                                && Self::token_unsafe_for_oversize(
+                            let needs_oversize_refresh_skip = footprint.is_medium_or_oversized()
+                                && Self::token_unsafe_for_medium_or_oversized(
                                     found,
                                     chrono::Utc::now().timestamp(),
                                 );
@@ -7416,6 +7468,12 @@ mod tests {
             std::env::set_var("ABV_DATA_DIR", &tmp_root);
             TestEnvGuard("ABV_DATA_DIR")
         };
+        let mut app_cfg = crate::models::AppConfig::new();
+        app_cfg.quota_ledger.sprint_capacity_cu = 500.0;
+        app_cfg.quota_ledger.marathon_capacity_cu = 1500.0;
+        app_cfg.quota_ledger.conservative_multiplier = 1.25;
+        let _ = crate::modules::config::save_app_config(&app_cfg);
+
         let account_id = "acc_micro";
         let email = "micro@test.com";
         let now = chrono::Utc::now().timestamp();
@@ -7538,6 +7596,7 @@ mod tests {
             let rem_5h = t.pending_cu_5h.get("claude").copied().unwrap();
             let rem_w = t.pending_cu_weekly.get("claude").copied().unwrap();
             assert!((rem_5h - 0.0).abs() < 1e-6, "expected 0.0, got {}", rem_5h);
+            let rem_w = t.pending_cu_weekly.get("claude").copied().unwrap();
             assert!((rem_w - 0.0).abs() < 1e-6, "expected 0.0, got {}", rem_w);
         }
 
@@ -7563,7 +7622,7 @@ mod tests {
                     "access_token": format!("atk-{}", id),
                     "refresh_token": format!("rtk-{}", id),
                     "expires_in": 3600,
-                    "expiry_timestamp": now + 3600,
+                    "expiry_timestamp": now + 3000,
                     "project_id": "test-project"
                 },
                 "disabled": false,
@@ -7587,8 +7646,8 @@ mod tests {
         manager.load_accounts().await.unwrap();
 
         let sid = Some("client-session-alpha");
-        // 模拟现网 260KB 大请求 (>200KB -> Oversized)
-        let fp_oversize = RequestFootprint::new(61_000, 260_575);
+        // 模拟超大请求 (>100K tokens 或 >400KB -> Oversized)
+        let fp_oversize = RequestFootprint::new(120_000, 450 * 1024);
 
         // 第 1 个 >200KB 请求：分配某冷账号并建立粘性绑定
         let mut acq1 = manager
@@ -7790,8 +7849,8 @@ mod tests {
             .session_accounts
             .insert("sess-oversize".to_string(), "acc_expiring".to_string());
 
-        // Send >200KB Oversized request -> router MUST pre-unbind acc_expiring and route to acc_active!
-        let fp_oversize = RequestFootprint::new(65_000, 244 * 1024);
+        // Send Medium/Oversized (>50K tokens or >200KB) request -> router MUST pre-unbind acc_expiring and route to acc_active!
+        let fp_oversize = RequestFootprint::new(120_000, 450 * 1024);
         let mut acq = manager
             .acquire_token_with_lease(
                 "claude",
@@ -7801,11 +7860,11 @@ mod tests {
                 fp_oversize,
             )
             .await
-            .expect("Oversized request must skip expiring token account and pick active account");
+            .expect("Medium/Oversized request must skip expiring token account and pick active account");
 
         assert_eq!(
             acq.account_id, "acc_active",
-            "Router must never use an expired/expiring OAuth token account for a >200KB request"
+            "Router must never use an expired/expiring OAuth token account for a Medium/Oversized request"
         );
         assert_eq!(
             manager.session_accounts.get("sess-oversize").map(|v| v.clone()),
@@ -7861,7 +7920,7 @@ mod tests {
         manager.pacer = Arc::new(crate::proxy::rate_limit::HumanizedPacer::new_warmed());
         manager.load_accounts().await.unwrap();
 
-        // 1. Normal/Medium request should be allowed on acc_fresh (or both)
+        // 1. Normal request (<=50K tokens and <=200KB) should be allowed on acc_fresh (or both)
         let fp_normal = RequestFootprint::new(15_000, 30 * 1024);
         let mut acq_norm = manager
             .acquire_token_with_lease(
@@ -7875,8 +7934,8 @@ mod tests {
             .expect("Normal request should succeed");
         acq_norm.lease_guard.abort_and_rollback();
 
-        // 2. Oversized (>200KB) request MUST skip acc_fresh and select acc_warmed
-        let fp_oversize = RequestFootprint::new(65_000, 244 * 1024);
+        // 2. Medium/Oversized (>50K tokens or >200KB) request MUST skip acc_fresh (<60s) and select acc_warmed
+        let fp_oversize = RequestFootprint::new(120_000, 450 * 1024);
         let mut acq_over = manager
             .acquire_token_with_lease(
                 "claude",
@@ -7886,10 +7945,10 @@ mod tests {
                 fp_oversize,
             )
             .await
-            .expect("Oversized request should succeed by picking warmed account");
+            .expect("Medium/Oversized request should succeed by picking warmed account");
         assert_eq!(
             acq_over.account_id, "acc_warmed",
-            "Oversized request must skip newly minted token (<60s) and pick warmed account"
+            "Medium/Oversized request must skip newly minted token (<60s) and pick warmed account"
         );
         acq_over.lease_guard.abort_and_rollback();
 

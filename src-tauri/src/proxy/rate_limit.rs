@@ -60,32 +60,39 @@ pub const STICKY_MAX_SLOT_WAIT_MS: u64 = 2000;
 /// 全号池均处于冷却延迟中时，兜底允许预约等待最短冷却槽位的最大毫秒数
 pub const FALLBACK_MAX_SLOT_WAIT_MS: u64 = 5000;
 
-/// 流量分级物理字节与 Token 边界
-pub const MEDIUM_BODY_BYTES: usize = 100 * 1024;
-pub const OVERSIZE_BODY_BYTES: usize = 200 * 1024;
-pub const MEDIUM_TOKENS: u32 = 100_000;
-pub const OVERSIZE_TOKENS: u32 = 200_000;
+/// 流量分级物理字节与 Token 边界（按 1 Token ≈ 4 Bytes 严格对齐）
+pub const LIGHT_MEDIUM_TOKENS: u32 = 30_000; // 30K tokens（轻度微加热度门槛）
+pub const MEDIUM_BODY_BYTES: usize = 200 * 1024; // 200 KB
+pub const OVERSIZE_BODY_BYTES: usize = 400 * 1024; // 400 KB
+pub const MEDIUM_TOKENS: u32 = 50_000; // 50K tokens
+pub const HEAVY_TOKENS: u32 = 80_000; // 80K tokens
+pub const OVERSIZE_TOKENS: u32 = 100_000; // 100K tokens
 
-/// 热度半衰期：600 秒（10 分钟）指数衰减，防止 3 分钟内衰减过快放进第 3 个大包
-const HEAT_HALF_LIFE_SECS: f64 = 600.0;
+/// 热度半衰期：从 600 秒调整为 200 秒 (~3.3 分钟) 指数衰减，加快账号自然静默降温
+const HEAT_HALF_LIFE_SECS: f64 = 200.0;
 
-/// 超大请求（>200K）10 分钟滑动时间窗硬上限：任意 600 秒内严格 < 3 个（最多允许 2 个）
+/// 超大请求（>100K tokens 或 >400KB）10 分钟滑动时间窗硬上限：任意 600 秒内严格 < 3 个（最多允许 2 个）
 pub const OVERSIZE_WINDOW_SECS: u64 = 600;
 pub const MAX_OVERSIZE_IN_WINDOW: usize = 2;
 
 /// OAuth Token 刚刷新后的大包保护期（60 秒）：
-/// 新签发的 ya29 Access Token 前 60 秒内严禁直接承接 >200KB 超大请求，仅允许 loadCodeAssist 握手与中小请求热身
+/// 新签发的 ya29 Access Token 前 60 秒内严禁直接承接 Medium/Oversized（>50K tokens 或 >200KB）请求，
+/// 仅允许 loadCodeAssist (40B) 握手与 Normal（<=50K tokens 且 <=200KB）轻量请求热身
 pub const TOKEN_REFRESH_WARMUP_OVERSIZE_SECS: u64 = 60;
 
 /// 各分级单次热度增量：
-/// - Normal (<=100K): +0.0
-/// - Medium (100K~200K, 含 130K): +0.5
-/// - Oversized (>200K): +1.5
-const MEDIUM_HEAT_INCREMENT: f64 = 0.5;
+/// - Normal (<30K tokens): +0.0
+/// - Light-Medium (30K~50K tokens): +0.08 (微加热度)
+/// - Medium (50K~80K tokens): +0.35
+/// - Heavy (80K~100K tokens): +0.8
+/// - Oversized (>100K tokens): +1.5
+pub const LIGHT_MEDIUM_HEAT_INCREMENT: f64 = 0.08;
+const MEDIUM_HEAT_INCREMENT: f64 = 0.35;
+const HEAVY_HEAT_INCREMENT: f64 = 0.8;
 const OVERSIZE_HEAT_INCREMENT: f64 = 1.5;
 
-/// 超大请求（>200K）准入红线：推演热度 (current_heat + 1.5) >= 3.0 即拒绝进入该账号。
-/// 保证单账号在短时间窗口内承接 >200K 的请求严格少于 3 个（最多允许 2 个：1.5 -> ~2.9 < 3.0，第 3 个 >= 3.0 进门前拦截换号）。
+/// 超大请求（>100K tokens 或 >400KB）准入红线：推演热度 (current_heat + 1.5) >= 3.0 即拒绝进入该账号。
+/// 保证单账号在短时间窗口内承接 >100K 的请求严格少于 3 个（最多允许 2 个：1.5 -> ~2.9 < 3.0，第 3 个 >= 3.0 进门前拦截换号）。
 pub const OVERSIZE_HEAT_CAP: f64 = 3.0;
 
 /// 冷号池优选线：Heat < 1.5 视为清凉账号，在自由选号（P2C）中享受最高优先级
@@ -104,11 +111,11 @@ pub fn remaining_recovery_hold_secs_for_tier(elapsed_secs: u64, tier: TrafficTie
 /// 请求流量四级分级（L1 日常轻量 / L2 中大请求 / L3 超大高危；L4 为账号轮次微小憩）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficTier {
-    /// <= 100KB 且 < 100K tokens：低延迟（0.8s~1.8s），热度 +0.0，占用 1 槽
+    /// <= 200KB 且 < 50K tokens：低延迟（0.8s~1.8s），热度 +0.0，占用 1 槽
     Normal,
-    /// (100KB..=200KB) 或 [100K..=200K] tokens（含 130K 典型请求）：少量延迟（2.0s~3.8s），热度 +0.5，占用 1 槽
+    /// (200KB..=400KB) 或 [50K..=100K] tokens：少量延迟（2.0s~3.8s），热度 +0.5，占用 1 槽
     Medium,
-    /// > 200KB 或 > 200K tokens：充分冷却（8.0s~15.0s），热度 +1.5（短时严格 < 3 个），独占全部并发槽（与小请求互斥）
+    /// > 400KB 或 > 100K tokens：充分冷却（8.0s~15.0s），热度 +1.5（短时严格 < 3 个），独占全部并发槽（与小请求互斥）
     Oversized,
 }
 
@@ -142,15 +149,30 @@ impl RequestFootprint {
         }
     }
 
+    #[inline]
     pub fn is_oversized(&self) -> bool {
         self.tier == TrafficTier::Oversized
     }
 
+    #[inline]
+    pub fn is_medium_or_oversized(&self) -> bool {
+        self.tier != TrafficTier::Normal
+    }
+
     pub fn heat_increment(&self) -> f64 {
-        match self.tier {
-            TrafficTier::Normal => 0.0,
-            TrafficTier::Medium => MEDIUM_HEAT_INCREMENT,
-            TrafficTier::Oversized => OVERSIZE_HEAT_INCREMENT,
+        let tokens = self.prompt_tokens;
+        let bytes = self.raw_body_len;
+
+        if tokens >= OVERSIZE_TOKENS || bytes > OVERSIZE_BODY_BYTES {
+            OVERSIZE_HEAT_INCREMENT
+        } else if tokens >= HEAVY_TOKENS || bytes > 320 * 1024 {
+            HEAVY_HEAT_INCREMENT
+        } else if tokens >= MEDIUM_TOKENS || bytes > MEDIUM_BODY_BYTES {
+            MEDIUM_HEAT_INCREMENT
+        } else if tokens >= LIGHT_MEDIUM_TOKENS || bytes > 120 * 1024 {
+            LIGHT_MEDIUM_HEAT_INCREMENT
+        } else {
+            0.0
         }
     }
 }
@@ -256,7 +278,7 @@ pub struct AccountPacerState {
     pub request_counter: u64,
     /// 当前小憩周期内已累计的对话轮数
     pub turns_since_nap: u64,
-    /// 本周期触发强制小憩的目标轮数（每次休眠后重新随机抽取 20..=30）
+    /// 本周期触发强制小憩的目标轮数（每次休眠后重新随机抽取 15..=25）
     pub next_nap_threshold: u64,
     /// 当前波段基础间隔 (ms)
     pub current_interval_ms: u64,
@@ -278,7 +300,7 @@ impl AccountPacerState {
     pub fn new_default(account_id: &str, now: std::time::Instant, slot_count: usize) -> Self {
         use rand::Rng;
         let n = slot_count.max(1);
-        let next_nap_threshold = rand::thread_rng().gen_range(20..=30);
+        let next_nap_threshold = rand::thread_rng().gen_range(15..=25);
         Self {
             last_request_time: now,
             last_response_completed_at: None,
@@ -403,10 +425,21 @@ impl HumanizedPacer {
 
     /// 检查账号是否处于拟人化微休眠中 (Micro-Nap)
     pub fn is_in_nap(&self, account_id: &str) -> bool {
-        if let Some(entry) = self.account_states.get(account_id) {
+        if let Some(mut entry) = self.account_states.get_mut(account_id) {
             if let Some(nap) = entry.nap_until {
-                if std::time::Instant::now() < nap {
+                let now = std::time::Instant::now();
+                if now < nap {
                     return true;
+                } else {
+                    // 小憩 3~6 分钟结束：热度与疲劳轮数彻底清零，满血复活
+                    entry.nap_until = None;
+                    entry.massive_heat = 0.0;
+                    entry.turns_since_nap = 0;
+                    entry.last_heat_updated_at = now;
+                    tracing::info!(
+                        "[HumanizedPacer] Account {} finished nap (3-6m), heat and turns fully reset to 0.",
+                        account_id
+                    );
                 }
             }
         }
@@ -415,11 +448,16 @@ impl HumanizedPacer {
 
     /// 获取账号剩余的拟人化微休眠秒数（若不在休眠中则返回 None）
     pub fn get_nap_remaining_seconds(&self, account_id: &str) -> Option<u64> {
-        if let Some(entry) = self.account_states.get(account_id) {
+        if let Some(mut entry) = self.account_states.get_mut(account_id) {
             if let Some(nap_until) = entry.nap_until {
                 let now = std::time::Instant::now();
                 if now < nap_until {
                     return Some(((nap_until - now).as_millis() as u64 + 999) / 1000);
+                } else {
+                    entry.nap_until = None;
+                    entry.massive_heat = 0.0;
+                    entry.turns_since_nap = 0;
+                    entry.last_heat_updated_at = now;
                 }
             }
         }
@@ -479,9 +517,17 @@ impl HumanizedPacer {
         }
     }
 
-    /// 账号热度是否达到清凉池分界线 (Heat >= 1.5)
+    /// 账号热度是否达到清凉池分界线 (Heat >= 1.5，整点敏感期 XX:05~XX:15 降为 1.0 提前避险)
     pub fn is_heat_saturated(&self, account_id: &str) -> bool {
-        self.get_account_heat(account_id) >= COLD_POOL_HEAT_THRESHOLD
+        let current_heat = self.get_account_heat(account_id);
+        use chrono::Timelike;
+        let current_minute = chrono::Utc::now().minute();
+        let threshold = if (5..=15).contains(&current_minute) {
+            1.0
+        } else {
+            COLD_POOL_HEAT_THRESHOLD
+        };
+        current_heat >= threshold
     }
 
     /// 推演给定请求进入后账号的合成热度
@@ -749,17 +795,17 @@ impl HumanizedPacer {
     }
 
     /// 检查进程级冷启动、专属代理恢复期与新 OAuth Token 保护期对请求的限制：
-    /// - 进程冷启动前 60s：仅拦截 Oversized 请求突刺；
+    /// - 进程冷启动前 60s：拦截 Medium 与 Oversized 请求突刺；
     /// - 专属代理从 RED 恢复 GREEN：
     ///   1. 前 60s（静默期）：拦截所有流量（Normal / Medium / Oversized），确保代理网络彻底稳定后再发包；
     ///   2. 60..180s（预热期）：放行 Normal 轻量流量热身，拦截 Medium 和 Oversized 请求；
-    /// - OAuth Token 刚刷新后前 60s：放行 Normal / Medium 流量，拦截 Oversized（>200K）超大请求。
+    /// - OAuth Token 刚刷新后前 60s：放行 Normal 流量，拦截 Medium（>50K/200KB）与 Oversized（>100K/400KB）超大请求。
     pub fn check_global_or_egress_hold(
         &self,
         account_id: &str,
         footprint: RequestFootprint,
     ) -> Option<LeaseRejectReason> {
-        if footprint.is_oversized() {
+        if footprint.is_medium_or_oversized() {
             let uptime_secs = self.started_at.elapsed().as_secs();
             if uptime_secs < COLD_START_WARMUP_SECS {
                 let remain = (COLD_START_WARMUP_SECS - uptime_secs).max(5);
@@ -818,6 +864,9 @@ impl HumanizedPacer {
                     });
                 } else {
                     entry.nap_until = None;
+                    entry.massive_heat = 0.0;
+                    entry.turns_since_nap = 0;
+                    entry.last_heat_updated_at = now;
                 }
             }
 
@@ -912,6 +961,9 @@ impl HumanizedPacer {
                 });
             } else {
                 entry.nap_until = None;
+                entry.massive_heat = 0.0;
+                entry.turns_since_nap = 0;
+                entry.last_heat_updated_at = now;
             }
         }
 
@@ -1051,18 +1103,23 @@ impl HumanizedPacer {
         }
 
         let mut entered_nap = false;
-        if entry.turns_since_nap >= entry.next_nap_threshold {
+        let is_overheated_fatigued = entry.turns_since_nap >= 10 && entry.massive_heat >= 2.0;
+        let is_turn_exhausted = entry.turns_since_nap >= entry.next_nap_threshold;
+        if is_overheated_fatigued || is_turn_exhausted {
             let mut rng = rand::thread_rng();
-            let nap_secs = rng.gen_range(120..=300);
+            // 小憩时间 3 ~ 6 分钟 (180 ~ 360 秒)
+            let nap_secs = rng.gen_range(180..=360);
             entry.nap_until = Some(ready_at + Duration::from_secs(nap_secs));
             entry.turns_since_nap = 0;
-            entry.next_nap_threshold = rng.gen_range(20..=30);
+            entry.next_nap_threshold = rng.gen_range(15..=25);
             entered_nap = true;
             tracing::info!(
-                "[HumanizedPacer] Account {} reached turn quota, entering micro-nap for {}s (next cycle: {} turns)",
+                "[HumanizedPacer] Account {} entering nap for {}s (reason: high_heat_fatigue={}, turns={}, heat={:.2})",
                 account_id,
                 nap_secs,
-                entry.next_nap_threshold
+                is_overheated_fatigued,
+                is_turn_exhausted,
+                entry.massive_heat
             );
         }
 
@@ -1266,16 +1323,21 @@ impl HumanizedPacer {
         entry.turns_since_nap += 1;
         entry.rolling_requests.push_back(now);
 
-        if entry.turns_since_nap >= entry.next_nap_threshold {
+        let is_overheated_fatigued = entry.turns_since_nap >= 10 && entry.massive_heat >= 2.0;
+        let is_turn_exhausted = entry.turns_since_nap >= entry.next_nap_threshold;
+        if is_overheated_fatigued || is_turn_exhausted {
             let mut rng = rand::thread_rng();
-            let nap_secs = rng.gen_range(120..=300);
+            // 小憩时间 3 ~ 6 分钟 (180 ~ 360 秒)
+            let nap_secs = rng.gen_range(180..=360);
             entry.nap_until = Some(now + Duration::from_secs(nap_secs));
             entry.turns_since_nap = 0;
-            entry.next_nap_threshold = rng.gen_range(20..=30);
+            entry.next_nap_threshold = rng.gen_range(15..=25);
             tracing::info!(
-                "[HumanizedPacer] Account {} entering micro-nap for {}s to prevent quota homogenization",
+                "[HumanizedPacer] Account {} entering nap for {}s (reason: high_heat_fatigue={}, turns={})",
                 account_id,
-                nap_secs
+                nap_secs,
+                is_overheated_fatigued,
+                is_turn_exhausted
             );
         }
     }
@@ -2189,13 +2251,13 @@ mod tests {
         let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
         assert_eq!(info.unwrap().retry_after_sec, 300);
 
-        // 第 3 次 429 → 1800 秒
+        // 第 3 次 429 → 1800 秒（受 300 秒 / 5 分钟上限保护截断为 300 秒）
         let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
-        assert_eq!(info.unwrap().retry_after_sec, 1800);
+        assert_eq!(info.unwrap().retry_after_sec, 300);
 
-        // 第 4 次 429 → 7200 秒
+        // 第 4 次 429 → 7200 秒（受 300 秒上限保护截断为 300 秒）
         let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
-        assert_eq!(info.unwrap().retry_after_sec, 7200);
+        assert_eq!(info.unwrap().retry_after_sec, 300);
     }
 
     #[test]
@@ -2237,13 +2299,13 @@ mod tests {
         let pacer = HumanizedPacer::new_warmed();
         let acc = "test_pacer_acc";
 
-        // 1. L1 Normal (<=100KB 且 <100K tokens)：低延迟 800ms ~ 1800ms
+        // 1. L1 Normal (<=200KB 且 <50K tokens)：低延迟 800ms ~ 1800ms
         pacer.mark_request_completed(acc, Some(20_000));
         let wait = pacer.get_required_wait_ms(acc);
         assert!(wait >= 700 && wait <= 1850, "Normal wait was {}ms", wait);
 
-        // 2. L2 Medium (130K tokens)：少量延迟 2000ms ~ 3800ms
-        pacer.mark_request_completed(acc, Some(130_000));
+        // 2. L2 Medium (50K~100K tokens 或 200KB~400KB)：少量延迟 2000ms ~ 3800ms
+        pacer.mark_request_completed(acc, Some(75_000));
         let wait_medium = pacer.get_required_wait_ms(acc);
         assert!(
             wait_medium >= 1900 && wait_medium <= 3850,
@@ -2251,8 +2313,8 @@ mod tests {
             wait_medium
         );
 
-        // 3. L3 Oversized (>200K tokens)：充分冷却 8000ms ~ 15000ms
-        pacer.mark_request_completed(acc, Some(250_000));
+        // 3. L3 Oversized (>100K tokens 或 >400KB)：充分冷却 8000ms ~ 15000ms
+        pacer.mark_request_completed(acc, Some(150_000));
         let wait_huge = pacer.get_required_wait_ms(acc);
         assert!(
             wait_huge >= 7900 && wait_huge <= 15_100,
@@ -2278,15 +2340,15 @@ mod tests {
         let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
         let acc = "heat_cap_acc";
 
-        // 分级校验：<100KB -> Normal, 130KB -> Medium, >200KB -> Oversized
-        let fp_normal = RequestFootprint::new(25_000, 80 * 1024);
-        let fp_medium = RequestFootprint::new(60_000, 130 * 1024);
-        let fp_oversize = RequestFootprint::new(61_000, 255 * 1024);
+        // 分级校验：<=200KB & <50K -> Normal, 50K~100K 或 200KB~400KB -> Medium, >400KB 或 >100K -> Oversized
+        let fp_normal = RequestFootprint::new(25_000, 100 * 1024);
+        let fp_medium = RequestFootprint::new(75_000, 250 * 1024);
+        let fp_oversize = RequestFootprint::new(120_000, 450 * 1024);
         assert_eq!(fp_normal.tier, TrafficTier::Normal);
         assert_eq!(fp_medium.tier, TrafficTier::Medium);
         assert_eq!(fp_oversize.tier, TrafficTier::Oversized);
 
-        // 第 1 个 >200K 请求：heat 0.0 -> 1.5，放行
+        // 第 1 个 >100K/400KB 请求：heat 0.0 -> 1.5，放行
         let (mut g1, _) = pacer
             .try_acquire_lease(acc, fp_oversize, 2, 0)
             .expect("1st oversized should pass");
@@ -2297,7 +2359,7 @@ mod tests {
         }
         assert!(pacer.get_account_heat(acc) >= 1.45);
 
-        // 第 2 个 >200K 请求：projected ~2.99 < 3.0，放行
+        // 第 2 个 >100K/400KB 请求：projected ~2.99 < 3.0，放行
         let (mut g2, _) = pacer
             .try_acquire_lease(acc, fp_oversize, 2, 0)
             .expect("2nd oversized should pass");
@@ -2307,17 +2369,17 @@ mod tests {
         }
         assert!(pacer.get_account_heat(acc) >= 2.9);
 
-        // 第 3 个 >200K 请求：projected ~4.49 >= 3.0，必须在进门前被 Overheated 拒绝！（严格 < 3 个）
+        // 第 3 个 >100K/400KB 请求：projected ~4.49 >= 3.0，必须在进门前被 Overheated 拒绝！（严格 < 3 个）
         let third = pacer.try_acquire_lease(acc, fp_oversize, 2, 2000);
         assert!(
             matches!(third, Err(LeaseRejectReason::Overheated { .. })),
             "3rd oversized must be rejected pre-admission"
         );
 
-        // 但 130KB 中等请求与 <=100KB 普通请求不受过热硬封锁，仍可正常进入空闲槽
+        // 但 Medium 中等请求与 Normal 普通请求不受过热硬封锁，仍可正常进入空闲槽
         let (mut gm, _) = pacer
             .try_acquire_lease(acc, fp_medium, 2, 0)
-            .expect("Medium 130KB request should still be allowed on warm account");
+            .expect("Medium request should still be allowed on warm account");
         gm.abort_and_rollback();
     }
 
@@ -2389,7 +2451,7 @@ mod tests {
     }
 
     #[test]
-    fn test_turn_based_micro_nap_20_to_30_turns() {
+    fn test_turn_based_micro_nap_15_to_25_turns() {
         let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
         let acc = "nap_turn_acc";
         let fp = RequestFootprint::new(5_000, 10 * 1024);
@@ -2411,13 +2473,51 @@ mod tests {
             }
         }
 
-        let triggered_turn = nap_triggered_at.expect("must trigger micro-nap within 20..=30 turns");
+        let triggered_turn = nap_triggered_at.expect("must trigger micro-nap within 15..=25 turns");
         assert!(
-            (20..=30).contains(&triggered_turn),
-            "nap triggered at turn {}, expected 20..=30",
+            (15..=25).contains(&triggered_turn),
+            "nap triggered at turn {}, expected 15..=25",
             triggered_turn
         );
         assert!(pacer.is_in_nap(acc));
+    }
+
+    #[test]
+    fn test_early_nap_triggered_by_heat_and_turns() {
+        let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
+        let acc = "early_nap_acc";
+        let fp_small = RequestFootprint::new(5_000, 10 * 1024);
+        let fp_heavy = RequestFootprint::new(85_000, 300 * 1024); // Heavy: heat increment +0.8
+
+        // Run 9 small turns
+        for _ in 1..=9 {
+            if let Some(mut entry) = pacer.account_states.get_mut(acc) {
+                entry.slots = vec![SlotPhase::Free; 2];
+                entry.rolling_requests.clear();
+            }
+            let (mut guard, entered_nap) = pacer
+                .try_acquire_lease(acc, fp_small, 2, 0)
+                .expect("should admit");
+            guard.complete();
+            assert!(!entered_nap, "should not enter nap before 10 turns");
+        }
+
+        // Set heat to 1.3 (below saturation threshold 1.5)
+        if let Some(mut entry) = pacer.account_states.get_mut(acc) {
+            entry.massive_heat = 1.3;
+            entry.slots = vec![SlotPhase::Free; 2];
+            entry.rolling_requests.clear();
+        }
+
+        // 10th turn with fp_heavy (+0.8 heat) -> massive_heat = 1.3 + 0.8 = 2.1 >= 2.0
+        // turns_since_nap = 10 >= 10
+        // Should trigger early nap!
+        let (mut guard, entered_nap) = pacer
+            .try_acquire_lease(acc, fp_heavy, 2, 0)
+            .expect("should admit 10th turn");
+        guard.complete();
+        assert!(entered_nap, "10th turn with heat >= 2.0 must trigger early nap");
+        assert!(pacer.is_in_nap(acc), "account must be in nap state");
     }
 
     #[test]
@@ -2461,7 +2561,7 @@ mod tests {
     fn test_oversize_10min_window_blocks_3rd_even_after_3min() {
         let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
         let acc = "win10m_acc";
-        let fp_oversize = RequestFootprint::new(65_000, 250 * 1024);
+        let fp_oversize = RequestFootprint::new(120_000, 450 * 1024);
 
         // Admit 2 oversized requests
         let (mut g1, _) = pacer
@@ -2493,40 +2593,44 @@ mod tests {
     }
 
     #[test]
-    fn test_oauth_token_refresh_warmup_blocks_oversized_allows_normal_and_medium() {
+    fn test_oauth_token_refresh_warmup_blocks_medium_and_oversized_allows_normal() {
         let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
         let acc = "fresh_oauth_acc";
         let fp_normal = RequestFootprint::new(15_000, 30 * 1024);
-        let fp_medium = RequestFootprint::new(130_000, 140 * 1024);
-        let fp_oversize = RequestFootprint::new(65_000, 240 * 1024);
+        let fp_medium = RequestFootprint::new(75_000, 250 * 1024);
+        let fp_oversize = RequestFootprint::new(120_000, 450 * 1024);
 
         // Mark account as having just refreshed its OAuth token
         pacer.note_oauth_refreshed(acc);
 
-        // Oversized (>200KB) must be blocked during 60s TokenRefreshWarmup
+        // Oversized (>100K/400KB) and Medium (>50K/200KB) must be blocked during 60s TokenRefreshWarmup
         assert!(matches!(
             pacer.try_acquire_lease(acc, fp_oversize, 2, 2000),
             Err(LeaseRejectReason::TokenRefreshWarmup { .. })
         ));
+        assert!(matches!(
+            pacer.try_acquire_lease(acc, fp_medium, 2, 2000),
+            Err(LeaseRejectReason::TokenRefreshWarmup { .. })
+        ));
 
-        // Normal and Medium are allowed during the 60s warmup
+        // Normal (<=50K and <=200KB) is allowed during the 60s warmup for handshakes and initial traffic
         let (mut g_norm, _) = pacer
             .try_acquire_lease(acc, fp_normal, 2, 0)
             .expect("Normal tier must be allowed after OAuth refresh");
         g_norm.complete();
         pacer.test_clear_slot_cooldowns(acc);
 
-        let (mut g_med, _) = pacer
-            .try_acquire_lease(acc, fp_medium, 2, 0)
-            .expect("Medium tier must be allowed after OAuth refresh");
-        g_med.complete();
-        pacer.test_clear_slot_cooldowns(acc);
-
-        // Simulate 61s elapsed since OAuth refresh -> Oversized now allowed
+        // Simulate 61s elapsed since OAuth refresh -> Medium and Oversized now allowed
         if let Some(mut entry) = pacer.account_states.get_mut(acc) {
             entry.last_oauth_refresh_at =
                 Some(std::time::Instant::now() - Duration::from_secs(61));
         }
+        let (mut g_med, _) = pacer
+            .try_acquire_lease(acc, fp_medium, 2, 0)
+            .expect("Medium must be allowed after 60s OAuth warmup expires");
+        g_med.complete();
+        pacer.test_clear_slot_cooldowns(acc);
+
         let (mut g_over, _) = pacer
             .try_acquire_lease(acc, fp_oversize, 2, 0)
             .expect("Oversized must be allowed after 60s OAuth warmup expires");

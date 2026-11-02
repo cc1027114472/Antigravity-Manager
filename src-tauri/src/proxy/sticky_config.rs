@@ -13,7 +13,7 @@ pub enum SchedulingMode {
 
 impl Default for SchedulingMode {
     fn default() -> Self {
-        Self::Balance
+        Self::CacheFirst
     }
 }
 
@@ -30,8 +30,8 @@ pub struct StickySessionConfig {
 impl Default for StickySessionConfig {
     fn default() -> Self {
         Self {
-            mode: SchedulingMode::Balance,
-            max_wait_seconds: 60,
+            mode: SchedulingMode::CacheFirst,
+            max_wait_seconds: 300,
         }
     }
 }

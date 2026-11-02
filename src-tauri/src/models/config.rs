@@ -532,7 +532,7 @@ impl AppConfig {
         Self {
             language: "zh".to_string(),
             theme: "system".to_string(),
-            auto_refresh: true,
+            auto_refresh: false,
             refresh_interval: 15,
             auto_sync: false,
             sync_interval: 5,
