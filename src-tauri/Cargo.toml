@@ -87,3 +87,8 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
 tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = "off"
+codegen-units = 16

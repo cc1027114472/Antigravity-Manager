@@ -2034,54 +2034,60 @@ impl TokenManager {
                         return;
                     }
 
-                    let settle_ms: u64 = {
-                        use rand::Rng;
-                        rand::thread_rng().gen_range(600..=1100)
-                    };
-                    tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+                    // [NATIVE ALIGNMENT] 仿原生反重力：仅在 project_id 确实缺失时才发起 loadCodeAssist 握手
+                    let has_pid = latest.project_id.as_ref().map_or(false, |p| !p.trim().is_empty());
+                    if !has_pid {
+                        let settle_ms: u64 = {
+                            use rand::Rng;
+                            rand::thread_rng().gen_range(600..=1100)
+                        };
+                        tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
 
-                    match crate::proxy::project_resolver::fetch_project_id(
-                        &new_access_token,
-                        Some(&latest.account_id),
-                    )
-                    .await
-                    {
-                        Ok(pid) => {
-                            if let Some(mut entry) = tokens_map.get_mut(&latest.account_id) {
-                                entry.project_id = Some(pid);
-                            }
-                            bg_cooldown.remove(&latest.account_id);
-                            tracing::info!(
-                                "✅ [TokenManager] 账号 {} 后台新 Token 已完成 loadCodeAssist (40B) 首包预热握手",
-                                latest.email
-                            );
-                        }
-                        Err(e) => {
-                            let is_forbidden = e.contains("403")
-                                || e.contains("TOS_VIOLATION")
-                                || e.contains("PERMISSION_DENIED")
-                                || e.contains("disabled in this account");
-                            if is_forbidden {
-                                tracing::error!(
-                                    "🚫 [TokenManager] 账号 {} 后台新 Token loadCodeAssist 发现已被 Google 封禁 (403/TOS_VIOLATION)，立即标记 forbidden 并从号池移除: {}",
-                                    latest.email,
-                                    e
-                                );
-                                let _ = crate::modules::account::mark_account_forbidden(&latest.account_id, &e);
-                                tokens_map.remove(&latest.account_id);
+                        match crate::proxy::project_resolver::fetch_project_id(
+                            &new_access_token,
+                            Some(&latest.account_id),
+                        )
+                        .await
+                        {
+                            Ok(pid) => {
+                                if let Some(mut entry) = tokens_map.get_mut(&latest.account_id) {
+                                    entry.project_id = Some(pid);
+                                }
                                 bg_cooldown.remove(&latest.account_id);
-                            } else {
-                                tracing::warn!(
-                                    "⚠️ [TokenManager] 账号 {} 后台新 Token loadCodeAssist 握手失败: {}，冷却 30s",
-                                    latest.email,
-                                    e
-                                );
-                                bg_cooldown.insert(
-                                    latest.account_id.clone(),
-                                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                                tracing::info!(
+                                    "✅ [TokenManager] 账号 {} 后台新 Token 补齐 project_id 成功",
+                                    latest.email
                                 );
                             }
+                            Err(e) => {
+                                let is_forbidden = e.contains("403")
+                                    || e.contains("TOS_VIOLATION")
+                                    || e.contains("PERMISSION_DENIED")
+                                    || e.contains("disabled in this account");
+                                if is_forbidden {
+                                    tracing::error!(
+                                        "🚫 [TokenManager] 账号 {} 后台 loadCodeAssist 发现已被 Google 封禁 (403/TOS_VIOLATION)，立即标记 forbidden 并从号池移除: {}",
+                                        latest.email,
+                                        e
+                                    );
+                                    let _ = crate::modules::account::mark_account_forbidden(&latest.account_id, &e);
+                                    tokens_map.remove(&latest.account_id);
+                                    bg_cooldown.remove(&latest.account_id);
+                                } else {
+                                    tracing::warn!(
+                                        "⚠️ [TokenManager] 账号 {} 后台 loadCodeAssist 失败: {}，冷却 30s",
+                                        latest.email,
+                                        e
+                                    );
+                                    bg_cooldown.insert(
+                                        latest.account_id.clone(),
+                                        std::time::Instant::now() + std::time::Duration::from_secs(30),
+                                    );
+                                }
+                            }
                         }
+                    } else {
+                        bg_cooldown.remove(&latest.account_id);
                     }
                 }
                 Err(e) => {
@@ -2394,104 +2400,109 @@ impl TokenManager {
         mut token: ProxyToken,
     ) -> Result<(ProxyToken, String), String> {
         let now = chrono::Utc::now().timestamp();
-        let mut did_inband_oauth_refresh = false;
+        let needs_oauth = Self::token_needs_oauth_refresh(&token, now);
+        let has_pid = token.project_id.as_ref().map_or(false, |s| !s.trim().is_empty());
+
+        // 快路径（Fast-Path）：Token 依然有效且具备 project_id，零锁开销直接放行
+        if !needs_oauth && has_pid {
+            let pid = token.project_id.clone().unwrap();
+            return Ok((token, pid));
+        }
+
+        // 慢路径（Slow-Path）：进入账号专属异步互斥锁，确保并发下仅有 1 个协程执行刷新
+        let refresh_mu = self
+            .refresh_locks
+            .entry(token.account_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = refresh_mu.lock().await;
+
+        // Double-Checked Locking：持锁二次检查最新内存缓存
+        if let Some(latest) = self.tokens.get(&token.account_id).map(|r| r.clone()) {
+            let latest_needs_oauth = Self::token_needs_oauth_refresh(&latest, now);
+            let latest_has_pid = latest.project_id.as_ref().map_or(false, |s| !s.trim().is_empty());
+            if !latest_needs_oauth && latest_has_pid {
+                return Ok((latest.clone(), latest.project_id.unwrap()));
+            }
+            token = latest;
+        }
+
+        // 1. 若确实需要刷新 OAuth Token，执行标准 OAuth 换发
         if Self::token_needs_oauth_refresh(&token, now) {
-            let refresh_mu = self
-                .refresh_locks
-                .entry(token.account_id.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone();
-            let _guard = refresh_mu.lock().await;
+            let refresh_start = std::time::Instant::now();
+            match crate::modules::oauth::refresh_access_token(
+                &token.refresh_token,
+                Some(&token.account_id),
+            )
+            .await
+            {
+                Ok(token_response) => {
+                    let refresh_ms = refresh_start.elapsed().as_millis() as u64;
+                    let refreshed_at = chrono::Utc::now().timestamp();
+                    token.access_token = token_response.access_token.clone();
+                    token.expires_in = token_response.expires_in;
+                    token.timestamp = refreshed_at + token_response.expires_in;
+                    if let Some(rt) = token_response.refresh_token.clone() {
+                        token.refresh_token = rt;
+                    }
+                    if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
+                        entry.access_token = token.access_token.clone();
+                        entry.expires_in = token.expires_in;
+                        entry.timestamp = token.timestamp;
+                        entry.refresh_token = token.refresh_token.clone();
+                    }
+                    let _ = self
+                        .save_refreshed_token(&token.account_id, &token_response)
+                        .await;
 
-            let latest_token_opt = self.tokens.get(&token.account_id).map(|r| r.clone());
-            if let Some(latest) = latest_token_opt {
-                if !Self::token_needs_oauth_refresh(&latest, now) {
-                    token = latest;
-                } else {
-                    let refresh_start = std::time::Instant::now();
-                    match crate::modules::oauth::refresh_access_token(
-                        &token.refresh_token,
-                        Some(&token.account_id),
-                    )
-                    .await
-                    {
-                        Ok(token_response) => {
-                            let refresh_ms = refresh_start.elapsed().as_millis() as u64;
-                            let refreshed_at = chrono::Utc::now().timestamp();
-                            token.access_token = token_response.access_token.clone();
-                            token.expires_in = token_response.expires_in;
-                            token.timestamp = refreshed_at + token_response.expires_in;
-                            if let Some(rt) = token_response.refresh_token.clone() {
-                                token.refresh_token = rt;
-                            }
-                            if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
-                                entry.access_token = token.access_token.clone();
-                                entry.expires_in = token.expires_in;
-                                entry.timestamp = token.timestamp;
-                                entry.refresh_token = token.refresh_token.clone();
-                            }
-                            let _ = self
-                                .save_refreshed_token(&token.account_id, &token_response)
-                                .await;
+                    // 登记新 Token 60s 大包保护期
+                    self.pacer.note_oauth_refreshed(&token.account_id);
 
-                            // 登记新 Token 60s 大包保护期（前 60s 禁止承接 >200KB 超大请求）
-                            self.pacer.note_oauth_refreshed(&token.account_id);
-
-                            // 若 OAuth 刷新本身耗时 > 3000ms，说明当前绑定的代理隧道正处于剧烈高延迟抖动期：
-                            // 保存好新 Token 后立即将该代理置 RED 并放弃本次选号，切换其他健康账号承接本次推理请求！
-                            if refresh_ms > 3000 {
-                                tracing::warn!(
-                                    "⚠️ [TokenManager] 账号 {} 在途 OAuth 刷新耗时高达 {}ms (>3000ms)，代理隧道不稳定，已保存新 Token 并主动置 RED 换号",
-                                    token.email,
-                                    refresh_ms
-                                );
-                                if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                                    if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
-                                        pool.mark_proxy_unhealthy(&cfg.entry_id).await;
-                                    }
-                                }
-                                return Err(format!(
-                                    "OAuth refresh latency too high ({}ms > 3000ms), aborting to switch account",
-                                    refresh_ms
-                                ));
+                    if refresh_ms > 3000 {
+                        tracing::warn!(
+                            "⚠️ [TokenManager] 账号 {} 在途 OAuth 刷新耗时高达 {}ms (>3000ms)，代理隧道不稳定，已保存新 Token 并主动置 RED 换号",
+                            token.email,
+                            refresh_ms
+                        );
+                        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                            if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
+                                pool.mark_proxy_unhealthy(&cfg.entry_id).await;
                             }
-                            did_inband_oauth_refresh = true;
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                "Token 刷新失败 ({}): {}，准备回滚租约并尝试下一个账号",
-                                token.email,
-                                e
-                            );
-                            if e.contains("\"invalid_grant\"") || e.contains("invalid_grant") {
-                                let _ = self
-                                    .disable_account(
-                                        &token.account_id,
-                                        &format!("invalid_grant: {}", e),
-                                    )
-                                    .await;
-                            } else if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                                if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
-                                    pool.mark_proxy_unhealthy(&cfg.entry_id).await;
-                                }
-                            }
-                            return Err(format!("Token refresh failed: {}", e));
+                        return Err(format!(
+                            "OAuth refresh latency too high ({}ms > 3000ms), aborting to switch account",
+                            refresh_ms
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Token 刷新失败 ({}): {}，准备回滚租约并尝试下一个账号",
+                        token.email,
+                        e
+                    );
+                    if e.contains("\"invalid_grant\"") || e.contains("invalid_grant") {
+                        let _ = self
+                            .disable_account(
+                                &token.account_id,
+                                &format!("invalid_grant: {}", e),
+                            )
+                            .await;
+                    } else if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                        if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
+                            pool.mark_proxy_unhealthy(&cfg.entry_id).await;
                         }
                     }
+                    return Err(format!("Token refresh failed: {}", e));
                 }
             }
         }
 
-        // 在途刚完成 OAuth Token 刷新后：
-        // 1. 先停顿 600ms~1100ms，强制发送一次 40B `v1internal:loadCodeAssist` 官方客户端握手作为新 Token 的第 1 个包；
-        // 2. 握手完成后再停顿 800ms~1400ms，严禁新 Token 的首包直接裸发业务推理请求！
-        if did_inband_oauth_refresh {
-            let pre_handshake_ms: u64 = {
-                use rand::Rng;
-                rand::thread_rng().gen_range(600..=1100)
-            };
-            tokio::time::sleep(std::time::Duration::from_millis(pre_handshake_ms)).await;
-
+        // 2. [NATIVE ALIGNMENT] 仿原生反重力：仅当 project_id 缺失时才按需调用一次 loadCodeAssist 握手
+        let existing_pid = token.project_id.as_deref().filter(|s| !s.trim().is_empty()).map(|s| s.to_string());
+        let project_id = if let Some(pid) = existing_pid {
+            pid
+        } else {
             match crate::proxy::project_resolver::fetch_project_id(
                 &token.access_token,
                 Some(&token.account_id),
@@ -2504,6 +2515,7 @@ impl TokenManager {
                         entry.project_id = Some(pid.clone());
                     }
                     let _ = self.save_project_id(&token.account_id, &pid).await;
+                    pid
                 }
                 Err(e) => {
                     let is_forbidden = e.contains("403")
@@ -2512,73 +2524,14 @@ impl TokenManager {
                         || e.contains("disabled in this account");
                     if is_forbidden {
                         tracing::error!(
-                            "🚫 [TokenManager] 账号 {} 新 Token loadCodeAssist 握手检测到 Google 403 封号，立即标记 forbidden 并移除: {}",
+                            "🚫 [TokenManager] 账号 {} loadCodeAssist 握手检测到 Google 403 封号，立即标记 forbidden 并移除: {}",
                             token.email,
                             e
                         );
                         let _ = self.set_forbidden(&token.account_id, &e).await;
                         return Err(format!("Account forbidden during loadCodeAssist handshake: {}", e));
                     }
-
-                    tracing::warn!(
-                        "⚠️ [TokenManager] 账号 {} 新 Token loadCodeAssist 握手失败: {}，代理隧道异常，标记 RED 并中止换号",
-                        token.email,
-                        e
-                    );
-                    if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                        if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
-                            pool.mark_proxy_unhealthy(&cfg.entry_id).await;
-                        }
-                    }
-                    return Err(format!("New token loadCodeAssist handshake failed: {}", e));
-                }
-            }
-
-            let post_handshake_ms: u64 = {
-                use rand::Rng;
-                rand::thread_rng().gen_range(800..=1400)
-            };
-            tracing::info!(
-                "⏳ [TokenManager] 账号 {} 已完成新 Token loadCodeAssist 首包握手，呼吸停顿 {}ms 后再发送推理请求",
-                token.email,
-                post_handshake_ms
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(post_handshake_ms)).await;
-        }
-
-        let project_id = token.project_id.clone().filter(|s| !s.is_empty());
-        let project_id = if let Some(pid) = project_id {
-            pid
-        } else {
-            let refresh_mu = self
-                .refresh_locks
-                .entry(token.account_id.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone();
-            let _guard = refresh_mu.lock().await;
-
-            let cached = self
-                .tokens
-                .get(&token.account_id)
-                .and_then(|t| t.project_id.clone())
-                .filter(|s| !s.is_empty());
-            if let Some(pid) = cached {
-                pid
-            } else {
-                match crate::proxy::project_resolver::fetch_project_id(
-                    &token.access_token,
-                    Some(&token.account_id),
-                )
-                .await
-                {
-                    Ok(pid) => {
-                        if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
-                            entry.project_id = Some(pid.clone());
-                        }
-                        let _ = self.save_project_id(&token.account_id, &pid).await;
-                        pid
-                    }
-                    Err(_) => "bamboo-precept-lgxtn".to_string(),
+                    "bamboo-precept-lgxtn".to_string()
                 }
             }
         };
