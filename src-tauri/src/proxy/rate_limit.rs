@@ -71,6 +71,9 @@ pub const OVERSIZE_TOKENS: u32 = 100_000; // 100K tokens
 /// 热度半衰期：从 600 秒调整为 200 秒 (~3.3 分钟) 指数衰减，加快账号自然静默降温
 const HEAT_HALF_LIFE_SECS: f64 = 200.0;
 
+/// 单账号 60 秒滑动窗口请求上限（严格限制最多 5 次/分钟，达到后触发冷却并换号）
+pub const ACCOUNT_MAX_REQUESTS_PER_MINUTE: usize = 5;
+
 /// 超大请求（>100K tokens 或 >400KB）10 分钟滑动时间窗硬上限：任意 600 秒内严格 < 3 个（最多允许 2 个）
 pub const OVERSIZE_WINDOW_SECS: u64 = 600;
 pub const MAX_OVERSIZE_IN_WINDOW: usize = 2;
@@ -270,7 +273,7 @@ pub struct AccountPacerState {
     pub last_response_completed_at: Option<std::time::Instant>,
     /// 下一次允许发起请求的最早时间点 (兼容单槽查询)
     pub next_allowed_request_at: std::time::Instant,
-    /// 过去 60 秒内的请求时间戳历史（用于滚动 60s RPM，单号上限 10 次）
+    /// 过去 60 秒内的请求时间戳历史（用于滚动 60s RPM，单号上限 ACCOUNT_MAX_REQUESTS_PER_MINUTE 次）
     pub rolling_requests: std::collections::VecDeque<std::time::Instant>,
     /// 过去 600 秒（10 分钟）内的超大请求（>200K）时间戳历史（严格限制 < 3 个，即最多 2 个）
     pub oversized_history: std::collections::VecDeque<std::time::Instant>,
@@ -603,7 +606,7 @@ impl HumanizedPacer {
         }
     }
 
-    /// 计算滚动 60s RPM 所需等待毫秒数（单账号 60 秒上限 10 次）
+    /// 计算滚动 60s RPM 所需等待毫秒数（单账号 60 秒上限 ACCOUNT_MAX_REQUESTS_PER_MINUTE 次，超限触发冷却换号）
     fn clean_and_compute_rpm_wait_ms(entry: &mut AccountPacerState, now: std::time::Instant) -> u64 {
         let cutoff = now.checked_sub(Duration::from_secs(60)).unwrap_or(now);
         while let Some(&front) = entry.rolling_requests.front() {
@@ -614,7 +617,7 @@ impl HumanizedPacer {
             }
         }
 
-        if entry.rolling_requests.len() >= 10 {
+        if entry.rolling_requests.len() >= ACCOUNT_MAX_REQUESTS_PER_MINUTE {
             if let Some(&oldest) = entry.rolling_requests.front() {
                 if now >= oldest {
                     let elapsed = now.duration_since(oldest).as_millis() as u64;
@@ -2322,12 +2325,12 @@ mod tests {
             wait_huge
         );
 
-        // 4. 模拟 10 次请求打满 60s 滚动 RPM
+        // 4. 模拟 ACCOUNT_MAX_REQUESTS_PER_MINUTE 次请求打满 60s 滚动 RPM
         let now = std::time::Instant::now();
         if let Some(mut entry) = pacer.account_states.get_mut(acc) {
             entry.next_allowed_request_at = now; // 清空冷却以便测试 RPM
             entry.rolling_requests.clear();
-            for _ in 0..10 {
+            for _ in 0..ACCOUNT_MAX_REQUESTS_PER_MINUTE {
                 entry.rolling_requests.push_back(now);
             }
         }
@@ -2635,5 +2638,28 @@ mod tests {
             .try_acquire_lease(acc, fp_oversize, 2, 0)
             .expect("Oversized must be allowed after 60s OAuth warmup expires");
         g_over.complete();
+    }
+
+    #[test]
+    fn test_rolling_rpm_5_cap_and_rejection() {
+        let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
+        let acc = "rpm5_acc";
+        let fp_small = RequestFootprint::new(10_000, 20 * 1024);
+
+        // 连续进入 5 个请求（中间清空槽位冷却以专注测试 60s RPM 门禁）
+        for i in 1..=5 {
+            let (mut g, _) = pacer
+                .try_acquire_lease(acc, fp_small, 2, 0)
+                .unwrap_or_else(|e| panic!("Request #{} should pass RPM check: {:?}", i, e));
+            g.complete();
+            pacer.test_clear_slot_cooldowns(acc);
+        }
+
+        // 第 6 个请求在 60s 窗口内到来：必须被 CooldownTooLong 拒绝（wait > 2000ms），触发上层切号！
+        let sixth = pacer.try_acquire_lease(acc, fp_small, 2, STICKY_MAX_SLOT_WAIT_MS);
+        assert!(
+            matches!(sixth, Err(LeaseRejectReason::CooldownTooLong { wait_ms }) if wait_ms > 2000),
+            "6th request within 60s must be rejected by RPM cap"
+        );
     }
 }

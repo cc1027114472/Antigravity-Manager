@@ -2,7 +2,7 @@
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -98,6 +98,9 @@ pub struct TokenManager {
     rate_limit_tracker: Arc<RateLimitTracker>, // 新增: 限流跟踪器
     sticky_config: Arc<tokio::sync::RwLock<StickySessionConfig>>, // 新增：调度配置
     session_accounts: Arc<DashMap<String, String>>, // 新增：会话与账号映射 (SessionID -> AccountID)
+    /// 记录每个账号最近一次服务的活跃会话及其时间戳 (AccountID -> (SessionID, Instant))
+    /// 用于新会话选号时的“60 秒软排他”分流，防止多个不同 Session 在 1 分钟内密集挤占同一个账号
+    account_active_sessions: Arc<DashMap<String, (String, std::time::Instant)>>,
     preferred_account_id: Arc<tokio::sync::RwLock<Option<String>>>, // [FIX #820] 优先使用的账号ID（固定账号模式）
     health_scores: Arc<DashMap<String, f32>>,                       // account_id -> health_score
     circuit_breaker_config: Arc<tokio::sync::RwLock<crate::models::CircuitBreakerConfig>>, // [NEW] 熔断配置缓存
@@ -152,6 +155,7 @@ impl TokenManager {
             rate_limit_tracker: Arc::new(RateLimitTracker::new()),
             sticky_config: Arc::new(tokio::sync::RwLock::new(StickySessionConfig::default())),
             session_accounts: Arc::new(DashMap::new()),
+            account_active_sessions: Arc::new(DashMap::new()),
             preferred_account_id: Arc::new(tokio::sync::RwLock::new(None)), // [FIX #820]
             health_scores: Arc::new(DashMap::new()),
             circuit_breaker_config: Arc::new(tokio::sync::RwLock::new(
@@ -442,6 +446,7 @@ impl TokenManager {
         self.clear_rate_limit(account_id);
         self.cancel_auto_recovery(account_id);
         self.session_accounts.retain(|_, v| v != account_id);
+        self.unbind_account_session(account_id);
         if let Ok(mut preferred) = self.preferred_account_id.try_write() {
             if preferred.as_deref() == Some(account_id) {
                 *preferred = None;
@@ -1845,6 +1850,34 @@ impl TokenManager {
             .count()
     }
 
+    /// 检查指定账号是否在最近 60 秒内正被其他异己 Session 占用（用于新会话软排他分流）
+    pub fn is_account_session_busy(&self, account_id: &str, current_sid: Option<&str>) -> bool {
+        if let Some(entry) = self.account_active_sessions.get(account_id) {
+            let (bound_sid, last_active) = entry.value();
+            if last_active.elapsed().as_secs() < 60 {
+                if let Some(sid) = current_sid {
+                    return bound_sid.as_str() != sid;
+                } else {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 登记/刷新账号当前绑定的活跃会话时间戳
+    pub fn record_account_session_activity(&self, account_id: &str, session_id: &str) {
+        self.account_active_sessions.insert(
+            account_id.to_string(),
+            (session_id.to_string(), std::time::Instant::now()),
+        );
+    }
+
+    /// 解绑账号的活跃会话记录（如遇到 429、小憩、禁用或过热换号）
+    pub fn unbind_account_session(&self, account_id: &str) {
+        self.account_active_sessions.remove(account_id);
+    }
+
     /// P2C 算法的候选池大小 - 从前 N 个最优候选中随机选择
     const P2C_POOL_SIZE: usize = 5;
 
@@ -2544,6 +2577,7 @@ impl TokenManager {
         target_model: &str,
         quota_protection_enabled: bool,
         footprint: RequestFootprint,
+        session_id: Option<&str>,
     ) -> (
         Option<(ProxyToken, SlotLeaseGuard, bool)>,
         Option<(u64, String)>,
@@ -2641,10 +2675,24 @@ impl TokenManager {
             }
 
             if !tier1_zero_wait_cold.is_empty() || !tier2_zero_wait_warm.is_empty() {
-                let bucket = if !tier1_zero_wait_cold.is_empty() {
+                let raw_bucket = if !tier1_zero_wait_cold.is_empty() {
                     &tier1_zero_wait_cold
                 } else {
                     &tier2_zero_wait_warm
+                };
+
+                // 软排他优化：优先挑选“过去 60 秒内无异己活跃 Session 占用”的纯净空闲账号
+                let isolated_candidates: Vec<(&ProxyToken, f64, usize)> = raw_bucket
+                    .iter()
+                    .copied()
+                    .filter(|(t, _, _)| !self.is_account_session_busy(&t.account_id, session_id))
+                    .collect();
+
+                let bucket = if !isolated_candidates.is_empty() {
+                    &isolated_candidates
+                } else {
+                    // 全池候选账号在最近 60 秒内均有活跃 Session 时，降级共享
+                    raw_bucket
                 };
 
                 let chosen = if bucket.len() == 1 {
@@ -2668,24 +2716,30 @@ impl TokenManager {
                     } else if f1 != f2 {
                         if f1 > f2 { c1 } else { c2 }
                     } else {
-                        let s1 = self.bound_session_count(&c1.account_id);
-                        let s2 = self.bound_session_count(&c2.account_id);
-                        if s1 != s2 {
-                            if s1 < s2 { c1 } else { c2 }
+                        let b1 = self.is_account_session_busy(&c1.account_id, session_id);
+                        let b2 = self.is_account_session_busy(&c2.account_id, session_id);
+                        if b1 != b2 {
+                            if !b1 { c1 } else { c2 }
                         } else {
-                            let q1 = c1
-                                .model_quotas
-                                .get(billing_target)
-                                .copied()
-                                .or(c1.remaining_quota)
-                                .unwrap_or(0);
-                            let q2 = c2
-                                .model_quotas
-                                .get(billing_target)
-                                .copied()
-                                .or(c2.remaining_quota)
-                                .unwrap_or(0);
-                            if q1 >= q2 { c1 } else { c2 }
+                            let s1 = self.bound_session_count(&c1.account_id);
+                            let s2 = self.bound_session_count(&c2.account_id);
+                            if s1 != s2 {
+                                if s1 < s2 { c1 } else { c2 }
+                            } else {
+                                let q1 = c1
+                                    .model_quotas
+                                    .get(billing_target)
+                                    .copied()
+                                    .or(c1.remaining_quota)
+                                    .unwrap_or(0);
+                                let q2 = c2
+                                    .model_quotas
+                                    .get(billing_target)
+                                    .copied()
+                                    .or(c2.remaining_quota)
+                                    .unwrap_or(0);
+                                if q1 >= q2 { c1 } else { c2 }
+                            }
                         }
                     }
                 };
@@ -2865,9 +2919,11 @@ impl TokenManager {
                             if entered_nap {
                                 self.session_accounts
                                     .retain(|_, v| v != &refreshed.account_id);
+                                self.unbind_account_session(&refreshed.account_id);
                             } else if let Some(sid) = session_id {
                                 self.session_accounts
                                     .insert(sid.to_string(), refreshed.account_id.clone());
+                                self.record_account_session_activity(&refreshed.account_id, sid);
                             }
                             return Ok(AcquiredToken {
                                 access_token: refreshed.access_token,
@@ -3104,6 +3160,9 @@ impl TokenManager {
                                                     self.session_accounts.retain(|_, bound_id| {
                                                         bound_id != &refreshed.account_id
                                                     });
+                                                    self.unbind_account_session(&refreshed.account_id);
+                                                } else if let Some(sid) = session_id {
+                                                    self.record_account_session_activity(&refreshed.account_id, sid);
                                                 }
                                                 return Ok(AcquiredToken {
                                                     access_token: refreshed.access_token,
@@ -3233,6 +3292,9 @@ impl TokenManager {
                                         if entered_nap {
                                             // 本轮是触发小憩的最后一轮，立即解绑会话，确保下一轮直接无缝切往新号
                                             self.session_accounts.retain(|_, v| v != acc_id);
+                                            self.unbind_account_session(acc_id);
+                                        } else {
+                                            self.record_account_session_activity(acc_id, sid);
                                         }
                                         selected_with_lease =
                                             Some((bound_token.clone(), guard, entered_nap));
@@ -3282,6 +3344,7 @@ impl TokenManager {
                                             }
                                         }
                                         self.session_accounts.remove(sid);
+                                        self.unbind_account_session(acc_id);
                                     }
                                 }
                             }
@@ -3359,6 +3422,7 @@ impl TokenManager {
                         target_model,
                         quota_protection_enabled,
                         footprint,
+                        session_id,
                     )
                     .await;
                 pool_reject_hint = reject_hint;
@@ -3377,9 +3441,11 @@ impl TokenManager {
                         if entered_nap {
                             self.session_accounts
                                 .retain(|_, v| v != &selected.account_id);
+                            self.unbind_account_session(&selected.account_id);
                         } else if scheduling.mode != SchedulingMode::PerformanceFirst {
                             self.session_accounts
                                 .insert(sid.to_string(), selected.account_id.clone());
+                            self.record_account_session_activity(&selected.account_id, sid);
                             tracing::info!(
                                 "Sticky Session: Bound healthy account {} to session {}",
                                 selected.email,
@@ -3427,6 +3493,7 @@ impl TokenManager {
                                     target_model,
                                     quota_protection_enabled,
                                     footprint,
+                                    session_id,
                                 )
                                 .await;
                             if let Some((selected, guard, entered_nap)) = retry_picked {
@@ -3436,6 +3503,7 @@ impl TokenManager {
                                     {
                                         self.session_accounts
                                             .insert(sid.to_string(), selected.account_id.clone());
+                                        self.record_account_session_activity(&selected.account_id, sid);
                                     }
                                 }
                                 (selected, guard, entered_nap)
@@ -3936,6 +4004,8 @@ impl TokenManager {
                             self.pacer.mark_request_started(&token.account_id);
                             if self.pacer.is_in_nap(&token.account_id) {
                                 self.session_accounts.retain(|_, bound_id| bound_id != &token.account_id);
+                self.unbind_account_session(&token.account_id);
+                                self.unbind_account_session(&token.account_id);
                                 tracing::info!(
                                     "[HumanizedPacer] Preferred account {} entered micro-nap: actively unbound all sticky sessions",
                                     token.email
@@ -4551,6 +4621,7 @@ impl TokenManager {
             self.pacer.mark_request_started(&token.account_id);
             if self.pacer.is_in_nap(&token.account_id) {
                 self.session_accounts.retain(|_, bound_id| bound_id != &token.account_id);
+                self.unbind_account_session(&token.account_id);
                 tracing::info!(
                     "[HumanizedPacer] Account {} entered micro-nap: actively unbound all sticky sessions",
                     token.email
@@ -5295,6 +5366,7 @@ impl TokenManager {
                 true
             }
         });
+        self.unbind_account_session(account_id);
         tracing::warn!(
             "🚫 Account {} proxy-disabled after 429 {:?} and removed from pool",
             account_id,
@@ -6206,6 +6278,7 @@ impl TokenManager {
 
         // Clear sticky session if blocked
         self.session_accounts.retain(|_, v| *v != account_id);
+        self.unbind_account_session(account_id);
 
         let json_str = serde_json::to_string_pretty(&account)
             .map_err(|e| format!("Failed to serialize account JSON: {}", e))?;
@@ -7951,6 +8024,93 @@ mod tests {
             "Medium/Oversized request must skip newly minted token (<60s) and pick warmed account"
         );
         acq_over.lease_guard.abort_and_rollback();
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_session_soft_exclusivity_p2c_isolation() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-exclusivity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, email: &str| {
+            let path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": "test-project"
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "quota": {
+                    "models": [
+                        { "name": "gemini-2.5-pro", "percentage": 100 }
+                    ]
+                },
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        write_account("acc1", "acc1@test.com");
+        write_account("acc2", "acc2@test.com");
+
+        let mut manager = TokenManager::new(tmp_root.clone());
+        manager.pacer = Arc::new(crate::proxy::rate_limit::HumanizedPacer::new_warmed());
+        manager.load_accounts().await.unwrap();
+
+        let fp = RequestFootprint::new(10_000, 20 * 1024);
+
+        // 1. Session A 发起请求，被分配给某个账号（例如 acc1 或 acc2）
+        let mut acq_a = manager
+            .acquire_token_with_lease("gemini", false, Some("session-A"), "gemini-2.5-pro", fp)
+            .await
+            .expect("Session A should acquire lease");
+        let bound_acc_a = acq_a.account_id.clone();
+        acq_a.lease_guard.complete();
+        manager.pacer.test_clear_slot_cooldowns(&bound_acc_a);
+
+        // 验证 session_accounts 与 account_active_sessions 均已正确记录
+        assert_eq!(
+            manager.session_accounts.get("session-A").map(|v| v.clone()),
+            Some(bound_acc_a.clone())
+        );
+        assert!(manager.is_account_session_busy(&bound_acc_a, Some("session-B")));
+        assert!(!manager.is_account_session_busy(&bound_acc_a, Some("session-A")));
+
+        // 2. 紧接着全新的 Session B 在 60 秒内发起请求：
+        // 软排他算法必须将其路由至另一个未被占用的空闲账号，绝不挤在同一个账号上！
+        let mut acq_b = manager
+            .acquire_token_with_lease("gemini", false, Some("session-B"), "gemini-2.5-pro", fp)
+            .await
+            .expect("Session B should acquire lease");
+        let bound_acc_b = acq_b.account_id.clone();
+        acq_b.lease_guard.complete();
+        manager.pacer.test_clear_slot_cooldowns(&bound_acc_b);
+
+        assert_ne!(
+            bound_acc_a, bound_acc_b,
+            "Session B must be isolated to a different cold account, avoiding multi-session interleaving on a single account"
+        );
+
+        // 3. Session A 发起后续请求，正常复用 bound_acc_a
+        let mut acq_a2 = manager
+            .acquire_token_with_lease("gemini", false, Some("session-A"), "gemini-2.5-pro", fp)
+            .await
+            .expect("Session A continuation should succeed");
+        assert_eq!(acq_a2.account_id, bound_acc_a);
+        acq_a2.lease_guard.complete();
 
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
