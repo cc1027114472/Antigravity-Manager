@@ -381,9 +381,9 @@ impl HumanizedPacer {
     }
 
     /// 根据四级流量分级计算响应结束后的槽位冷却延迟（毫秒）：
-    /// - L1 Normal (<=100KB 且 <100K tokens)：低延迟 800ms ~ 1800ms（严格 <= 2000ms，保障粘性对话顺畅）
-    /// - L2 Medium (100K~200K, 含 130K)：少量平滑延迟 2000ms ~ 3800ms
-    /// - L3 Oversized (>200KB 或 >200K tokens)：充分冷却 8000ms ~ 15000ms（期间独占全槽闭合）
+    /// - L1 Normal (<=200KB 且 <50K tokens)：低延迟 800ms ~ 1800ms（保障交互对话顺畅）
+    /// - L2 Medium (200KB~400KB 或 50K~100K tokens)：拟人思考散热延迟 6000ms ~ 12000ms (杜绝 2~3 秒大包机枪连击被 Google TOS 封号)
+    /// - L3 Oversized (>400KB 或 >100K tokens)：充分物理冷却 12000ms ~ 22000ms（期间独占全槽闭合，强行分流下一发请求）
     pub fn compute_footprint_cooldown_ms(footprint: RequestFootprint) -> u64 {
         use rand::Rng;
         let mut rng = rand::thread_rng();
@@ -395,8 +395,10 @@ impl HumanizedPacer {
                     rng.gen_range(1100..=1800)
                 }
             }
-            TrafficTier::Medium => rng.gen_range(2000..=3800),
-            TrafficTier::Oversized => rng.gen_range(8000..=15_000),
+            // 5万~10万 Tokens 的大包请求，必须留出至少 6~12 秒的拟人思考与散热时间，迫使短时连续连击自动分流至池中其他健康账号
+            TrafficTier::Medium => rng.gen_range(6000..=12000),
+            // >10万 Tokens 极重计算，必须严格保持 12~22 秒充分冷却
+            TrafficTier::Oversized => rng.gen_range(12000..=22_000),
         }
     }
 

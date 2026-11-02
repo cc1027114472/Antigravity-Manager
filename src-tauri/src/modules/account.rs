@@ -891,6 +891,11 @@ fn internal_add_account(
     let mut account = Account::new(account_id.clone(), email.clone(), token);
     account.name = name.clone();
 
+    // [STRICT DEVICE ISOLATION] 新建/导入账号时，立即生成唯一的官方标准设备指纹并持久化，一个账号有且仅有一个永久设备指纹
+    if account.device_profile.is_none() {
+        account.device_profile = Some(crate::modules::device::generate_profile());
+    }
+
     // Save account data
     save_account(&account)?;
 

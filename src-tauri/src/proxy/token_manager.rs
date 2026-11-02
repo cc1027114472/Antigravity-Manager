@@ -88,6 +88,8 @@ pub struct ProxyToken {
     pub model_limits: HashMap<String, u64>, // [NEW] max_output_tokens per model from quota data
     /// Per-account concurrency override (None/0 = inherit global).
     pub max_concurrency: Option<u32>,
+    /// [STRICT DEVICE ISOLATION] 该账号专属固定的设备指纹（有且仅有一个）
+    pub device_profile: Option<crate::models::DeviceProfile>,
 }
 
 pub struct TokenManager {
@@ -885,6 +887,22 @@ impl TokenManager {
             }
         }
 
+        // [STRICT DEVICE ISOLATION] 读取或自愈补齐账号设备指纹：确保每个账号有且仅有一个永久设备指纹
+        let device_profile: Option<crate::models::DeviceProfile> = {
+            if let Some(dp_val) = account.get("device_profile").filter(|v| !v.is_null()) {
+                serde_json::from_value(dp_val.clone()).ok()
+            } else {
+                // 若存量历史账号缺失指纹，现场调用官方标准算法生成，并持久化回写磁盘
+                let new_dp = crate::modules::device::generate_profile();
+                account["device_profile"] = serde_json::to_value(&new_dp).unwrap_or(serde_json::Value::Null);
+                if let Ok(updated_json) = serde_json::to_string_pretty(&account) {
+                    let _ = std::fs::write(path, updated_json);
+                    tracing::info!("[Fingerprint] Backfilled and persisted unique device profile for account {}", email);
+                }
+                Some(new_dp)
+            }
+        };
+
         Ok(Some(ProxyToken {
             account_id,
             access_token,
@@ -921,6 +939,7 @@ impl TokenManager {
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32)
                 .filter(|&n| n > 0),
+            device_profile,
         }))
     }
 
@@ -6652,6 +6671,7 @@ mod tests {
             pending_cu_weekly: HashMap::new(),
             model_limits: HashMap::new(),
             max_concurrency: None,
+            device_profile: None,
         }
     }
 
@@ -6993,6 +7013,7 @@ mod tests {
             pending_cu_weekly: HashMap::new(),
             model_limits: HashMap::new(),
             max_concurrency: None,
+            device_profile: None,
         }
     }
 

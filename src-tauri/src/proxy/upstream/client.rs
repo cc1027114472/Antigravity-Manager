@@ -80,6 +80,35 @@ pub struct UpstreamClient {
     user_agent_override: RwLock<Option<String>>,
 }
 
+/// [STRICT DEVICE ISOLATION] 获取指定账号绑定且唯一的官方标准设备指纹 (内存缓存加速，确保一个账号有且仅有一个永久设备指纹)
+fn get_or_init_account_device_profile(account_id: &str) -> crate::models::DeviceProfile {
+    static PROFILE_CACHE: once_cell::sync::Lazy<dashmap::DashMap<String, crate::models::DeviceProfile>> =
+        once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+    if let Some(cached) = PROFILE_CACHE.get(account_id) {
+        return cached.clone();
+    }
+
+    // 未命中内存缓存，从持久化账号存储中加载已绑定的指纹
+    let profile = if let Ok(mut account) = crate::modules::account::load_account(account_id) {
+        if let Some(ref dp) = account.device_profile {
+            dp.clone()
+        } else {
+            // 存量历史账号缺失指纹时自愈补齐并持久化存盘
+            let new_dp = crate::modules::device::generate_profile();
+            account.device_profile = Some(new_dp.clone());
+            let _ = crate::modules::account::save_account(&account);
+            new_dp
+        }
+    } else {
+        // 若账号尚未落盘或未找到，调用官方标准算法生成独立指纹
+        crate::modules::device::generate_profile()
+    };
+
+    PROFILE_CACHE.insert(account_id.to_string(), profile.clone());
+    profile
+}
+
 impl UpstreamClient {
     pub fn new(
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
@@ -414,6 +443,7 @@ impl UpstreamClient {
     ///
     /// Initiates a basic network request, supporting multi-endpoint auto-fallback.
     /// [UPDATED] Takes optional account_id for per-account proxy selection.
+
     pub async fn call_v1_internal(
         &self,
         method: &str,
@@ -520,15 +550,22 @@ impl UpstreamClient {
             headers.insert("x-client-version", ver);
         }
 
-        // 2. Device & Session Identity
-        // Machine ID (Persistent)
-        if let Ok(mid) = machine_uid::get() {
-            if let Ok(mid_val) = header::HeaderValue::from_str(&mid) {
-                headers.insert("x-machine-id", mid_val);
-            }
+        // 2. Device & Session Identity (严格使用官方标准 DeviceProfile，保证单账号有且仅有一个专属设备指纹)
+        let (machine_id, session_id) = if let Some(acc_id) = account_id {
+            let dp = get_or_init_account_device_profile(acc_id);
+            let mid = dp.mac_machine_id;
+            let sess = format!("sess-{}", &dp.dev_device_id.replace('-', "")[..24]);
+            (mid, sess)
+        } else {
+            let rand_dp = crate::modules::device::generate_profile();
+            let mid = rand_dp.mac_machine_id;
+            let sess = format!("sess-{}", &rand_dp.dev_device_id.replace('-', "")[..24]);
+            (mid, sess)
+        };
+        if let Ok(mid_val) = header::HeaderValue::from_str(&machine_id) {
+            headers.insert("x-machine-id", mid_val);
         }
-        // Session ID (Per App Launch)
-        if let Ok(sess_val) = header::HeaderValue::from_str(&crate::constants::SESSION_ID) {
+        if let Ok(sess_val) = header::HeaderValue::from_str(&session_id) {
             headers.insert("x-vscode-sessionid", sess_val);
         }
 
