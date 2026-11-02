@@ -135,6 +135,20 @@ pub fn check_time_recovery(account: &mut Account, now: i64) -> bool {
             } else {
                 est.limiting_window = Some("5h".to_string());
             }
+
+            // [FIX P0] 检查并解除受保护模型标记，彻底打破时间自愈死锁闭环
+            // 当恢复后的有效配额高于安全阈值（10%）时，将该计费组从受保护列表中移除
+            let effective = est.percentage;
+            if effective > 10 {
+                let removed_count = account.protected_models.len();
+                account.protected_models.retain(|m| m != billing && !m.starts_with(&format!("{}:", billing)));
+                if account.protected_models.len() < removed_count {
+                    crate::modules::logger::log_info(&format!(
+                        "[QuotaLedger] Account {} billing group {} recovered to {}%: automatically cleared protection lock",
+                        account.email, billing, effective
+                    ));
+                }
+            }
         }
     }
     modified

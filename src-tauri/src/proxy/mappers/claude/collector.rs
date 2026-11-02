@@ -3,6 +3,7 @@
 
 use super::models::*;
 use bytes::Bytes;
+use crate::proxy::mappers::Utf8ChunkBuffer;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::io;
@@ -37,32 +38,65 @@ where
     let mut current_event_type = String::new();
     let mut current_data = String::new();
 
-    // 1. 收集所有 SSE 事件
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| format!("Stream error: {}", e))?;
-        let text = String::from_utf8_lossy(&chunk);
+    // 1. 收集所有 SSE 事件（使用 Utf8ChunkBuffer 防止 TCP 切片截断多字节 UTF-8 字符如中文、Emoji、思维链签名）
+    let mut utf8_buf = Utf8ChunkBuffer::new();
+    let mut line_buffer = String::new();
 
-        for line in text.lines() {
-            if line.is_empty() {
-                // 空行表示事件结束
-                if !current_data.is_empty() {
-                    if let Ok(data) = serde_json::from_str::<Value>(&current_data) {
-                        events.push(SseEvent {
-                            event_type: current_event_type.clone(),
-                            data,
-                        });
-                    }
-                    current_event_type.clear();
-                    current_data.clear();
+    let mut process_line = |line: &str,
+                            current_event_type: &mut String,
+                            current_data: &mut String,
+                            events: &mut Vec<SseEvent>| {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            // 空行表示事件结束
+            if !current_data.is_empty() {
+                if let Ok(data) = serde_json::from_str::<Value>(current_data) {
+                    events.push(SseEvent {
+                        event_type: current_event_type.clone(),
+                        data,
+                    });
                 }
-            } else if let Some((key, value)) = parse_sse_line(line) {
-                match key.as_str() {
-                    "event" => current_event_type = value,
-                    "data" => current_data = value,
-                    _ => {}
-                }
+                current_event_type.clear();
+                current_data.clear();
+            }
+        } else if let Some((key, value)) = parse_sse_line(line) {
+            match key.as_str() {
+                "event" => *current_event_type = value,
+                "data" => *current_data = value,
+                _ => {}
             }
         }
+    };
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| format!("Stream error: {}", e))?;
+        let text_chunk = utf8_buf.push(&chunk);
+        line_buffer.push_str(&text_chunk);
+
+        while let Some(pos) = line_buffer.find('\n') {
+            let line: String = line_buffer.drain(..=pos).collect();
+            process_line(&line, &mut current_event_type, &mut current_data, &mut events);
+        }
+    }
+
+    // 遇到 EOF (流结束) 时做最后的 flush_lossy 保证下游绝不挂起
+    if let Some(lossy_tail) = utf8_buf.flush_lossy() {
+        line_buffer.push_str(&lossy_tail);
+    }
+    if !line_buffer.is_empty() {
+        process_line(&line_buffer, &mut current_event_type, &mut current_data, &mut events);
+        line_buffer.clear();
+    }
+    // 确保末尾事件如果未以空行闭合也能被收集
+    if !current_data.is_empty() {
+        if let Ok(data) = serde_json::from_str::<Value>(&current_data) {
+            events.push(SseEvent {
+                event_type: current_event_type.clone(),
+                data,
+            });
+        }
+        current_event_type.clear();
+        current_data.clear();
     }
 
     // 2. 重建 ClaudeResponse
@@ -279,6 +313,46 @@ mod tests {
 
         if let ContentBlock::Text { text } = &response.content[0] {
             assert_eq!(text, "Hello World");
+        } else {
+            panic!("Expected Text block");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_claude_collector_utf8_fragmentation() {
+        // 模拟多字节中文字符与思维链跨 TCP 切片截断
+        let sse_full = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-7-sonnet","content":[],"stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好世界，这是Claude中文测试！"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+        let full_bytes = sse_full.as_bytes();
+
+        let cut_pos = sse_full.find("世界").unwrap() + 2; // 切在汉字中间
+        let chunk1 = &full_bytes[..cut_pos];
+        let chunk2 = &full_bytes[cut_pos..];
+
+        let byte_stream = stream::iter(vec![
+            Ok::<Bytes, io::Error>(Bytes::copy_from_slice(chunk1)),
+            Ok::<Bytes, io::Error>(Bytes::copy_from_slice(chunk2)),
+        ]);
+
+        let result = collect_stream_to_json(byte_stream).await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        if let ContentBlock::Text { text } = &response.content[0] {
+            assert_eq!(text, "你好世界，这是Claude中文测试！");
         } else {
             panic!("Expected Text block");
         }

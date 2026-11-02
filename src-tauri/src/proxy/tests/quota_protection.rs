@@ -44,6 +44,7 @@ mod tests {
             pending_cu_weekly: std::collections::HashMap::new(),
             model_limits: std::collections::HashMap::new(),
             max_concurrency: None,
+            device_profile: None,
         }
     }
 
@@ -1130,6 +1131,7 @@ mod tests {
             pending_cu_weekly: std::collections::HashMap::new(),
             model_limits: std::collections::HashMap::new(),
             max_concurrency: None,
+            device_profile: None,
         }
     }
 }

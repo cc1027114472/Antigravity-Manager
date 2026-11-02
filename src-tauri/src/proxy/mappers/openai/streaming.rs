@@ -114,7 +114,8 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
-    let mut buffer = BytesMut::new();
+    let mut utf8_buf = crate::proxy::mappers::Utf8ChunkBuffer::new();
+    let mut line_buffer = String::new();
     let stream_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created_ts = Utc::now().timestamp();
 
@@ -135,11 +136,12 @@ where
                 item = gemini_stream.next() => {
                     match item {
                         Some(Ok(bytes)) => {
-                            buffer.extend_from_slice(&bytes);
-                            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                                let line_raw = buffer.split_to(pos + 1);
-                                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                    let line = line_str.trim();
+                            let text_chunk = utf8_buf.push(&bytes);
+                            line_buffer.push_str(&text_chunk);
+                            while let Some(pos) = line_buffer.find('\n') {
+                                let line_raw: String = line_buffer.drain(..=pos).collect();
+                                {
+                                    let line = line_raw.trim();
                                     if line.is_empty() { continue; }
                                     if line.starts_with("data: ") {
                                         let json_part = line.trim_start_matches("data: ").trim();
@@ -349,19 +351,12 @@ where
         }
 
         // [FIX #1732] Flush remaining buffer to prevent hang on network fragmentation
-        if !buffer.is_empty() {
-            if let Ok(line_str) = std::str::from_utf8(&buffer) {
-                let line = line_str.trim();
-                if !line.is_empty() && line.starts_with("data: ") {
-                    let json_part = line.trim_start_matches("data: ").trim();
-                    if json_part != "[DONE]" {
-                        // Re-use logic for processing the last line
-                        // (Note: In a more complex refactor we'd extract this to a function,
-                        // but for a targeted fix, processing the terminal data chunk is safer)
-                        tracing::debug!("[OpenAI-SSE] Flushing remaining {} bytes in buffer", buffer.len());
-                    }
-                }
-            }
+        if let Some(lossy_tail) = utf8_buf.flush_lossy() {
+            line_buffer.push_str(&lossy_tail);
+        }
+        if !line_buffer.is_empty() {
+            tracing::debug!("[OpenAI-SSE] Flushing remaining {} bytes in line_buffer", line_buffer.len());
+            line_buffer.clear();
         }
 
         if !error_occurred {
@@ -392,7 +387,8 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
-    let mut buffer = BytesMut::new();
+    let mut utf8_buf = crate::proxy::mappers::Utf8ChunkBuffer::new();
+    let mut line_buffer = String::new();
     let charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
     let random_str: String = (0..28)
@@ -415,11 +411,12 @@ where
                 item = gemini_stream.next() => {
                     match item {
                         Some(Ok(bytes)) => {
-                            buffer.extend_from_slice(&bytes);
-                            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                                let line_raw = buffer.split_to(pos + 1);
-                                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                    let line = line_str.trim();
+                            let text_chunk = utf8_buf.push(&bytes);
+                            line_buffer.push_str(&text_chunk);
+                            while let Some(pos) = line_buffer.find('\n') {
+                                let line_raw: String = line_buffer.drain(..=pos).collect();
+                                {
+                                    let line = line_raw.trim();
                                     if line.is_empty() { continue; }
                                     if line.starts_with("data: ") {
                                         let json_part = line.trim_start_matches("data: ").trim();
@@ -481,6 +478,16 @@ where
                 _ = heartbeat_interval.tick() => { yield Ok::<Bytes, String>(Bytes::from(": ping\n\n")); }
             }
         }
+
+        // Flush remaining buffer to prevent hang on network fragmentation
+        if let Some(lossy_tail) = utf8_buf.flush_lossy() {
+            line_buffer.push_str(&lossy_tail);
+        }
+        if !line_buffer.is_empty() {
+            tracing::debug!("[Legacy-SSE] Flushing remaining {} bytes in line_buffer", line_buffer.len());
+            line_buffer.clear();
+        }
+
         if !error_occurred {
             if let Some(ref usage) = final_usage {
                 let usage_chunk = json!({
@@ -579,7 +586,8 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
-    let mut buffer = BytesMut::new();
+    let mut utf8_buf = crate::proxy::mappers::Utf8ChunkBuffer::new();
+    let mut line_buffer = String::new();
     let charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
     let random_str: String = (0..24)
@@ -640,11 +648,12 @@ where
                 item = gemini_stream.next() => {
                     match item {
                         Some(Ok(bytes)) => {
-                            buffer.extend_from_slice(&bytes);
-                            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                                let line_raw = buffer.split_to(pos + 1);
-                                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                    let line = line_str.trim();
+                            let text_chunk = utf8_buf.push(&bytes);
+                            line_buffer.push_str(&text_chunk);
+                            while let Some(pos) = line_buffer.find('\n') {
+                                let line_raw: String = line_buffer.drain(..=pos).collect();
+                                {
+                                    let line = line_raw.trim();
                                     if line.is_empty() || !line.starts_with("data: ") { continue; }
                                     let json_part = line.trim_start_matches("data: ").trim();
                                     if json_part == "[DONE]" { continue; }
@@ -1031,6 +1040,15 @@ where
             }
         }
 
+        // Flush remaining buffer to prevent hang on network fragmentation
+        if let Some(lossy_tail) = utf8_buf.flush_lossy() {
+            line_buffer.push_str(&lossy_tail);
+        }
+        if !line_buffer.is_empty() {
+            tracing::debug!("[Codex-SSE] Flushing remaining {} bytes in line_buffer", line_buffer.len());
+            line_buffer.clear();
+        }
+
         // 最终收尾时，若可见思考 commentary 还开着，则先物化为完整 message。
         if reasoning_open {
             let text_done = json!({
@@ -1272,6 +1290,64 @@ mod tests {
             .filter_map(|data| serde_json::from_str::<Value>(data).ok())
             .collect();
         (raw, events)
+    }
+
+    #[tokio::test]
+    async fn test_openai_stream_utf8_fragmentation() {
+        // 模拟 OpenAI 流式场景下，中文跨 TCP chunk 截断
+        let payload = json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "text": "你好世界，这是测试流式UTF-8残缺字符拼接！"
+                        }]
+                    }
+                }]
+            }
+        });
+        let raw_sse = format!("data: {}\n\n", payload);
+        let raw_bytes = raw_sse.as_bytes();
+
+        // 在 "残缺字符" 汉字中间进行字节截断
+        let cut_pos = raw_sse.find("残缺").unwrap() + 2;
+        let chunk1 = &raw_bytes[..cut_pos];
+        let chunk2 = &raw_bytes[cut_pos..];
+
+        let stream_items = vec![
+            Ok::<Bytes, String>(Bytes::copy_from_slice(chunk1)),
+            Ok::<Bytes, String>(Bytes::copy_from_slice(chunk2)),
+        ];
+
+        let mut sse_stream = create_openai_sse_stream(
+            Box::pin(stream::iter(stream_items)),
+            "gemini-2.5-flash".to_string(),
+            "test_session".to_string(),
+            0,
+            None,
+        );
+
+        let mut all_text = String::new();
+        while let Some(item) = sse_stream.next().await {
+            if let Ok(bytes) = item {
+                let s = String::from_utf8_lossy(&bytes);
+                for line in s.lines() {
+                    let line = line.trim();
+                    if line.starts_with("data: ") && !line.contains("[DONE]") {
+                        if let Ok(v) = serde_json::from_str::<Value>(line.trim_start_matches("data: ")) {
+                            if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+                                if let Some(delta) = choices.get(0).and_then(|c| c.get("delta")) {
+                                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                        all_text.push_str(content);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(all_text, "你好世界，这是测试流式UTF-8残缺字符拼接！");
     }
 
     #[tokio::test]

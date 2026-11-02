@@ -55,7 +55,9 @@ where
         state.estimated_prompt_tokens = estimated_prompt_tokens; // [FIX] Pass estimated tokens
         state.set_client_adapter(client_adapter); // [NEW] Set adapter
         state.set_registered_tool_names(registered_tool_names); // [FIX #MCP] Set tool names
-        let mut buffer = BytesMut::new();
+        // 方案3：引入 Utf8ChunkBuffer 防止 TCP 切片截断多字节 UTF-8 字符（如中文、Emoji、思维链签名）
+        let mut utf8_buf = crate::proxy::mappers::Utf8ChunkBuffer::new();
+        let mut line_buffer = String::new();
 
         loop {
             // [NEW] 60秒心跳保活: 延长超时时间以增加网络抖动容错
@@ -68,19 +70,18 @@ where
                 Ok(Some(chunk_result)) => {
                     match chunk_result {
                         Ok(chunk) => {
-                            buffer.extend_from_slice(&chunk);
+                            let text_chunk = utf8_buf.push(&chunk);
+                            line_buffer.push_str(&text_chunk);
 
                             // Process complete lines
-                            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                                let line_raw = buffer.split_to(pos + 1);
-                                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                    let line = line_str.trim();
-                                    if line.is_empty() { continue; }
+                            while let Some(pos) = line_buffer.find('\n') {
+                                let line_raw: String = line_buffer.drain(..=pos).collect();
+                                let line = line_raw.trim();
+                                if line.is_empty() { continue; }
 
-                                    if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
-                                        for sse_chunk in sse_chunks {
-                                            yield Ok(sse_chunk);
-                                        }
+                                if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
+                                    for sse_chunk in sse_chunks {
+                                        yield Ok(sse_chunk);
                                     }
                                 }
                             }
@@ -107,19 +108,20 @@ where
 
         // [FIX #1732] Mandatory Flush remaining buffer on stream termination
         // Prevents hangs when the last SSE chunk doesn't end with a newline (network fragmentation)
-        if !buffer.is_empty() {
-             if let Ok(line_str) = std::str::from_utf8(&buffer) {
-                 let line = line_str.trim();
-                 if !line.is_empty() {
-                     tracing::debug!("[{}] SSE Termination: Flushing remaining {} bytes in buffer", trace_id, buffer.len());
-                     if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
-                         for sse_chunk in sse_chunks {
-                             yield Ok(sse_chunk);
-                         }
-                     }
-                 }
-             }
-             buffer.clear();
+        if let Some(lossy_tail) = utf8_buf.flush_lossy() {
+            line_buffer.push_str(&lossy_tail);
+        }
+        if !line_buffer.is_empty() {
+            let line = line_buffer.trim();
+            if !line.is_empty() {
+                tracing::debug!("[{}] SSE Termination: Flushing remaining {} bytes in line_buffer", trace_id, line_buffer.len());
+                if let Some(sse_chunks) = process_sse_line(line, &mut state, &trace_id, &email) {
+                    for sse_chunk in sse_chunks {
+                        yield Ok(sse_chunk);
+                    }
+                }
+            }
+            line_buffer.clear();
         }
 
         // [FIX #859] Post-thinking interruption recovery

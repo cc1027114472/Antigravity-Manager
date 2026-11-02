@@ -59,6 +59,7 @@ fn create_test_token(
         pending_cu_weekly: HashMap::new(),
         model_limits: std::collections::HashMap::new(),
         max_concurrency: None,
+        device_profile: None,
     }
 }
 

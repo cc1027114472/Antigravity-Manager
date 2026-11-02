@@ -1,15 +1,18 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::num::NonZeroUsize;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
+use lru::LruCache;
+use parking_lot::Mutex;
 
 // Node.js proxy uses 2 hours TTL
 const SIGNATURE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 const MIN_SIGNATURE_LENGTH: usize = 50;
 
-// Different cache limits for different layers
-const TOOL_CACHE_LIMIT: usize = 500; // Layer 1: Tool-specific signatures
-const FAMILY_CACHE_LIMIT: usize = 200; // Layer 2: Model family mappings
-const SESSION_CACHE_LIMIT: usize = 1000; // Layer 3: Session-based signatures (largest)
+// Bounded hard limits for different cache layers (guaranteeing O(1) eviction)
+const TOOL_CACHE_LIMIT: usize = 1000;    // Layer 1: Tool-specific signatures
+const FAMILY_CACHE_LIMIT: usize = 1000;  // Layer 2: Model family mappings
+const SESSION_CACHE_LIMIT: usize = 2000; // Layer 3 & 4: Session-based signatures & reasonings
 
 /// Cache entry with timestamp for TTL
 #[derive(Clone, Debug)]
@@ -38,40 +41,32 @@ impl<T> CacheEntry<T> {
     }
 }
 
-/// Triple-layer signature cache to handle:
+/// Quad-layer bounded LRU signature cache to handle:
 /// 1. Signature recovery for tool calls (when clients strip them)
 /// 2. Cross-model compatibility checks (preventing Claude signatures on Gemini models)
 /// 3. Session-based signature tracking (preventing cross-session pollution)
+/// 4. Session-based reasoning history tracking
 pub struct SignatureCache {
     /// Layer 1: Tool Use ID -> Thinking Signature
-    /// Key: tool_use_id (e.g., "toolu_01...")
-    /// Value: The thought signature that generated this tool call
-    tool_signatures: Mutex<HashMap<String, CacheEntry<String>>>,
+    tool_signatures: Mutex<LruCache<String, CacheEntry<String>>>,
 
     /// Layer 2: Signature -> Model Family
-    /// Key: thought signature string
-    /// Value: Model family identifier (e.g., "claude-3-5-sonnet", "gemini-2.0-flash")
-    thinking_families: Mutex<HashMap<String, CacheEntry<String>>>,
+    thinking_families: Mutex<LruCache<String, CacheEntry<String>>>,
 
-    /// Layer 3: Session ID -> Map of Message Count -> Thinking Signature (NEW)
-    /// Key: session fingerprint (e.g., "sid-a1b2c3d4...")
-    /// Value: A map of message count to thought signature
-    /// This prevents signature pollution between different conversations and preserves history
-    session_signatures: Mutex<HashMap<String, CacheEntry<HashMap<usize, SessionSignatureEntry>>>>,
+    /// Layer 3: Session ID -> Map of Message Count -> Thinking Signature
+    session_signatures: Mutex<LruCache<String, CacheEntry<HashMap<usize, SessionSignatureEntry>>>>,
 
-    /// Layer 4: Session ID -> Assistant Reasoning Text History (NEW v4.2.0)
-    /// Key: session fingerprint
-    /// Value: A vector of reasoning contents (index corresponds to assistant turn index)
-    session_reasonings: Mutex<HashMap<String, CacheEntry<Vec<String>>>>,
+    /// Layer 4: Session ID -> Assistant Reasoning Text History
+    session_reasonings: Mutex<LruCache<String, CacheEntry<Vec<String>>>>,
 }
 
 impl SignatureCache {
     fn new() -> Self {
         Self {
-            tool_signatures: Mutex::new(HashMap::new()),
-            thinking_families: Mutex::new(HashMap::new()),
-            session_signatures: Mutex::new(HashMap::new()),
-            session_reasonings: Mutex::new(HashMap::new()),
+            tool_signatures: Mutex::new(LruCache::new(NonZeroUsize::new(TOOL_CACHE_LIMIT).unwrap())),
+            thinking_families: Mutex::new(LruCache::new(NonZeroUsize::new(FAMILY_CACHE_LIMIT).unwrap())),
+            session_signatures: Mutex::new(LruCache::new(NonZeroUsize::new(SESSION_CACHE_LIMIT).unwrap())),
+            session_reasonings: Mutex::new(LruCache::new(NonZeroUsize::new(SESSION_CACHE_LIMIT).unwrap())),
         }
     }
 
@@ -81,91 +76,73 @@ impl SignatureCache {
         INSTANCE.get_or_init(SignatureCache::new)
     }
 
-    /// Store a tool call signature
+    /// Store a tool call signature with strict LRU hard-cap eviction
     pub fn cache_tool_signature(&self, tool_use_id: &str, signature: String) {
         if signature.len() < MIN_SIGNATURE_LENGTH {
             return;
         }
 
-        if let Ok(mut cache) = self.tool_signatures.lock() {
-            tracing::debug!(
-                "[SignatureCache] Caching tool signature for id: {}",
-                tool_use_id
-            );
-            cache.insert(tool_use_id.to_string(), CacheEntry::new(signature));
-
-            // Clean up expired entries when limit is reached
-            if cache.len() > TOOL_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::debug!(
-                        "[SignatureCache] Tool cache cleanup: {} -> {} entries",
-                        before,
-                        after
-                    );
-                }
-            }
-        }
+        let mut cache = self.tool_signatures.lock();
+        tracing::debug!(
+            "[SignatureCache] Caching tool signature for id: {}",
+            tool_use_id
+        );
+        cache.put(tool_use_id.to_string(), CacheEntry::new(signature));
     }
 
-    /// Retrieve a signature for a tool_use_id
+    /// Retrieve a signature for a tool_use_id with O(1) access and TTL verification
     pub fn get_tool_signature(&self, tool_use_id: &str) -> Option<String> {
-        if let Ok(cache) = self.tool_signatures.lock() {
-            if let Some(entry) = cache.get(tool_use_id) {
-                if !entry.is_expired() {
-                    tracing::debug!(
-                        "[SignatureCache] Hit tool signature for id: {}",
-                        tool_use_id
-                    );
-                    return Some(entry.data.clone());
-                }
+        let mut cache = self.tool_signatures.lock();
+        if let Some(entry) = cache.get(tool_use_id) {
+            if !entry.is_expired() {
+                tracing::debug!(
+                    "[SignatureCache] Hit tool signature for id: {}",
+                    tool_use_id
+                );
+                return Some(entry.data.clone());
+            } else {
+                tracing::debug!(
+                    "[SignatureCache] Tool signature expired for id: {}",
+                    tool_use_id
+                );
             }
+        } else {
+            return None;
         }
+        // If expired, pop from LRU
+        cache.pop(tool_use_id);
         None
     }
 
-    /// Store model family for a signature
+    /// Store model family for a signature with strict LRU hard-cap eviction
     pub fn cache_thinking_family(&self, signature: String, family: String) {
         if signature.len() < MIN_SIGNATURE_LENGTH {
             return;
         }
 
-        if let Ok(mut cache) = self.thinking_families.lock() {
-            tracing::debug!(
-                "[SignatureCache] Caching thinking family for sig (len={}): {}",
-                signature.len(),
-                family
-            );
-            cache.insert(signature, CacheEntry::new(family));
-
-            if cache.len() > FAMILY_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::debug!(
-                        "[SignatureCache] Family cache cleanup: {} -> {} entries",
-                        before,
-                        after
-                    );
-                }
-            }
-        }
+        let mut cache = self.thinking_families.lock();
+        tracing::debug!(
+            "[SignatureCache] Caching thinking family for sig (len={}): {}",
+            signature.len(),
+            family
+        );
+        cache.put(signature, CacheEntry::new(family));
     }
 
-    /// Get model family for a signature
+    /// Get model family for a signature with O(1) access and TTL verification
     pub fn get_signature_family(&self, signature: &str) -> Option<String> {
-        if let Ok(cache) = self.thinking_families.lock() {
-            if let Some(entry) = cache.get(signature) {
-                if !entry.is_expired() {
-                    return Some(entry.data.clone());
-                } else {
-                    tracing::debug!("[SignatureCache] Signature family entry expired");
-                }
+        let mut cache = self.thinking_families.lock();
+        if let Some(entry) = cache.get(signature) {
+            if !entry.is_expired() {
+                return Some(entry.data.clone());
+            } else {
+                tracing::debug!("[SignatureCache] Signature family entry expired");
             }
+        } else {
+            return None;
         }
+        // If expired, pop from LRU
+        cache.pop(signature);
         None
     }
 
@@ -173,11 +150,6 @@ impl SignatureCache {
 
     /// Store the thinking signature for a session at a specific message count.
     /// This is the preferred method for tracking signatures across tool loops.
-    ///
-    /// # Arguments
-    /// * `session_id` - Session fingerprint (e.g., "sid-a1b2c3d4...")
-    /// * `signature` - The thought signature to store
-    /// * `message_count` - The current message count of the conversation (to detect Rewind)
     pub fn cache_session_signature(
         &self,
         session_id: &str,
@@ -188,16 +160,12 @@ impl SignatureCache {
             return;
         }
 
-        if let Ok(mut cache) = self.session_signatures.lock() {
-            let entry = cache
-                .entry(session_id.to_string())
-                .or_insert_with(|| CacheEntry::new(HashMap::new()));
-
+        let mut cache = self.session_signatures.lock();
+        if let Some(entry) = cache.get_mut(session_id) {
             // Update timestamp to refresh TTL
             entry.timestamp = SystemTime::now();
 
-            // Detect if a rewind happened (e.g. if we have cached signatures with message_count
-            // greater than the current message_count, those should be cleared since that future is gone).
+            // Detect if a rewind happened: remove future signatures
             entry.data.retain(|&mc, _| {
                 if mc > message_count {
                     tracing::info!(
@@ -214,10 +182,7 @@ impl SignatureCache {
 
             let should_store = match entry.data.get(&message_count) {
                 None => true,
-                Some(existing) => {
-                    // Same message count: only update if the new signature is longer (more complete)
-                    signature.len() > existing.signature.len()
-                }
+                Some(existing) => signature.len() > existing.signature.len(),
             };
 
             if should_store {
@@ -235,45 +200,43 @@ impl SignatureCache {
                     },
                 );
             }
-
-            // Cleanup when limit is reached (Session cache has largest limit)
-            if cache.len() > SESSION_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::info!(
-                        "[SignatureCache] Session cache cleanup: {} -> {} entries (limit: {})",
-                        before,
-                        after,
-                        SESSION_CACHE_LIMIT
-                    );
-                }
-            }
+        } else {
+            // Not in cache yet, create new entry and put
+            let mut data = HashMap::new();
+            data.insert(
+                message_count,
+                SessionSignatureEntry {
+                    signature,
+                    message_count,
+                },
+            );
+            cache.put(session_id.to_string(), CacheEntry::new(data));
         }
     }
 
     /// Retrieve the latest thinking signature for a session.
     /// Returns None if not found or expired.
     pub fn get_session_signature(&self, session_id: &str) -> Option<String> {
-        if let Ok(cache) = self.session_signatures.lock() {
-            if let Some(entry) = cache.get(session_id) {
-                if !entry.is_expired() {
-                    // Find the signature with the maximum message_count (the latest one)
-                    if let Some(sig_entry) = entry.data.values().max_by_key(|e| e.message_count) {
-                        tracing::debug!(
-                            "[SignatureCache] Session {} (latest, msg_count={}) -> HIT (len={})",
-                            session_id,
-                            sig_entry.message_count,
-                            sig_entry.signature.len()
-                        );
-                        return Some(sig_entry.signature.clone());
-                    }
-                } else {
-                    tracing::debug!("[SignatureCache] Session {} -> EXPIRED", session_id);
+        let mut cache = self.session_signatures.lock();
+        if let Some(entry) = cache.get(session_id) {
+            if !entry.is_expired() {
+                if let Some(sig_entry) = entry.data.values().max_by_key(|e| e.message_count) {
+                    tracing::debug!(
+                        "[SignatureCache] Session {} (latest, msg_count={}) -> HIT (len={})",
+                        session_id,
+                        sig_entry.message_count,
+                        sig_entry.signature.len()
+                    );
+                    return Some(sig_entry.signature.clone());
                 }
+            } else {
+                tracing::debug!("[SignatureCache] Session {} -> EXPIRED", session_id);
             }
+        } else {
+            return None;
         }
+        // If expired, pop from LRU
+        cache.pop(session_id);
         None
     }
 
@@ -284,23 +247,30 @@ impl SignatureCache {
         session_id: &str,
         message_count: usize,
     ) -> Option<String> {
-        if let Ok(cache) = self.session_signatures.lock() {
-            if let Some(entry) = cache.get(session_id) {
-                if !entry.is_expired() {
-                    if let Some(sig_entry) = entry.data.get(&message_count) {
-                        tracing::debug!(
-                            "[SignatureCache] Session {} (msg_count={}) -> HIT (len={})",
-                            session_id,
-                            message_count,
-                            sig_entry.signature.len()
-                        );
-                        return Some(sig_entry.signature.clone());
-                    }
+        let mut cache = self.session_signatures.lock();
+        if let Some(entry) = cache.get(session_id) {
+            if !entry.is_expired() {
+                if let Some(sig_entry) = entry.data.get(&message_count) {
+                    tracing::debug!(
+                        "[SignatureCache] Session {} (msg_count={}) -> HIT (len={})",
+                        session_id,
+                        message_count,
+                        sig_entry.signature.len()
+                    );
+                    return Some(sig_entry.signature.clone());
                 }
+            } else {
+                tracing::debug!("[SignatureCache] Session {} -> EXPIRED", session_id);
             }
+        } else {
+            return None;
         }
+        // If expired, pop from LRU
+        cache.pop(session_id);
         None
     }
+
+    // ===== Layer 4: Session Reasoning Text Storage =====
 
     /// Store reasoning text for a specific assistant turn in a session
     pub fn cache_session_reasoning(&self, session_id: &str, reasoning: String, turn_index: usize) {
@@ -308,19 +278,12 @@ impl SignatureCache {
             return;
         }
 
-        if let Ok(mut cache) = self.session_reasonings.lock() {
-            let entry = cache
-                .entry(session_id.to_string())
-                .or_insert_with(|| CacheEntry::new(Vec::new()));
-
-            // Update timestamp to refresh TTL
-            entry.timestamp = std::time::SystemTime::now();
-
+        let mut cache = self.session_reasonings.lock();
+        if let Some(entry) = cache.get_mut(session_id) {
+            entry.timestamp = SystemTime::now();
             if turn_index >= entry.data.len() {
                 entry.data.resize(turn_index + 1, String::new());
             }
-
-            // Only update if the new reasoning is longer to prevent overwriting with partial content
             let old_len = entry.data[turn_index].len();
             if reasoning.len() > old_len {
                 tracing::debug!(
@@ -332,72 +295,57 @@ impl SignatureCache {
                 );
                 entry.data[turn_index] = reasoning;
             }
-
-            // Session cache cleanup if limit exceeded
-            if cache.len() > SESSION_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::debug!(
-                        "[SignatureCache] Session reasoning cache cleanup: {} -> {} entries",
-                        before,
-                        after
-                    );
-                }
-            }
+        } else {
+            let mut data = Vec::new();
+            data.resize(turn_index + 1, String::new());
+            data[turn_index] = reasoning;
+            cache.put(session_id.to_string(), CacheEntry::new(data));
         }
     }
 
     /// Retrieve reasoning text for a specific assistant turn in a session
     pub fn get_session_reasoning(&self, session_id: &str, turn_index: usize) -> Option<String> {
-        if let Ok(cache) = self.session_reasonings.lock() {
-            if let Some(entry) = cache.get(session_id) {
-                if !entry.is_expired() && turn_index < entry.data.len() {
-                    let text = &entry.data[turn_index];
-                    if !text.trim().is_empty() {
-                        tracing::debug!(
-                            "[SignatureCache] Session {} (turn={}) -> Hit reasoning text cache (len: {})",
-                            session_id,
-                            turn_index,
-                            text.len()
-                        );
-                        return Some(text.clone());
-                    }
+        let mut cache = self.session_reasonings.lock();
+        if let Some(entry) = cache.get(session_id) {
+            if !entry.is_expired() && turn_index < entry.data.len() {
+                let text = &entry.data[turn_index];
+                if !text.trim().is_empty() {
+                    tracing::debug!(
+                        "[SignatureCache] Session {} (turn={}) -> Hit reasoning text cache (len: {})",
+                        session_id,
+                        turn_index,
+                        text.len()
+                    );
+                    return Some(text.clone());
                 }
             }
+        } else {
+            return None;
         }
+        // If expired, pop from LRU
+        cache.pop(session_id);
         None
     }
 
     /// 删除指定会话的缓存签名
     #[allow(dead_code)] // 预留给管理接口或调试使用
     pub fn delete_session_signature(&self, session_id: &str) {
-        if let Ok(mut cache) = self.session_signatures.lock() {
-            if cache.remove(session_id).is_some() {
-                tracing::debug!(
-                    "[SignatureCache] Deleted session signature for: {}",
-                    session_id
-                );
-            }
+        let mut cache = self.session_signatures.lock();
+        if cache.pop(session_id).is_some() {
+            tracing::debug!(
+                "[SignatureCache] Deleted session signature for: {}",
+                session_id
+            );
         }
     }
 
     /// Clear all caches (for testing or manual reset)
     #[allow(dead_code)] // Used in tests
     pub fn clear(&self) {
-        if let Ok(mut cache) = self.tool_signatures.lock() {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.thinking_families.lock() {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.session_signatures.lock() {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.session_reasonings.lock() {
-            cache.clear();
-        }
+        self.tool_signatures.lock().clear();
+        self.thinking_families.lock().clear();
+        self.session_signatures.lock().clear();
+        self.session_reasonings.lock().clear();
     }
 }
 
@@ -495,5 +443,22 @@ mod tests {
         assert!(cache.get_tool_signature("tool_1").is_none());
         assert!(cache.get_signature_family(&sig).is_none());
         assert!(cache.get_session_signature("sid-1").is_none());
+    }
+
+    #[test]
+    fn test_lru_hard_capacity_eviction() {
+        let cache = SignatureCache::new();
+        let sig = "s".repeat(60);
+
+        // Fill tool cache up to TOOL_CACHE_LIMIT + 10
+        for i in 0..(TOOL_CACHE_LIMIT + 10) {
+            cache.cache_tool_signature(&format!("tool_{}", i), sig.clone());
+        }
+
+        // Check that older items were strictly evicted in O(1)
+        assert_eq!(cache.get_tool_signature("tool_0"), None);
+        assert_eq!(cache.get_tool_signature("tool_9"), None);
+        // Latest items must still exist
+        assert_eq!(cache.get_tool_signature(&format!("tool_{}", TOOL_CACHE_LIMIT + 9)), Some(sig));
     }
 }

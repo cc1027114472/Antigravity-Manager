@@ -25,6 +25,39 @@ use crate::proxy::session_manager::SessionManager;
 use axum::http::HeaderMap;
 use std::collections::VecDeque;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// RAII guard that automatically triggers a `CancellationToken` when dropped prematurely
+/// (e.g. client disconnects, Axum handler Future dropped).
+struct ImageCancellationGuard {
+    token: CancellationToken,
+    disarmed: bool,
+}
+
+impl ImageCancellationGuard {
+    fn new(token: CancellationToken) -> Self {
+        Self {
+            token,
+            disarmed: false,
+        }
+    }
+
+    /// Disarm the guard when the handler completes normally.
+    fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for ImageCancellationGuard {
+    fn drop(&mut self) {
+        if !self.disarmed && !self.token.is_cancelled() {
+            tracing::warn!(
+                "[Images] Client disconnected / future dropped; triggering cancellation token to abort background tasks"
+            );
+            self.token.cancel();
+        }
+    }
+}
 
 /// Return true only when a streamed chunk contains an actual error event.
 ///
@@ -3442,6 +3475,10 @@ pub async fn handle_images_generations_internal(
         .min(max_pool_size.saturating_add(1))
         .max(2);
 
+    // [方案4] 建立生命周期守卫，当客户端断开连接（外层 Future drop）时，自动触发 token.cancel()
+    let cancel_token = CancellationToken::new();
+    let cancel_guard = ImageCancellationGuard::new(cancel_token.clone());
+
     let mut tasks = Vec::new();
 
     // Track the last account actually attempted, so error responses (502/503) can be
@@ -3458,6 +3495,7 @@ pub async fn handle_images_generations_internal(
 
         let model_to_use = clean_model_name.clone();
         let attempted_account = attempted_account.clone();
+        let cancel_token = cancel_token.clone();
 
         tasks.push(tokio::spawn(async move {
             let mut last_error = String::new();
@@ -3466,15 +3504,34 @@ pub async fn handle_images_generations_internal(
                 None;
 
             for attempt in 0..max_attempts {
-                let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-                    .get_token("image_gen", force_rotate, None, &model_to_use)
-                    .await
-                {
+                // 检查取消信号
+                if cancel_token.is_cancelled() {
+                    tracing::info!("[Images] Task cancelled before attempt {}, terminating", attempt);
+                    drop(inflight_guard);
+                    return Err("Request cancelled by client".to_string());
+                }
+
+                let token_res = tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        tracing::info!("[Images] Task cancelled while waiting for token; terminating");
+                        drop(inflight_guard);
+                        return Err("Request cancelled by client".to_string());
+                    }
+                    res = token_manager.get_token("image_gen", force_rotate, None, &model_to_use) => res,
+                };
+
+                let (access_token, project_id, email, account_id, _wait_ms) = match token_res {
                     Ok(t) => t,
                     Err(e) => {
                         last_error = format!("Token error: {}", e);
                         if attempt < max_attempts - 1 {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => {
+                                    drop(inflight_guard);
+                                    return Err("Request cancelled by client".to_string());
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                            }
                             continue;
                         }
                         break;
@@ -3499,6 +3556,12 @@ pub async fn handle_images_generations_internal(
                         email.clone(),
                         crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
                     ));
+                }
+
+                // 准备发包前再次检查取消
+                if cancel_token.is_cancelled() {
+                    drop(inflight_guard);
+                    return Err("Request cancelled by client".to_string());
                 }
 
                 // [FIX] Resolve to the account-specific dynamic image model, exactly like the
@@ -3533,21 +3596,37 @@ pub async fn handle_images_generations_internal(
                     }
                 });
 
-                match upstream
-                    .call_v1_internal(
+                // 网络发包穿透取消信号：若客户端中途断连，立刻中断网络请求并安全释放并发租借槽位
+                let call_result = tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        tracing::warn!(
+                            "[Images] Client disconnected during upstream call for account {}; terminating request and releasing inflight slot",
+                            email
+                        );
+                        drop(inflight_guard);
+                        return Err("Request cancelled by client".to_string());
+                    }
+                    res = upstream.call_v1_internal(
                         "generateContent",
                         &access_token,
                         gemini_body,
                         None,
                         Some(account_id.as_str()),
-                    )
-                    .await
-                {
+                    ) => res,
+                };
+
+                match call_result {
                     Ok(call_result) => {
                         let response = call_result.response;
                         let status = response.status();
                         if !status.is_success() {
-                            let err_text = response.text().await.unwrap_or_default();
+                            let err_text = tokio::select! {
+                                _ = cancel_token.cancelled() => {
+                                    drop(inflight_guard);
+                                    return Err("Request cancelled by client".to_string());
+                                }
+                                text_res = response.text() => text_res.unwrap_or_default(),
+                            };
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
 
@@ -3590,6 +3669,7 @@ pub async fn handle_images_generations_internal(
                             }
 
                             // Other errors: return
+                            drop(inflight_guard);
                             return Err(last_error);
                         }
                         token_manager.mark_account_success(&account_id);
@@ -3597,14 +3677,26 @@ pub async fn handle_images_generations_internal(
                             .clear_persisted_live_limit(&account_id, Some(&model_to_use))
                             .await;
 
-                        match response.json::<Value>().await {
+                        let json_res = tokio::select! {
+                            _ = cancel_token.cancelled() => {
+                                tracing::warn!("[Images] Task cancelled while decoding response; releasing inflight slot");
+                                drop(inflight_guard);
+                                return Err("Request cancelled by client".to_string());
+                            }
+                            res = response.json::<Value>() => res,
+                        };
+
+                        match json_res {
                             Ok(json) => {
                                 let peak = crate::proxy::account_inflight::sample_peak(
                                     &mut inflight_guard,
                                 );
                                 return Ok((json, email, peak));
                             }
-                            Err(e) => return Err(format!("Parse error: {}", e)),
+                            Err(e) => {
+                                drop(inflight_guard);
+                                return Err(format!("Parse error: {}", e));
+                            }
                         }
                     }
                     Err(e) => {
@@ -3615,6 +3707,7 @@ pub async fn handle_images_generations_internal(
             }
 
             // All attempts failed
+            drop(inflight_guard);
             Err(format!("Max retries exhausted. Last error: {}", last_error))
         }));
     }
@@ -3686,6 +3779,16 @@ pub async fn handle_images_generations_internal(
         };
         tracing::error!("[Images] All {} requests failed. Errors: {}", n, error_msg);
 
+        // [方案4] 若因客户端断开连接或取消导致，返回 499 Client Closed Request
+        if cancel_token.is_cancelled() || error_msg.contains("Request cancelled by client") {
+            return Err((
+                StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                "Client Closed Request".to_string(),
+                None,
+                None,
+            ));
+        }
+
         // [FIX] Map upstream status codes correctly instead of forcing 502
         let status = if error_msg.contains("429") || error_msg.contains("Quota exhausted") {
             StatusCode::TOO_MANY_REQUESTS
@@ -3732,6 +3835,7 @@ pub async fn handle_images_generations_internal(
         "data": images
     });
 
+    cancel_guard.disarm();
     let email_header = used_email.unwrap_or_default();
     Ok((email_header, openai_response, used_peak))
 }
@@ -3934,6 +4038,10 @@ pub async fn handle_images_edits(
         .min(max_pool_size.saturating_add(1))
         .max(2);
 
+    // [方案4] 建立生命周期守卫，当客户端断开连接（外层 Future drop）时，自动触发 token.cancel()
+    let cancel_token = CancellationToken::new();
+    let cancel_guard = ImageCancellationGuard::new(cancel_token.clone());
+
     let mut tasks = Vec::new();
     for _ in 0..n {
         let upstream = upstream.clone();
@@ -3942,6 +4050,7 @@ pub async fn handle_images_edits(
         let image_config = image_config.clone();
         let response_format = response_format.clone();
         let model_to_use = clean_model_name.clone();
+        let cancel_token = cancel_token.clone();
 
         tasks.push(tokio::spawn(async move {
             let mut last_error = String::new();
@@ -3951,16 +4060,35 @@ pub async fn handle_images_edits(
                 None;
 
             for attempt in 0..max_attempts {
-                // 4.1 获取 Token
-                let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-                    .get_token("image_gen", force_rotate, None, "gemini-3-pro-image")
-                    .await
-                {
+                // 检查取消信号
+                if cancel_token.is_cancelled() {
+                    tracing::info!("[Images] Edit task cancelled before attempt {}, terminating", attempt);
+                    drop(inflight_guard);
+                    return Err("Request cancelled by client".to_string());
+                }
+
+                // 4.1 获取 Token (穿透取消信号)
+                let token_res = tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        tracing::info!("[Images] Edit task cancelled while waiting for token; terminating");
+                        drop(inflight_guard);
+                        return Err("Request cancelled by client".to_string());
+                    }
+                    res = token_manager.get_token("image_gen", force_rotate, None, "gemini-3-pro-image") => res,
+                };
+
+                let (access_token, project_id, email, account_id, _wait_ms) = match token_res {
                     Ok(t) => t,
                     Err(e) => {
                         last_error = format!("Token error: {}", e);
                         if attempt < max_attempts - 1 {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => {
+                                    drop(inflight_guard);
+                                    return Err("Request cancelled by client".to_string());
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                            }
                             continue;
                         }
                         break;
@@ -3979,6 +4107,11 @@ pub async fn handle_images_edits(
                         force_rotate = true;
                         continue;
                     }
+                }
+
+                if cancel_token.is_cancelled() {
+                    drop(inflight_guard);
+                    return Err("Request cancelled by client".to_string());
                 }
 
                 // 4.2 Construct Request Body (Need project_id)
@@ -4011,21 +4144,37 @@ pub async fn handle_images_edits(
                     }
                 });
 
-                match upstream
-                    .call_v1_internal(
+                // 网络发包穿透取消信号：若客户端中途断连，立刻中断网络请求并安全释放并发租借槽位
+                let call_result = tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        tracing::warn!(
+                            "[Images] Client disconnected during upstream edit call for account {}; terminating request and releasing inflight slot",
+                            email
+                        );
+                        drop(inflight_guard);
+                        return Err("Request cancelled by client".to_string());
+                    }
+                    res = upstream.call_v1_internal(
                         "generateContent",
                         &access_token,
                         gemini_body,
                         None,
                         Some(account_id.as_str()),
-                    )
-                    .await
-                {
+                    ) => res,
+                };
+
+                match call_result {
                     Ok(call_result) => {
                         let response = call_result.response;
                         let status = response.status();
                         if !status.is_success() {
-                            let err_text = response.text().await.unwrap_or_default();
+                            let err_text = tokio::select! {
+                                _ = cancel_token.cancelled() => {
+                                    drop(inflight_guard);
+                                    return Err("Request cancelled by client".to_string());
+                                }
+                                text_res = response.text() => text_res.unwrap_or_default(),
+                            };
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
 
@@ -4052,6 +4201,7 @@ pub async fn handle_images_edits(
                                 force_rotate = true;
                                 continue; // Retry loop
                             }
+                            drop(inflight_guard);
                             return Err(last_error);
                         }
                         token_manager.mark_account_success(&account_id);
@@ -4059,14 +4209,26 @@ pub async fn handle_images_edits(
                             .clear_persisted_live_limit(&account_id, Some(&model_to_use))
                             .await;
 
-                        match response.json::<Value>().await {
+                        let json_res = tokio::select! {
+                            _ = cancel_token.cancelled() => {
+                                tracing::warn!("[Images] Edit task cancelled while decoding response; releasing inflight slot");
+                                drop(inflight_guard);
+                                return Err("Request cancelled by client".to_string());
+                            }
+                            res = response.json::<Value>() => res,
+                        };
+
+                        match json_res {
                             Ok(json) => {
                                 let peak = crate::proxy::account_inflight::sample_peak(
                                     &mut inflight_guard,
                                 );
                                 return Ok((json, response_format.clone(), email, peak));
                             }
-                            Err(e) => return Err(format!("Parse error: {}", e)),
+                            Err(e) => {
+                                drop(inflight_guard);
+                                return Err(format!("Parse error: {}", e));
+                            }
                         }
                     }
                     Err(e) => {
@@ -4075,6 +4237,7 @@ pub async fn handle_images_edits(
                     }
                 }
             }
+            drop(inflight_guard);
             Err(format!("Max retries exhausted. Last error: {}", last_error))
         }));
     }
@@ -4148,6 +4311,15 @@ pub async fn handle_images_edits(
             n,
             error_msg
         );
+
+        // [方案4] 若因客户端断开连接或取消导致，返回 499 Client Closed Request
+        if cancel_token.is_cancelled() || error_msg.contains("Request cancelled by client") {
+            return Err((
+                StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                "Client Closed Request".to_string(),
+            ));
+        }
+
         let status = if error_msg.contains("429") || error_msg.contains("Quota exhausted") {
             StatusCode::TOO_MANY_REQUESTS
         } else if error_msg.contains("503") || error_msg.contains("Service Unavailable") {
@@ -4179,6 +4351,7 @@ pub async fn handle_images_edits(
         "data": images
     });
 
+    cancel_guard.disarm();
     let email_header = used_email.unwrap_or_default();
     Ok((
         StatusCode::OK,
