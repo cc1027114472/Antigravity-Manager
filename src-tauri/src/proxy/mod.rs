@@ -36,10 +36,11 @@ pub mod zai_vision_mcp; // Built-in Vision MCP server state
 pub mod zai_vision_tools; // Built-in Vision MCP tools (z.ai vision API) // 调试日志
 
 pub use account_selector::{
-    filter_available_candidates, select_least_used_account, AccountCandidate, AccountSelector,
-    AccountTokenUsage, FatigueReason, FatigueRecord, SoftLimitConfig,
-    DAILY_OUTPUT_TOKEN_SOFT_LIMIT, FATIGUE_NAP_MAX_SECS, FATIGUE_NAP_MIN_SECS,
-    HOURLY_OUTPUT_TOKEN_SOFT_LIMIT,
+    can_accept_input_tokens, filter_available_candidates, get_capacity_tier, is_hourly_sweet_spot,
+    is_sweet_spot_for_oversized, record_warm_interaction, select_least_used_account,
+    AccountCandidate, AccountSelector, AccountTokenUsage, CapacityTier, FatigueReason,
+    FatigueRecord, SoftLimitConfig, DAILY_OUTPUT_TOKEN_SOFT_LIMIT, FATIGUE_NAP_MAX_SECS,
+    FATIGUE_NAP_MIN_SECS, HOURLY_OUTPUT_TOKEN_SOFT_LIMIT,
 };
 pub use auto_recovery::AutoRecoveryScheduler;
 pub use config::get_enable_g1_credits;

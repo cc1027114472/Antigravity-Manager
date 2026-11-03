@@ -54,8 +54,8 @@ pub const EGRESS_RECOVERY_COOLDOWN_SECS: u64 = 180;
 /// 默认单账号并发槽位数（未在页面或账号单独配置时默认 2 并发槽）
 pub const DEFAULT_CONCURRENCY_SLOTS: usize = 2;
 
-/// 粘性会话允许等待单账号槽位冷却释放的最大毫秒数（<= 2s 微等保缓存，> 2s 果断换号）
-pub const STICKY_MAX_SLOT_WAIT_MS: u64 = 2000;
+/// 粘性会话允许等待单账号槽位呼吸冷却的最大毫秒数（18s：覆盖大包 8~15s 冷却，防止频繁解绑跳冷号，且低于客户端 30~60s TTFB 超时）
+pub const STICKY_MAX_SLOT_WAIT_MS: u64 = 18_000;
 
 /// 全号池均处于冷却延迟中时，兜底允许预约等待最短冷却槽位的最大毫秒数
 pub const FALLBACK_MAX_SLOT_WAIT_MS: u64 = 5000;
@@ -397,8 +397,8 @@ impl HumanizedPacer {
 
     /// 根据四级流量分级计算响应结束后的槽位冷却延迟（毫秒）：
     /// - L1 Normal (<=200KB 且 <50K tokens)：低延迟 800ms ~ 1800ms（保障交互对话顺畅）
-    /// - L2 Medium (200KB~400KB 或 50K~100K tokens)：拟人思考散热延迟 6000ms ~ 12000ms (杜绝 2~3 秒大包机枪连击被 Google TOS 封号)
-    /// - L3 Oversized (>400KB 或 >100K tokens)：充分物理冷却 12000ms ~ 22000ms（期间独占全槽闭合，强行分流下一发请求）
+    /// - L2 Medium (200KB~400KB 或 50K~100K tokens)：拟人思考散热延迟 3500ms ~ 7500ms
+    /// - L3 Oversized (>400KB 或 >100K tokens)：充分物理冷却 8000ms ~ 15000ms（被 18s 粘性等待窗口 100% 覆盖，防止误解绑跳冷号）
     pub fn compute_footprint_cooldown_ms(footprint: RequestFootprint) -> u64 {
         use rand::Rng;
         let mut rng = rand::thread_rng();
@@ -410,10 +410,10 @@ impl HumanizedPacer {
                     rng.gen_range(1100..=1800)
                 }
             }
-            // 5万~10万 Tokens 的大包请求，必须留出至少 6~12 秒的拟人思考与散热时间，迫使短时连续连击自动分流至池中其他健康账号
-            TrafficTier::Medium => rng.gen_range(6000..=12000),
-            // >10万 Tokens 极重计算，必须严格保持 12~22 秒充分冷却
-            TrafficTier::Oversized => rng.gen_range(12000..=22_000),
+            // 5万~10万 Tokens 的中型请求：留出 3.5~7.5 秒拟人思考与散热时间
+            TrafficTier::Medium => rng.gen_range(3500..=7500),
+            // >10万 Tokens 极重计算：保持 8~15 秒充分冷却（完全在 18s 粘性等待上限内，杜绝旋转木马切号）
+            TrafficTier::Oversized => rng.gen_range(8000..=15_000),
         }
     }
 
@@ -914,7 +914,9 @@ impl HumanizedPacer {
             if let Some(entry) = self.account_states.get(account_id) {
                 if let Some(refreshed_at) = entry.last_oauth_refresh_at {
                     let elapsed = refreshed_at.elapsed().as_secs();
-                    if elapsed < TOKEN_REFRESH_WARMUP_OVERSIZE_SECS {
+                    let is_cold = crate::proxy::account_selector::get_capacity_tier(account_id)
+                        == crate::proxy::account_selector::CapacityTier::Tier1Cold;
+                    if is_cold && elapsed < TOKEN_REFRESH_WARMUP_OVERSIZE_SECS {
                         let remain = (TOKEN_REFRESH_WARMUP_OVERSIZE_SECS - elapsed).max(5);
                         return Some(LeaseRejectReason::TokenRefreshWarmup {
                             retry_after_secs: remain,
@@ -1001,7 +1003,7 @@ impl HumanizedPacer {
                     wait_ms,
                     total_slots,
                 } => {
-                    if wait_ms <= FALLBACK_MAX_SLOT_WAIT_MS {
+                    if wait_ms <= STICKY_MAX_SLOT_WAIT_MS {
                         AccountProbe::Admissible {
                             wait_ms,
                             current_heat,
@@ -1516,6 +1518,7 @@ impl SlotLeaseGuard {
                 crate::proxy::account_selector::release_in_flight(&self.account_id, self.reserved_inflight_tokens);
                 self.reserved_inflight_tokens = 0;
             }
+            crate::proxy::account_selector::record_warm_interaction(&self.account_id);
             self.pacer
                 .complete_lease(&self.account_id, self.lease_id, self.footprint);
             self.finished = true;
@@ -2414,16 +2417,16 @@ mod tests {
         let wait = pacer.get_required_wait_ms(acc);
         assert!(wait >= 700 && wait <= 1850, "Normal wait was {}ms", wait);
 
-        // 2. L2 Medium (50K~100K tokens 或 200KB~400KB)：少量延迟 2000ms ~ 3800ms
+        // 2. L2 Medium (50K~100K tokens 或 200KB~400KB)：3500ms ~ 7500ms
         pacer.mark_request_completed(acc, Some(75_000));
         let wait_medium = pacer.get_required_wait_ms(acc);
         assert!(
-            wait_medium >= 1900 && wait_medium <= 3850,
+            wait_medium >= 3400 && wait_medium <= 7600,
             "Medium wait was {}ms",
             wait_medium
         );
 
-        // 3. L3 Oversized (>100K tokens 或 >400KB)：充分冷却 8000ms ~ 15000ms
+        // 3. L3 Oversized (>100K tokens 或 >400KB)：8000ms ~ 15000ms
         pacer.mark_request_completed(acc, Some(150_000));
         let wait_huge = pacer.get_required_wait_ms(acc);
         assert!(
@@ -2540,9 +2543,9 @@ mod tests {
         // 若中途回滚，槽位退回原冷却状态，不污染计数
         s_reserved.abort_and_rollback();
 
-        // 3. 若两个槽冷却剩余 > 2s（例如 130K Medium 请求冷却 2.5s~3.8s），粘性会话 (>2s) 果断拒绝以触发换号
+        // 3. 若两个槽冷却剩余 > STICKY_MAX_SLOT_WAIT_MS，粘性会话果断拒绝以触发换号
         if let Some(mut entry) = pacer.account_states.get_mut(acc) {
-            let until = std::time::Instant::now() + Duration::from_millis(3000);
+            let until = std::time::Instant::now() + Duration::from_millis(STICKY_MAX_SLOT_WAIT_MS + 2000);
             entry.slots = vec![
                 SlotPhase::CoolingDown {
                     until,

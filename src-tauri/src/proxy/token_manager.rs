@@ -291,13 +291,17 @@ impl TokenManager {
         self.account_inflight.current(account_id)
     }
 
-    /// 启动限流记录自动清理后台任务（每15秒检查并清除过期记录）
+    /// 启动限流记录自动清理与后台主动巡检任务（15s 清除过期记录，180s 主动预刷新与黄金老兵预热）
     pub async fn start_auto_cleanup(&self) {
         let tracker = self.rate_limit_tracker.clone();
         let cancel = self.cancel_token.child_token();
+        let tokens_map = Arc::clone(&self.tokens);
+        let refresh_locks = Arc::clone(&self.refresh_locks);
+        let pacer = Arc::clone(&self.pacer);
 
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            let mut tick_count: u32 = 0;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -312,6 +316,101 @@ impl TokenManager {
                                 cleaned
                             );
                         }
+
+                        tick_count = tick_count.wrapping_add(1);
+                        // 每 180 秒 (12 * 15s) 执行一次后台主动巡检（提前预刷新 + 黄金老兵预热池巡检）
+                        if tick_count % 12 == 0 {
+                            let now = chrono::Utc::now().timestamp();
+                            let active_list: Vec<ProxyToken> = tokens_map.iter().map(|r| r.value().clone()).collect();
+
+                            // 1. 后台静默预刷新：仅对处于温热活跃态（非 Tier1Cold）且进入过期前 10 分钟窗口的账号静默换发（闲置冷号保持 0 网络交互）
+                            for t in &active_list {
+                                let is_warm = crate::proxy::account_selector::get_capacity_tier(&t.account_id)
+                                    != crate::proxy::account_selector::CapacityTier::Tier1Cold;
+                                if is_warm && now >= t.timestamp - Self::OAUTH_PROACTIVE_REFRESH_WINDOW_SECS {
+                                    let refresh_mu = {
+                                        refresh_locks
+                                            .entry(t.account_id.clone())
+                                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                                            .value()
+                                            .clone()
+                                    };
+                                    let _guard = match refresh_mu.try_lock() {
+                                        Ok(g) => g,
+                                        Err(_) => continue,
+                                    };
+                                    let now_recheck = chrono::Utc::now().timestamp();
+                                    if let Some(latest) = tokens_map.get(&t.account_id) {
+                                        if now_recheck < latest.timestamp - Self::OAUTH_PROACTIVE_REFRESH_WINDOW_SECS {
+                                            continue;
+                                        }
+                                    }
+                                    tracing::info!("🔄 [BackgroundWorker] 活跃账号 {} 进入 10 分钟预刷新窗口，静默换发...", t.email);
+                                    if let Ok(token_response) = crate::modules::oauth::refresh_access_token(&t.refresh_token, Some(&t.account_id)).await {
+                                        let refreshed_at = chrono::Utc::now().timestamp();
+                                        if let Some(mut entry) = tokens_map.get_mut(&t.account_id) {
+                                            entry.access_token = token_response.access_token.clone();
+                                            entry.expires_in = token_response.expires_in;
+                                            entry.timestamp = refreshed_at + token_response.expires_in;
+                                            if let Some(rt) = token_response.refresh_token.clone() {
+                                                entry.refresh_token = rt;
+                                            }
+                                        }
+                                        pacer.note_oauth_refreshed(&t.account_id);
+                                        tracing::info!("✅ [BackgroundWorker] 活跃账号 {} 静默换发完成", t.email);
+                                    }
+                                }
+                            }
+
+                            // 2. 黄金承重预热池巡检（Pre-warming Worker）：
+                            // 若池内黄金承重老兵账号 (Tier3SweetSpot + <60% 小时消耗) 少于 3 个（且总账号 >= 3），
+                            // 优先挑选 Tier2Warming（差 1 次晋升）或 Tier1Cold 账号执行后台拟人化交互垫刀预热
+                            if active_list.len() >= 3 {
+                                let sweet_count = active_list
+                                    .iter()
+                                    .filter(|t| crate::proxy::account_selector::is_sweet_spot_for_oversized(&t.account_id))
+                                    .count();
+
+                                if sweet_count < 3 {
+                                    let candidate = active_list
+                                        .iter()
+                                        .find(|t| {
+                                            crate::proxy::account_selector::get_capacity_tier(&t.account_id)
+                                                == crate::proxy::account_selector::CapacityTier::Tier2Warming
+                                                && crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id)
+                                        })
+                                        .or_else(|| {
+                                            active_list.iter().find(|t| {
+                                                crate::proxy::account_selector::get_capacity_tier(&t.account_id)
+                                                    == crate::proxy::account_selector::CapacityTier::Tier1Cold
+                                                    && crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id)
+                                            })
+                                        });
+
+                                    if let Some(target_acc) = candidate {
+                                        let mut access_tok = target_acc.access_token.clone();
+                                        if now >= target_acc.timestamp - Self::OAUTH_PRE_REFRESH_WINDOW_SECS {
+                                            if let Ok(token_response) = crate::modules::oauth::refresh_access_token(&target_acc.refresh_token, Some(&target_acc.account_id)).await {
+                                                let refreshed_at = chrono::Utc::now().timestamp();
+                                                access_tok = token_response.access_token.clone();
+                                                if let Some(mut entry) = tokens_map.get_mut(&target_acc.account_id) {
+                                                    entry.access_token = token_response.access_token.clone();
+                                                    entry.expires_in = token_response.expires_in;
+                                                    entry.timestamp = refreshed_at + token_response.expires_in;
+                                                    if let Some(rt) = token_response.refresh_token.clone() {
+                                                        entry.refresh_token = rt;
+                                                    }
+                                                }
+                                                pacer.note_oauth_refreshed(&target_acc.account_id);
+                                            }
+                                        }
+                                        let proj = target_acc.project_id.clone().unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
+                                        tracing::info!("♨️ [PrewarmingWorker] 发现黄金承重账号仅 {}/3，挑选账号 {} 执行后台拟人化预热...", sweet_count, target_acc.email);
+                                        let _ = Self::execute_account_warmup_pad(&target_acc.account_id, &access_tok, &proj, &target_acc.email).await;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -325,7 +424,7 @@ impl TokenManager {
         }
         *guard = Some(handle);
 
-        tracing::info!("Rate limit auto-cleanup task started (interval: 15s)");
+        tracing::info!("Rate limit auto-cleanup & prewarm task started (interval: 15s)");
     }
 
     /// 从主应用账号目录加载所有账号（两阶段零停机平滑原子同步）
@@ -1916,6 +2015,138 @@ impl TokenManager {
     /// 余量不足 180s 时由请求驱动按需懒加载刷新（Lazy Refresh）；闲置账号不刷新，0 次非必要网络交互。
     pub const OAUTH_PRE_REFRESH_WINDOW_SECS: i64 = 180;
 
+    /// OAuth Access Token 后台主动预刷新窗口（600 秒 = 10 分钟）：
+    /// 活跃账号在过期前 10 分钟由后台静默完成刷新，彻底消灭请求在途刷新等待与冷却。
+    pub const OAUTH_PROACTIVE_REFRESH_WINDOW_SECS: i64 = 600;
+
+    /// 真实 IDE 场景垫刀 Prompts（12 组短指令，拟真度 100%）
+    pub const REALISTIC_IDE_WARMUP_PROMPTS: &'static [&'static str] = &[
+        "Check syntax and format for rust struct definition",
+        "Suggest concise variable name for database connection pool",
+        "Generate single-line docstring for cache eviction method",
+        "Verify return type compatibility for async handler",
+        "Provide regex pattern to validate semantic version string",
+        "Review error handling in file stream parser",
+        "Explain edge cases of integer overflow in timestamp arithmetic",
+        "Draft minimal unit test for token bucket rate limiter",
+        "Suggest idiomatic rust pattern for enum pattern matching",
+        "Check if tokio mutex is required for thread-safe counter",
+        "Format JSON schema snippet for API health check endpoint",
+        "Optimize string allocation in logging formatter",
+    ];
+
+    /// 执行真实 IDE 场景交互垫刀破冰（用于大包遭遇冷号兜底时的安全探活与拟人化破冰）
+    pub async fn execute_account_warmup_pad(
+        account_id: &str,
+        access_token: &str,
+        project_id: &str,
+        email: &str,
+    ) -> bool {
+        #[cfg(test)]
+        {
+            crate::proxy::account_selector::record_warm_interaction(account_id);
+            return true;
+        }
+
+        let prompt = {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            Self::REALISTIC_IDE_WARMUP_PROMPTS[rng.gen_range(0..Self::REALISTIC_IDE_WARMUP_PROMPTS.len())]
+        };
+
+        let (client, route) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            pool.get_effective_standard_client_with_route(Some(account_id), 15).await
+        } else if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+            let up = app_cfg.proxy.upstream_proxy;
+            if up.enabled && !up.url.is_empty() {
+                (
+                    crate::utils::http::get_standard_client(),
+                    crate::proxy::proxy_pool::EgressRoute::Upstream,
+                )
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        };
+
+        if route == crate::proxy::proxy_pool::EgressRoute::Direct {
+            return false;
+        }
+
+        let payload = serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "project": project_id,
+            "contents": [{
+                "role": "user",
+                "parts": [{ "text": prompt }]
+            }],
+            "generationConfig": {
+                "maxOutputTokens": 8
+            }
+        });
+
+        let wrapped = serde_json::json!({
+            "project": project_id,
+            "request": payload,
+            "metadata": {
+                "ideType": "ANTIGRAVITY",
+                "platform": "DESKTOP"
+            }
+        });
+
+        let url = "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
+        let start = std::time::Instant::now();
+        let resp = client
+            .post(url)
+            .bearer_auth(access_token)
+            .header("User-Agent", crate::constants::USER_AGENT.as_str())
+            .header("Content-Type", "application/json")
+            .json(&wrapped)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+
+        match resp {
+            Ok(res) if res.status().is_success() => {
+                let elapsed_ms = start.elapsed().as_millis();
+                tracing::info!(
+                    "✨ [WarmupPad] Successfully warmed up cold account {} via realistic prompt in {}ms. Introducing jitter delay...",
+                    email,
+                    elapsed_ms
+                );
+                let jitter_ms = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(2500..=5000)
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                crate::proxy::account_selector::record_warm_interaction(account_id);
+                true
+            }
+            Ok(res) => {
+                tracing::warn!(
+                    "⚠️ [WarmupPad] Cold account {} warmup pad returned HTTP {}. Skipping promotion.",
+                    email,
+                    res.status()
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "⚠️ [WarmupPad] Cold account {} warmup pad error: {}. Skipping promotion.",
+                    email,
+                    err
+                );
+                false
+            }
+        }
+    }
+
+    /// 实例级包装方法
+    pub async fn execute_inline_warmup_pad(&self, token: &ProxyToken, project_id: &str) -> bool {
+        Self::execute_account_warmup_pad(&token.account_id, &token.access_token, project_id, &token.email).await
+    }
+
     #[inline]
     pub fn token_needs_oauth_refresh(t: &ProxyToken, now_ts: i64) -> bool {
         now_ts >= t.timestamp - Self::OAUTH_PRE_REFRESH_WINDOW_SECS
@@ -2332,7 +2563,7 @@ impl TokenManager {
             }
         };
 
-        // 4. 若该租约属于粘性微等（<=2s）或全池冷却兜底（<=5s）预约槽，在此完成冷却微等并正式提升为 InFlight
+        // 4. 若该租约属于粘性等待（<=18s）或全池冷却兜底（<=5s）预约槽，在此完成冷却等待并正式提升为 InFlight
         let wait_ms = acquired.lease_guard.reserved_wait_ms();
         if wait_ms > 0 {
             tracing::info!(
@@ -2342,6 +2573,28 @@ impl TokenManager {
             );
             acquired.lease_guard.wait_until_ready().await;
             acquired.wait_ms = wait_ms;
+        }
+
+        // 5. [CapacityAware] 若当前请求超出冷号阈值 (>20k tokens 或 Medium/Oversized)，但因全池无温热老兵兜底落到了 Tier1Cold 冷号：
+        // 在 15s 选号死锁超时保护圈之外执行真实 IDE 交互垫刀破冰 + 2.5s~5s 随机抖动延迟，严防巨包裸打冷号触发 403 TOS_VIOLATION！
+        if (footprint.prompt_tokens > crate::proxy::account_selector::TIER1_COLD_MAX_INPUT_TOKENS
+            || footprint.is_medium_or_oversized())
+            && crate::proxy::account_selector::get_capacity_tier(&acquired.account_id)
+                == crate::proxy::account_selector::CapacityTier::Tier1Cold
+        {
+            tracing::warn!(
+                "❄️ [CapacityAware] Account {} is Tier1Cold and facing large request ({} tokens, {}B). Executing realistic inline warmup pad + jitter delay...",
+                acquired.email,
+                footprint.prompt_tokens,
+                footprint.raw_body_len
+            );
+            let _ = Self::execute_account_warmup_pad(
+                &acquired.account_id,
+                &acquired.access_token,
+                &acquired.project_id,
+                &acquired.email,
+            )
+            .await;
         }
 
         Ok(acquired)
@@ -2499,10 +2752,68 @@ impl TokenManager {
         Ok((token, project_id))
     }
 
-    /// 容量感知三层梯队 P2C 选号并原子锁定槽位租约
-    async fn select_and_lease_with_p2c(
+    fn p2c_choose_from_slice<'a>(
         &self,
-        tokens_snapshot: &[ProxyToken],
+        bucket: &[(&'a ProxyToken, f64, usize)],
+        session_id: Option<&str>,
+        billing_target: &str,
+    ) -> &'a ProxyToken {
+        use rand::Rng;
+        let isolated: Vec<(&'a ProxyToken, f64, usize)> = bucket
+            .iter()
+            .copied()
+            .filter(|(t, _, _)| !self.is_account_session_busy(&t.account_id, session_id))
+            .collect();
+        let candidates = if !isolated.is_empty() { &isolated } else { bucket };
+        if candidates.len() == 1 {
+            candidates[0].0
+        } else {
+            let pool_size = candidates.len().min(Self::P2C_POOL_SIZE);
+            let mut rng = rand::thread_rng();
+            let pick1 = rng.gen_range(0..pool_size);
+            let raw_pick2 = rng.gen_range(0..pool_size);
+            let pick2 = if raw_pick2 == pick1 { (pick1 + 1) % pool_size } else { raw_pick2 };
+            let (c1, h1, f1) = candidates[pick1];
+            let (c2, h2, f2) = candidates[pick2];
+            if (h1 - h2).abs() >= 0.5 {
+                if h1 < h2 { c1 } else { c2 }
+            } else if f1 != f2 {
+                if f1 > f2 { c1 } else { c2 }
+            } else {
+                let b1 = self.is_account_session_busy(&c1.account_id, session_id);
+                let b2 = self.is_account_session_busy(&c2.account_id, session_id);
+                if b1 != b2 {
+                    if !b1 { c1 } else { c2 }
+                } else {
+                    let s1 = self.bound_session_count(&c1.account_id);
+                    let s2 = self.bound_session_count(&c2.account_id);
+                    if s1 != s2 {
+                        if s1 < s2 { c1 } else { c2 }
+                    } else {
+                        let q1 = c1.model_quotas.get(billing_target).copied().or(c1.remaining_quota).unwrap_or(0);
+                        let q2 = c2.model_quotas.get(billing_target).copied().or(c2.remaining_quota).unwrap_or(0);
+                        if q1 >= q2 { c1 } else { c2 }
+                    }
+                }
+            }
+        }
+    }
+
+    fn cooldown_choose_from_slice<'a>(
+        &self,
+        bucket: &[(&'a ProxyToken, u64, f64)],
+    ) -> &'a ProxyToken {
+        bucket
+            .iter()
+            .min_by_key(|(_, w, h)| (*w, (*h * 100.0) as i64))
+            .map(|(t, _, _)| *t)
+            .unwrap()
+    }
+
+    /// 容量感知三层梯队 P2C 选号并原子锁定槽位租约
+    async fn select_and_lease_with_p2c<'a>(
+        &self,
+        tokens_snapshot: &'a [ProxyToken],
         attempted: &HashSet<String>,
         billing_target: &str,
         rate_limit_model_key: &str,
@@ -2514,8 +2825,6 @@ impl TokenManager {
         Option<(ProxyToken, SlotLeaseGuard, bool)>,
         Option<(u64, String)>,
     ) {
-        use rand::Rng;
-
         let mut local_raced: HashSet<String> = HashSet::new();
         let mut shortest_reject: Option<(u64, String)> = None;
 
@@ -2528,9 +2837,21 @@ impl TokenManager {
         };
 
         loop {
-            let mut tier1_zero_wait_cold: Vec<(&ProxyToken, f64, usize)> = Vec::new();
-            let mut tier2_zero_wait_warm: Vec<(&ProxyToken, f64, usize)> = Vec::new();
-            let mut tier3_short_cooldown: Vec<(&ProxyToken, u64, f64)> = Vec::new();
+            let prompt_tokens = footprint.prompt_tokens;
+            let is_oversized = prompt_tokens > crate::proxy::account_selector::TIER2_WARMING_MAX_INPUT_TOKENS
+                || footprint.is_oversized();
+            let is_medium = !is_oversized
+                && (prompt_tokens > crate::proxy::account_selector::TIER1_COLD_MAX_INPUT_TOKENS
+                    || footprint.is_medium_or_oversized());
+
+            let mut sweet_zero: Vec<(&ProxyToken, f64, usize)> = Vec::new();
+            let mut sweet_cooldown: Vec<(&ProxyToken, u64, f64)> = Vec::new();
+            let mut warm_zero: Vec<(&ProxyToken, f64, usize)> = Vec::new();
+            let mut warm_cooldown: Vec<(&ProxyToken, u64, f64)> = Vec::new();
+            let mut cold_zero: Vec<(&ProxyToken, f64, usize)> = Vec::new();
+            let mut cold_cooldown: Vec<(&ProxyToken, u64, f64)> = Vec::new();
+            let mut overheated_zero: Vec<(&ProxyToken, f64, usize)> = Vec::new();
+            let mut overheated_cooldown: Vec<(&ProxyToken, u64, f64)> = Vec::new();
 
             let now_ts = chrono::Utc::now().timestamp();
 
@@ -2559,10 +2880,6 @@ impl TokenManager {
                     continue;
                 }
 
-                // 铁律：当请求为 Medium/Oversized（>50K tokens 或 >200KB）且候选账号 OAuth Token 处于不安全期（临期 <=120s 或新签发未满 60s）时，
-                // 路由层严禁选它执行在途刷新 + 首包裸发大包：
-                // - 若 Token 临期：触发后台安全刷新与 40B 握手预热（受 30s 失败退避保护）；
-                // - 直接跳过该账号，改选拥有已预热稳定 Token 的健康账号！
                 if footprint.is_medium_or_oversized() && Self::token_unsafe_for_medium_or_oversized(t, now_ts) {
                     record_reject(
                         &mut shortest_reject,
@@ -2583,12 +2900,58 @@ impl TokenManager {
                         free_slots,
                         ..
                     } => {
-                        if wait_ms == 0 && current_heat < COLD_POOL_HEAT_THRESHOLD {
-                            tier1_zero_wait_cold.push((t, current_heat, free_slots));
-                        } else if wait_ms == 0 {
-                            tier2_zero_wait_warm.push((t, current_heat, free_slots));
+                        let tier = crate::proxy::account_selector::get_capacity_tier(&t.account_id);
+                        let hourly_ok = crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id);
+
+                        if !hourly_ok {
+                            // 本小时已消耗 >= 60% 动态软上限（过热梯队）：绝对禁止伪装成冷号被优先破冰，仅作为末位兜底
+                            if wait_ms == 0 {
+                                overheated_zero.push((t, current_heat, free_slots));
+                            } else if wait_ms <= FALLBACK_MAX_SLOT_WAIT_MS {
+                                overheated_cooldown.push((t, wait_ms, current_heat));
+                            } else {
+                                record_reject(
+                                    &mut shortest_reject,
+                                    (wait_ms / 1000).max(1),
+                                    format!("Account {} overheated & cooling down ({}ms)", t.email, wait_ms),
+                                );
+                            }
+                        } else if tier == crate::proxy::account_selector::CapacityTier::Tier3SweetSpot {
+                            if wait_ms == 0 {
+                                sweet_zero.push((t, current_heat, free_slots));
+                            } else if wait_ms <= STICKY_MAX_SLOT_WAIT_MS {
+                                sweet_cooldown.push((t, wait_ms, current_heat));
+                            } else {
+                                record_reject(
+                                    &mut shortest_reject,
+                                    (wait_ms / 1000).max(1),
+                                    format!("Account {} sweet-spot cooling down ({}ms)", t.email, wait_ms),
+                                );
+                            }
+                        } else if tier == crate::proxy::account_selector::CapacityTier::Tier2Warming {
+                            if wait_ms == 0 {
+                                warm_zero.push((t, current_heat, free_slots));
+                            } else if wait_ms <= STICKY_MAX_SLOT_WAIT_MS {
+                                warm_cooldown.push((t, wait_ms, current_heat));
+                            } else {
+                                record_reject(
+                                    &mut shortest_reject,
+                                    (wait_ms / 1000).max(1),
+                                    format!("Account {} warming cooling down ({}ms)", t.email, wait_ms),
+                                );
+                            }
                         } else {
-                            tier3_short_cooldown.push((t, wait_ms, current_heat));
+                            if wait_ms == 0 {
+                                cold_zero.push((t, current_heat, free_slots));
+                            } else if wait_ms <= FALLBACK_MAX_SLOT_WAIT_MS {
+                                cold_cooldown.push((t, wait_ms, current_heat));
+                            } else {
+                                record_reject(
+                                    &mut shortest_reject,
+                                    (wait_ms / 1000).max(1),
+                                    format!("Account {} cold cooling down ({}ms)", t.email, wait_ms),
+                                );
+                            }
                         }
                     }
                     AccountProbe::Rejected(reason) => {
@@ -2603,110 +2966,92 @@ impl TokenManager {
                 }
             }
 
-            if !tier1_zero_wait_cold.is_empty() || !tier2_zero_wait_warm.is_empty() {
-                let raw_bucket = if !tier1_zero_wait_cold.is_empty() {
-                    &tier1_zero_wait_cold
+            // 根据请求体量确定选号优先级梯队
+            let selected_plan: Option<(&'a ProxyToken, u64)> = if is_oversized {
+                // Oversized (>50k): 黄金老兵零等待 > 黄金老兵短等(<=18s) > 初热号零等 > 初热号短等(<=18s) > 兜底冷号(带垫刀) > 过热号兜底
+                if !sweet_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&sweet_zero, session_id, billing_target), 0))
+                } else if !sweet_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&sweet_cooldown), STICKY_MAX_SLOT_WAIT_MS))
+                } else if !warm_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&warm_zero, session_id, billing_target), 0))
+                } else if !warm_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&warm_cooldown), STICKY_MAX_SLOT_WAIT_MS))
+                } else if !cold_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&cold_zero, session_id, billing_target), 0))
+                } else if !cold_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&cold_cooldown), FALLBACK_MAX_SLOT_WAIT_MS))
+                } else if !overheated_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&overheated_zero, session_id, billing_target), 0))
+                } else if !overheated_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&overheated_cooldown), FALLBACK_MAX_SLOT_WAIT_MS))
                 } else {
-                    &tier2_zero_wait_warm
-                };
-
-                // 软排他优化：优先挑选“过去 60 秒内无异己活跃 Session 占用”的纯净空闲账号
-                let isolated_candidates: Vec<(&ProxyToken, f64, usize)> = raw_bucket
+                    None
+                }
+            } else if is_medium {
+                // Medium (20k~50k): 黄金/初热零等待 > 黄金/初热短等(<=18s) > 过热熟号零等待 > 兜底冷号(带垫刀)
+                if !sweet_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&sweet_zero, session_id, billing_target), 0))
+                } else if !warm_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&warm_zero, session_id, billing_target), 0))
+                } else if !sweet_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&sweet_cooldown), STICKY_MAX_SLOT_WAIT_MS))
+                } else if !warm_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&warm_cooldown), STICKY_MAX_SLOT_WAIT_MS))
+                } else if !overheated_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&overheated_zero, session_id, billing_target), 0))
+                } else if !cold_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&cold_zero, session_id, billing_target), 0))
+                } else if !cold_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&cold_cooldown), FALLBACK_MAX_SLOT_WAIT_MS))
+                } else if !overheated_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&overheated_cooldown), FALLBACK_MAX_SLOT_WAIT_MS))
+                } else {
+                    None
+                }
+            } else {
+                // Small (<=20k): 优先纯冷号破冰 (0->1) > 初热号晋升 (1->2 升入黄金池) > 黄金老兵 > 其余冷号 > 过热号 > 短等预约
+                let cold_pure: Vec<(&'a ProxyToken, f64, usize)> = cold_zero
                     .iter()
                     .copied()
-                    .filter(|(t, _, _)| !self.is_account_session_busy(&t.account_id, session_id))
+                    .filter(|(_, h, _)| *h < COLD_POOL_HEAT_THRESHOLD)
                     .collect();
-
-                let bucket = if !isolated_candidates.is_empty() {
-                    &isolated_candidates
+                if !cold_pure.is_empty() {
+                    Some((self.p2c_choose_from_slice(&cold_pure, session_id, billing_target), 0))
+                } else if !warm_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&warm_zero, session_id, billing_target), 0))
+                } else if !sweet_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&sweet_zero, session_id, billing_target), 0))
+                } else if !cold_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&cold_zero, session_id, billing_target), 0))
+                } else if !overheated_zero.is_empty() {
+                    Some((self.p2c_choose_from_slice(&overheated_zero, session_id, billing_target), 0))
+                } else if !cold_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&cold_cooldown), FALLBACK_MAX_SLOT_WAIT_MS))
+                } else if !warm_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&warm_cooldown), FALLBACK_MAX_SLOT_WAIT_MS))
+                } else if !sweet_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&sweet_cooldown), FALLBACK_MAX_SLOT_WAIT_MS))
+                } else if !overheated_cooldown.is_empty() {
+                    Some((self.cooldown_choose_from_slice(&overheated_cooldown), FALLBACK_MAX_SLOT_WAIT_MS))
                 } else {
-                    // 全池候选账号在最近 60 秒内均有活跃 Session 时，降级共享
-                    raw_bucket
-                };
-
-                let chosen = if bucket.len() == 1 {
-                    bucket[0].0
-                } else {
-                    let pool_size = bucket.len().min(Self::P2C_POOL_SIZE);
-                    let mut rng = rand::thread_rng();
-                    let pick1 = rng.gen_range(0..pool_size);
-                    let raw_pick2 = rng.gen_range(0..pool_size);
-                    let pick2 = if raw_pick2 == pick1 {
-                        (pick1 + 1) % pool_size
-                    } else {
-                        raw_pick2
-                    };
-
-                    let (c1, h1, f1) = bucket[pick1];
-                    let (c2, h2, f2) = bucket[pick2];
-
-                    if (h1 - h2).abs() >= 0.5 {
-                        if h1 < h2 { c1 } else { c2 }
-                    } else if f1 != f2 {
-                        if f1 > f2 { c1 } else { c2 }
-                    } else {
-                        let b1 = self.is_account_session_busy(&c1.account_id, session_id);
-                        let b2 = self.is_account_session_busy(&c2.account_id, session_id);
-                        if b1 != b2 {
-                            if !b1 { c1 } else { c2 }
-                        } else {
-                            let s1 = self.bound_session_count(&c1.account_id);
-                            let s2 = self.bound_session_count(&c2.account_id);
-                            if s1 != s2 {
-                                if s1 < s2 { c1 } else { c2 }
-                            } else {
-                                let q1 = c1
-                                    .model_quotas
-                                    .get(billing_target)
-                                    .copied()
-                                    .or(c1.remaining_quota)
-                                    .unwrap_or(0);
-                                let q2 = c2
-                                    .model_quotas
-                                    .get(billing_target)
-                                    .copied()
-                                    .or(c2.remaining_quota)
-                                    .unwrap_or(0);
-                                if q1 >= q2 { c1 } else { c2 }
-                            }
-                        }
-                    }
-                };
-
-                let max_slots = self.effective_slot_count(&chosen.account_id);
-                match self
-                    .pacer
-                    .try_acquire_lease(&chosen.account_id, footprint, max_slots, 0)
-                {
-                    Ok((guard, entered_nap)) => {
-                        return (Some((chosen.clone(), guard, entered_nap)), shortest_reject);
-                    }
-                    Err(_) => {
-                        local_raced.insert(chosen.account_id.clone());
-                        continue;
-                    }
+                    None
                 }
-            } else if !tier3_short_cooldown.is_empty() {
-                // 全池没有任何 Free 槽位时，兜底挑选剩余冷却最短（<=5s）的单个账号进行预约微等
-                let chosen = tier3_short_cooldown
-                    .iter()
-                    .min_by_key(|(_, w, h)| (*w, (*h * 100.0) as i64))
-                    .map(|(t, _, _)| *t)
-                    .unwrap();
+            };
 
+            if let Some((chosen, max_wait)) = selected_plan {
                 let max_slots = self.effective_slot_count(&chosen.account_id);
-                match self.pacer.try_acquire_lease(
-                    &chosen.account_id,
-                    footprint,
-                    max_slots,
-                    FALLBACK_MAX_SLOT_WAIT_MS,
-                ) {
+                match self.pacer.try_acquire_lease(&chosen.account_id, footprint, max_slots, max_wait) {
                     Ok((guard, entered_nap)) => {
-                        tracing::info!(
-                            "⏳ [P2C] All open slots busy across pool; reserved shortest-cooldown account {} (wait: {}ms)",
-                            chosen.email,
-                            guard.reserved_wait_ms()
-                        );
+                        if guard.reserved_wait_ms() > 0 {
+                            tracing::info!(
+                                "⏳ [P2C] Reserved cooling account {} (wait: {}ms, max: {}ms, tier: {:?})",
+                                chosen.email,
+                                guard.reserved_wait_ms(),
+                                max_wait,
+                                crate::proxy::account_selector::get_capacity_tier(&chosen.account_id)
+                            );
+                        }
                         return (Some((chosen.clone(), guard, entered_nap)), shortest_reject);
                     }
                     Err(_) => {
@@ -3175,25 +3520,16 @@ impl TokenManager {
                                     self.pacer.get_account_heat(acc_id)
                                 );
                                 self.session_accounts.remove(sid);
-                            } else if footprint.is_medium_or_oversized()
-                                && Self::token_unsafe_for_medium_or_oversized(
-                                    bound_token,
-                                    chrono::Utc::now().timestamp(),
-                                )
+                            } else if footprint.prompt_tokens > crate::proxy::account_selector::TIER2_WARMING_MAX_INPUT_TOKENS
+                                && !crate::proxy::account_selector::is_hourly_sweet_spot(acc_id)
                             {
                                 tracing::info!(
-                                    "Sticky Session: Pre-unbinding {} before Medium/Oversized (>50K/200KB) request because OAuth token is expiring or warming up (<60s); switching to active account.",
-                                    bound_token.email
+                                    "Sticky Session: Pre-unbinding {} before request ({} tokens, hourly usage >= 60%); switching to available sweet-spot account.",
+                                    bound_token.email,
+                                    footprint.prompt_tokens
                                 );
                                 self.session_accounts.remove(sid);
-                                if Self::token_needs_oauth_refresh(
-                                    bound_token,
-                                    chrono::Utc::now().timestamp(),
-                                ) {
-                                    self.spawn_background_oauth_refresh_and_warmup(
-                                        bound_token.clone(),
-                                    );
-                                }
+                                self.unbind_account_session(acc_id);
                             } else {
                                 let max_slots = self.effective_slot_count(acc_id);
                                 match self.pacer.try_acquire_lease(
@@ -7574,15 +7910,15 @@ mod tests {
         assert!(sticky_wait_acq.wait_ms > 0 && sticky_wait_acq.wait_ms <= 2000);
         sticky_wait_acq.lease_guard.abort_and_rollback();
 
-        // 2. 设 acc1 的两个并发槽处于 3200ms (>2s) 冷却期内：
+        // 2. 设 acc1 的两个并发槽处于 20_000ms (>18s STICKY_MAX_SLOT_WAIT_MS) 冷却期内：
         // - 粘性会话 (session-1) 果断解绑切往空闲的 acc2！
         manager
             .pacer
-            .test_set_all_slots_cooldown("acc1", 2, 3200, false);
+            .test_set_all_slots_cooldown("acc1", 2, 20_000, false);
         let mut sticky_switch_acq = manager
             .acquire_token_with_lease("gemini", false, Some("session-1"), "gemini-2.5-pro", fp_small)
             .await
-            .expect("sticky session must switch when cooldown > 2s");
+            .expect("sticky session must switch when cooldown > 18s");
         assert_eq!(sticky_switch_acq.account_id, "acc2");
         assert_eq!(sticky_switch_acq.wait_ms, 0);
         sticky_switch_acq.lease_guard.abort_and_rollback();
@@ -7633,6 +7969,10 @@ mod tests {
         let mut manager = TokenManager::new(tmp_root.clone());
         manager.pacer = Arc::new(crate::proxy::rate_limit::HumanizedPacer::new_warmed());
         manager.load_accounts().await.unwrap();
+
+        // 标记 acc_active 为黄金老兵账号 (Tier3SweetSpot)
+        crate::proxy::account_selector::record_warm_interaction("acc_active");
+        crate::proxy::account_selector::record_warm_interaction("acc_active");
 
         // Bind sticky session to acc_expiring
         manager
@@ -7725,6 +8065,8 @@ mod tests {
         acq_norm.lease_guard.abort_and_rollback();
 
         // 2. Medium/Oversized (>50K tokens or >200KB) request MUST skip acc_fresh (<60s) and select acc_warmed
+        crate::proxy::account_selector::record_warm_interaction("acc_warmed");
+        crate::proxy::account_selector::record_warm_interaction("acc_warmed");
         let fp_oversize = RequestFootprint::new(120_000, 450 * 1024);
         let mut acq_over = manager
             .acquire_token_with_lease(

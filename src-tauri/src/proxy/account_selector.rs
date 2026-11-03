@@ -58,6 +58,34 @@ pub const FATIGUE_STRIKE_COOLDOWN_SECS: i64 = 14400;
 /// 削峰填谷平滑抖动阈值：当两个账号当日 Output Token 差距在 5000 tokens 以内时，视为同一消耗梯队
 pub const LOAD_SMOOTHING_TOKEN_DIFF_THRESHOLD: u64 = 5000;
 
+/// 慢启动破冰阶梯 Input Token 边界（统一唯一标准）
+pub const TIER1_COLD_MAX_INPUT_TOKENS: u32 = 20_000;      // 阶段一（冷号破冰期）：单包上限 20k
+pub const TIER2_WARMING_MAX_INPUT_TOKENS: u32 = 50_000;   // 阶段二（初热期）：单包上限 50k
+
+/// 账号温热态保鲜窗口（秒）：2 小时（7200s）无成功交互则自然冷却退回 Tier1Cold
+pub const WARMTH_RETENTION_WINDOW_SECS: i64 = 7200;
+
+/// 黄金承重区（Sweet Spot）本小时消耗水位红线：已用 + 预占 < 动态小时软上限的 60%
+pub const SWEET_SPOT_HOURLY_USAGE_RATIO: f64 = 0.60;
+
+/// 账号慢启动承载能力阶梯
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CapacityTier {
+    /// 阶段一（冰封/冷启动）：近 2h 成功请求 0 次，仅可接 <= 20k tokens
+    Tier1Cold,
+    /// 阶段二（初热期）：近 2h 成功请求 1 次，可接 <= 50k tokens
+    Tier2Warming,
+    /// 阶段三（完全破冰期）：近 2h 成功请求 >= 2 次，无单包体量上限
+    Tier3SweetSpot,
+}
+
+/// 账号温热状态追踪
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct AccountWarmthState {
+    pub recent_success_count: u32,
+    pub last_active_at: i64,
+}
+
 /// 单账号动态抖动软上限
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AccountJitterCap {
@@ -159,6 +187,10 @@ static GLOBAL_FATIGUE_STRIKES: Lazy<Arc<DashMap<String, (u32, i64)>>> =
 
 /// 全局单例：实时使用量追踪
 static GLOBAL_USAGE_TRACKER: Lazy<Arc<DashMap<String, AccountTokenUsage>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// 全局单例：账号温热度与慢启动活跃追踪 account_id -> AccountWarmthState
+static GLOBAL_WARMTH_TRACKER: Lazy<Arc<DashMap<String, AccountWarmthState>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// 可参与调度的账号候选对象 Trait
@@ -324,6 +356,62 @@ impl AccountSelector {
             .get(account_id)
             .map(|r| *r)
             .unwrap_or(0)
+    }
+
+    /// 获取账号当前慢启动容量等级（超 2h 无活动自动衰减为冷号）
+    pub fn get_capacity_tier(&self, account_id: &str, now_ts: i64) -> CapacityTier {
+        if let Some(entry) = GLOBAL_WARMTH_TRACKER.get(account_id) {
+            if now_ts.saturating_sub(entry.last_active_at) > WARMTH_RETENTION_WINDOW_SECS {
+                return CapacityTier::Tier1Cold;
+            }
+            match entry.recent_success_count {
+                0 => CapacityTier::Tier1Cold,
+                1 => CapacityTier::Tier2Warming,
+                _ => CapacityTier::Tier3SweetSpot,
+            }
+        } else {
+            CapacityTier::Tier1Cold
+        }
+    }
+
+    /// 记录一次成功的温热请求交互（推进慢启动阶梯）
+    pub fn record_warm_interaction(&self, account_id: &str, now_ts: i64) {
+        let mut entry = GLOBAL_WARMTH_TRACKER
+            .entry(account_id.to_string())
+            .or_insert_with(AccountWarmthState::default);
+        if now_ts.saturating_sub(entry.last_active_at) > WARMTH_RETENTION_WINDOW_SECS {
+            entry.recent_success_count = 1;
+        } else {
+            entry.recent_success_count = entry.recent_success_count.saturating_add(1);
+        }
+        entry.last_active_at = now_ts;
+    }
+
+    /// 判断账号是否处于当前小时“黄金承重区”（已用 + 在途 < 小时动态软上限的 60%）
+    pub fn is_hourly_sweet_spot(&self, account_id: &str, now_ts: i64) -> bool {
+        let jitter_cap = self.get_or_init_jitter_cap(account_id, now_ts);
+        let (rolling_hourly, _) = self.get_rolling_usage(account_id, now_ts);
+        let in_flight = self.get_in_flight_reserved(account_id);
+        let effective_hourly = rolling_hourly + in_flight;
+        (effective_hourly as f64) < (jitter_cap.hourly_limit as f64) * SWEET_SPOT_HOURLY_USAGE_RATIO
+    }
+
+    /// 评估是否为承接 Oversized (>50k) 巨包的“黄金老兵”（已破冰 Tier3 + 未过热 <60%）
+    pub fn is_sweet_spot_for_oversized(&self, account_id: &str, now_ts: i64) -> bool {
+        self.get_capacity_tier(account_id, now_ts) == CapacityTier::Tier3SweetSpot
+            && self.is_hourly_sweet_spot(account_id, now_ts)
+    }
+
+    /// 检查指定账号是否具备承接特定 input_tokens 体量的慢启动资质
+    pub fn can_accept_input_tokens(&self, account_id: &str, input_tokens: u32, now_ts: i64) -> bool {
+        let tier = self.get_capacity_tier(account_id, now_ts);
+        if input_tokens <= TIER1_COLD_MAX_INPUT_TOKENS {
+            true
+        } else if input_tokens <= TIER2_WARMING_MAX_INPUT_TOKENS {
+            tier >= CapacityTier::Tier2Warming
+        } else {
+            tier == CapacityTier::Tier3SweetSpot && self.is_hourly_sweet_spot(account_id, now_ts)
+        }
     }
 
     /// 评估是否需要触发疲劳休眠（结合滑动窗口、在途预占与阶梯退避惩罚）
@@ -777,6 +865,31 @@ pub fn select_least_used_account<'a, T: AccountCandidate>(
     AccountSelector.select_least_used(candidates, target_model)
 }
 
+pub fn get_capacity_tier(account_id: &str) -> CapacityTier {
+    let now = chrono::Utc::now().timestamp();
+    AccountSelector.get_capacity_tier(account_id, now)
+}
+
+pub fn record_warm_interaction(account_id: &str) {
+    let now = chrono::Utc::now().timestamp();
+    AccountSelector.record_warm_interaction(account_id, now);
+}
+
+pub fn is_hourly_sweet_spot(account_id: &str) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    AccountSelector.is_hourly_sweet_spot(account_id, now)
+}
+
+pub fn is_sweet_spot_for_oversized(account_id: &str) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    AccountSelector.is_sweet_spot_for_oversized(account_id, now)
+}
+
+pub fn can_accept_input_tokens(account_id: &str, input_tokens: u32) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    AccountSelector.can_accept_input_tokens(account_id, input_tokens, now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,6 +998,49 @@ mod tests {
         let rec3 = selector.check_and_update_fatigue(acc_id, email, now_ts + 7200).unwrap();
         assert_eq!(rec3.consecutive_strikes, 3);
         assert!(rec3.nap_duration_secs >= TIER3_NAP_MIN_SECS && rec3.nap_duration_secs <= TIER3_NAP_MAX_SECS);
+    }
+
+    #[test]
+    fn test_capacity_tier_progression_and_sweet_spot() {
+        let selector = AccountSelector::new();
+        let acc_id = "acc_tier_test";
+        let email = "tier@example.com";
+        let now_ts = 1_700_000_000;
+
+        // 初始状态：冷账号 Tier1Cold
+        assert_eq!(selector.get_capacity_tier(acc_id, now_ts), CapacityTier::Tier1Cold);
+        assert!(selector.can_accept_input_tokens(acc_id, 15_000, now_ts));
+        assert!(!selector.can_accept_input_tokens(acc_id, 35_000, now_ts)); // 超过 20k 被拒
+        assert!(!selector.can_accept_input_tokens(acc_id, 80_000, now_ts));
+
+        // 第 1 次成功交互 -> 晋升 Tier2Warming
+        selector.record_warm_interaction(acc_id, now_ts);
+        assert_eq!(selector.get_capacity_tier(acc_id, now_ts + 10), CapacityTier::Tier2Warming);
+        assert!(selector.can_accept_input_tokens(acc_id, 35_000, now_ts + 10)); // <= 50k 可接
+        assert!(!selector.can_accept_input_tokens(acc_id, 80_000, now_ts + 10)); // > 50k 仍不可接
+
+        // 第 2 次成功交互 -> 晋升 Tier3SweetSpot
+        selector.record_warm_interaction(acc_id, now_ts + 20);
+        assert_eq!(selector.get_capacity_tier(acc_id, now_ts + 30), CapacityTier::Tier3SweetSpot);
+        assert!(selector.is_sweet_spot_for_oversized(acc_id, now_ts + 30));
+        assert!(selector.can_accept_input_tokens(acc_id, 80_000, now_ts + 30)); // 大包放行！
+
+        // 模拟静默超过 2 小时 (7200s) -> 自然退回 Tier1Cold
+        assert_eq!(selector.get_capacity_tier(acc_id, now_ts + 30 + 7201), CapacityTier::Tier1Cold);
+
+        // 模拟小时消耗过热 (超过 60% 软上限) -> 失去黄金承重资格
+        let acc_overheat = "test_overheat_acc";
+        let email_overheat = "overheat@example.com";
+        let current_real_ts = chrono::Utc::now().timestamp();
+        let cap = selector.get_or_init_jitter_cap(acc_overheat, current_real_ts);
+        let overheat_usage = (cap.hourly_limit as f64 * 0.65) as u32;
+        selector.record_warm_interaction(acc_overheat, current_real_ts);
+        selector.record_warm_interaction(acc_overheat, current_real_ts + 10);
+        selector.record_token_usage(acc_overheat, email_overheat, 0, overheat_usage);
+        assert_eq!(selector.get_capacity_tier(acc_overheat, current_real_ts + 20), CapacityTier::Tier3SweetSpot);
+        assert!(!selector.is_hourly_sweet_spot(acc_overheat, current_real_ts + 20), "消耗超 60% 退出黄金承重区");
+        assert!(!selector.is_sweet_spot_for_oversized(acc_overheat, current_real_ts + 20));
+        assert!(!selector.can_accept_input_tokens(acc_overheat, 80_000, current_real_ts + 20), "过热账号拒接大包以防 TPM 穿透");
     }
 }
 
