@@ -297,6 +297,16 @@ pub struct AccountPacerState {
     pub last_oauth_refresh_at: Option<std::time::Instant>,
     /// 多并发槽位表（槽位生命周期 = 实际请求耗时 + 计算延迟）
     pub slots: Vec<SlotPhase>,
+    /// 今日累计已消耗 Output Tokens (用于日软上限 300,000 熔断)
+    pub daily_output_tokens: u64,
+    /// 当前小时累计已消耗 Output Tokens (用于小时软上限 60,000 熔断)
+    pub hourly_output_tokens: u64,
+    /// 上次小时窗口戳
+    pub last_hourly_window: i64,
+    /// 上次天窗口戳
+    pub last_daily_window: i64,
+    /// 触发疲劳熔断休眠截止时间
+    pub fatigue_until: Option<std::time::Instant>,
 }
 
 impl AccountPacerState {
@@ -320,6 +330,11 @@ impl AccountPacerState {
             last_heat_updated_at: now,
             last_oauth_refresh_at: None,
             slots: vec![SlotPhase::Free; n],
+            daily_output_tokens: 0,
+            hourly_output_tokens: 0,
+            last_hourly_window: chrono::Utc::now().timestamp() / 3600,
+            last_daily_window: chrono::Utc::now().timestamp() / 86400,
+            fatigue_until: None,
         }
     }
 }
@@ -452,6 +467,83 @@ impl HumanizedPacer {
     }
 
     /// 获取账号剩余的拟人化微休眠秒数（若不在休眠中则返回 None）
+    /// 记录账号消耗的 Output Tokens，维护滑动窗口统计，触发软上限疲劳熔断
+    pub fn record_output_tokens(&self, account_id: &str, output_tokens: u64) {
+        if output_tokens == 0 {
+            return;
+        }
+        let now_epoch_hour = chrono::Utc::now().timestamp() / 3600;
+        let now_epoch_day = chrono::Utc::now().timestamp() / 86400;
+        let now = std::time::Instant::now();
+
+        if let Some(mut entry) = self.account_states.get_mut(account_id) {
+            // 滑动小时窗口重置
+            if entry.last_hourly_window != now_epoch_hour {
+                entry.hourly_output_tokens = 0;
+                entry.last_hourly_window = now_epoch_hour;
+            }
+            // 滑动天窗口重置
+            if entry.last_daily_window != now_epoch_day {
+                entry.daily_output_tokens = 0;
+                entry.last_daily_window = now_epoch_day;
+            }
+
+            entry.hourly_output_tokens += output_tokens;
+            entry.daily_output_tokens += output_tokens;
+
+            // 软上限熔断检查：
+            // 单账号小时 Output Tokens > 60,000 或 当日 Output Tokens > 300,000 时，进入疲劳深度休眠 1~2 小时
+            const HOURLY_TOKEN_LIMIT: u64 = 60_000;
+            const DAILY_TOKEN_LIMIT: u64 = 300_000;
+
+            if entry.hourly_output_tokens >= HOURLY_TOKEN_LIMIT || entry.daily_output_tokens >= DAILY_TOKEN_LIMIT {
+                if entry.fatigue_until.is_none() {
+                    let cooldown_secs = 3600; // 冷却 1 小时，让其他空闲账号接力
+                    entry.fatigue_until = Some(now + Duration::from_secs(cooldown_secs));
+                    tracing::warn!(
+                        "😴 [FatigueCooldown] Account {} hit token soft-cap (hourly: {}/{}, daily: {}/{}), entering fatigue cooldown for {}s to prevent ban",
+                        account_id,
+                        entry.hourly_output_tokens,
+                        HOURLY_TOKEN_LIMIT,
+                        entry.daily_output_tokens,
+                        DAILY_TOKEN_LIMIT,
+                        cooldown_secs
+                    );
+                }
+            }
+        }
+    }
+
+    /// 检查账号是否处于疲劳休眠冷却期中
+    pub fn is_in_fatigue(&self, account_id: &str) -> bool {
+        if let Some(mut entry) = self.account_states.get_mut(account_id) {
+            if let Some(until) = entry.fatigue_until {
+                let now = std::time::Instant::now();
+                if now < until {
+                    return true;
+                } else {
+                    entry.fatigue_until = None;
+                    tracing::info!(
+                        "☀️ [FatigueCooldown] Account {} finished fatigue cooldown, waking up refreshed",
+                        account_id
+                    );
+                }
+            }
+        }
+        false
+    }
+
+    /// 获取账号今日累计消耗的 Output Tokens (用于选号时最少使用优先调度)
+    pub fn get_daily_output_tokens(&self, account_id: &str) -> u64 {
+        let now_epoch_day = chrono::Utc::now().timestamp() / 86400;
+        if let Some(entry) = self.account_states.get(account_id) {
+            if entry.last_daily_window == now_epoch_day {
+                return entry.daily_output_tokens;
+            }
+        }
+        0
+    }
+
     pub fn get_nap_remaining_seconds(&self, account_id: &str) -> Option<u64> {
         if let Some(mut entry) = self.account_states.get_mut(account_id) {
             if let Some(nap_until) = entry.nap_until {

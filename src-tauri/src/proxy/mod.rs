@@ -2,11 +2,13 @@
 
 // 现有模块 (保留)
 pub mod account_inflight;
+pub mod account_selector;
 pub mod config;
 pub mod project_resolver;
 pub mod security;
 pub mod server;
 pub mod token_manager;
+pub mod toxic_cache;
 
 // 新架构模块
 pub mod audio; // 音频处理模块
@@ -33,6 +35,12 @@ pub mod upstream; // 上游客户端
 pub mod zai_vision_mcp; // Built-in Vision MCP server state
 pub mod zai_vision_tools; // Built-in Vision MCP tools (z.ai vision API) // 调试日志
 
+pub use account_selector::{
+    filter_available_candidates, select_least_used_account, AccountCandidate, AccountSelector,
+    AccountTokenUsage, FatigueReason, FatigueRecord, SoftLimitConfig,
+    DAILY_OUTPUT_TOKEN_SOFT_LIMIT, FATIGUE_NAP_MAX_SECS, FATIGUE_NAP_MIN_SECS,
+    HOURLY_OUTPUT_TOKEN_SOFT_LIMIT,
+};
 pub use auto_recovery::AutoRecoveryScheduler;
 pub use config::get_enable_g1_credits;
 pub use config::update_enable_g1_credits;
@@ -53,6 +61,7 @@ pub use rate_limit::{
 pub use security::ProxySecurityConfig;
 pub use server::AxumServer;
 pub use signature_cache::SignatureCache;
+pub use toxic_cache::{calculate_fingerprint, check_toxic, record_toxic, ToxicEntry};
 #[allow(unused_imports)]
 pub use token_manager::{AcquiredToken, TokenAcquireError, TokenManager};
 

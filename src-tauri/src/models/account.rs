@@ -93,6 +93,9 @@ pub struct Account {
     /// [UI] Runtime-only: remaining seconds of humanized micro-nap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nap_remaining_seconds: Option<u64>,
+    /// [MODULE 3] 软上限疲劳休眠截止时间戳 (Unix timestamp)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fatigue_until: Option<i64>,
 }
 
 impl Account {
@@ -127,7 +130,24 @@ impl Account {
             max_concurrency: None,
             auto_recovery_attempt: None,
             nap_remaining_seconds: None,
+            fatigue_until: None,
         }
+    }
+
+    /// [MODULE 3] 检查账号当前是否处于软上限疲劳休眠期
+    pub fn is_fatigued(&self) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        self.fatigue_until.map(|until| now < until).unwrap_or(false)
+    }
+
+    /// [MODULE 3] 设置疲劳休眠截止时间戳
+    pub fn set_fatigue_until(&mut self, until: i64) {
+        self.fatigue_until = Some(until);
+    }
+
+    /// [MODULE 3] 清除疲劳休眠状态
+    pub fn clear_fatigue(&mut self) {
+        self.fatigue_until = None;
     }
 
     pub fn update_last_used(&mut self) {

@@ -131,6 +131,12 @@ impl ProxyMonitor {
                     log.cached_tokens,
                 );
 
+                if let Some(account_id) = log.account_id.as_deref() {
+                    if let Some(output) = log.output_tokens {
+                        tm.record_account_output_tokens(account_id, output as u64);
+                    }
+                }
+
                 // Notify frontend to silently sync latest account quotas and usage
                 if let Some(app) = &self.app_handle {
                     let _ = app.emit("accounts://refreshed", ());

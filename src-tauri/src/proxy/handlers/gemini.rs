@@ -76,6 +76,15 @@ pub async fn handle_generate(
         )
         .await;
     }
+    // [TOXIC CACHE] 入口毒丸拦截：检查是否命中近 30 分钟内导致过 403 的毒丸请求
+    let body_bytes_for_fp = serde_json::to_vec(&body).unwrap_or_default();
+    let toxic_fp = crate::proxy::toxic_cache::calculate_fingerprint(&model_name, &body_bytes_for_fp);
+    if let Some((toxic_status, toxic_body)) = crate::proxy::toxic_cache::check_toxic(&toxic_fp) {
+        let fp_prefix = if toxic_fp.len() >= 12 { &toxic_fp[..12] } else { &toxic_fp };
+        tracing::warn!("🚫 [Gemini] Fast early rejection on toxic request fingerprint: {}", fp_prefix);
+        return Ok((toxic_status, [("content-type", "application/json")], toxic_body).into_response());
+    }
+
     let client_wants_stream = method == "streamGenerateContent";
     // [AUTO-CONVERSION] 强制内部流式化
     let force_stream_internally = !client_wants_stream;
@@ -735,8 +744,21 @@ pub async fn handle_generate(
                 .await;
         }
 
-        // 遇到 403 Forbidden 立即硬熔断：标记反代已禁用、移出可用号池并持久化，彻底禁止任何重试，立刻返回响应
+        // 遇到 403 Forbidden 立即硬熔断：记录 403 毒丸指纹(TTL 30分钟)，标记反代已禁用、移出可用号池并持久化，彻底禁止任何重试，立刻返回响应
         if status_code == 403 {
+            // [TOXIC CACHE] 若包含 TOS_VIOLATION 或 disabled，记录毒丸指纹 1800 秒，严禁重试换号
+            let is_tos_or_disabled = error_text.contains("TOS_VIOLATION")
+                || error_text.to_uppercase().contains("TOS_VIOLATION")
+                || error_text.contains("disabled")
+                || error_text.to_lowercase().contains("disabled");
+            if is_tos_or_disabled {
+                crate::proxy::toxic_cache::record_toxic(&toxic_fp, 403, error_text.clone(), 1800);
+                let fp_prefix = if toxic_fp.len() >= 12 { &toxic_fp[..12] } else { &toxic_fp };
+                tracing::warn!(
+                    "🚫 [ToxicCache] Recorded toxic payload for Gemini (fingerprint: {}): TOS_VIOLATION / disabled detected",
+                    fp_prefix
+                );
+            }
             let target_acc_id = token_manager
                 .get_account_id_by_email(&email)
                 .unwrap_or_else(|| account_id.clone());
