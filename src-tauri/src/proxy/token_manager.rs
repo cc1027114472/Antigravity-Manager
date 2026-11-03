@@ -1919,16 +1919,9 @@ impl TokenManager {
     /// 2. Token 签发未满 60 秒（新签发 Token 预热期，禁止新 Token 早期直接承接 >50K tokens / >200KB 请求）。
     /// 注：通过 (t.timestamp - t.expires_in) 倒推签发时刻，对重启免疫、全刷新路径天然统一！
     #[inline]
-    pub fn token_unsafe_for_medium_or_oversized(t: &ProxyToken, now_ts: i64) -> bool {
-        if Self::token_needs_oauth_refresh(t, now_ts) {
-            return true;
-        }
-        if t.expires_in > 0 {
-            let issued_at = t.timestamp - t.expires_in;
-            if now_ts >= issued_at && (now_ts - issued_at) < 60 {
-                return true;
-            }
-        }
+    pub fn token_unsafe_for_medium_or_oversized(_t: &ProxyToken, _now_ts: i64) -> bool {
+        // [FIX] 解除选号过滤死锁：现已全面转入请求驱动 JIT 懒加载刷新（单账号原子互斥 + 400~800ms 沉淀延迟），
+        // 候选账号选定后由 JIT 链路安全换发保障其新鲜度，严禁在候选循环中硬性 continue 跳过账号导致号池假死 503！
         false
     }
 
@@ -2012,7 +2005,10 @@ impl TokenManager {
                 self.pacer.note_oauth_refreshed(&token.account_id);
 
                 // 拟人化平滑沉淀延迟 tokio::time::sleep(rand 400..800ms)，以消除跨机房扩散延迟和机器瞬击特征
-                let settle_delay = fastrand::u64(400..=800);
+                let settle_delay: u64 = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(400..=800)
+                };
                 tokio::time::sleep(tokio::time::Duration::from_millis(settle_delay)).await;
 
                 if refresh_ms > 3000 {
@@ -2036,7 +2032,7 @@ impl TokenManager {
                     token.email,
                     e
                 );
-                if e.contains(""invalid_grant"") || e.contains("invalid_grant") {
+                if e.contains("invalid_grant") {
                     let _ = self
                         .disable_account(
                             &token.account_id,
@@ -2409,7 +2405,10 @@ impl TokenManager {
 
                     // [NATIVE DELAY] 拟人化沉淀延迟 (400ms~800ms)：
                     // 确保 Google 全球机房 Token 凭据同步就绪，并消除机器连击特征
-                    let settle_delay = fastrand::u64(400..=800);
+                    let settle_delay: u64 = {
+                        use rand::Rng;
+                        rand::thread_rng().gen_range(400..=800)
+                    };
                     tokio::time::sleep(tokio::time::Duration::from_millis(settle_delay)).await;
 
                     if refresh_ms > 3000 {
@@ -7824,5 +7823,53 @@ mod tests {
         acq_a2.lease_guard.complete();
 
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_token_unsafe_never_starves_pool_for_oversized_request() {
+        let now_ts = chrono::Utc::now().timestamp();
+        // 构造一个处于临期状态（需要 JIT 刷新）的 ProxyToken
+        let expiring_token = ProxyToken {
+            account_id: "test-acc-1".to_string(),
+            access_token: "old-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            expires_in: 60, // <= 120s，属于临期窗口
+            timestamp: now_ts + 60,
+            email: "test@example.com".to_string(),
+            account_path: PathBuf::from("mock_path"),
+            project_id: Some("mock-proj".to_string()),
+            subscription_tier: Some("FREE".to_string()),
+            remaining_quota: Some(100),
+            protected_models: HashSet::new(),
+            health_score: 1.0,
+            reset_time: None,
+            validation_blocked: false,
+            validation_blocked_until: 0,
+            validation_url: None,
+            model_quotas: HashMap::new(),
+            model_quotas_weekly: HashMap::new(),
+            pending_cu_5h: HashMap::new(),
+            pending_cu_weekly: HashMap::new(),
+            model_limits: HashMap::new(),
+            max_concurrency: None,
+            device_profile: None,
+        };
+
+        // 验证：对于超大请求，unsafe 判定必须为 false，杜绝候选循环一票否决
+        assert!(
+            !TokenManager::token_unsafe_for_medium_or_oversized(&expiring_token, now_ts),
+            "Expiring token must not be deemed unsafe in candidate filtering; JIT refresh will handle it"
+        );
+
+        // 构造一个刚签发未满 60 秒的 ProxyToken
+        let just_issued_token = ProxyToken {
+            expires_in: 3600,
+            timestamp: now_ts + 3580, // issued 20s ago
+            ..expiring_token.clone()
+        };
+        assert!(
+            !TokenManager::token_unsafe_for_medium_or_oversized(&just_issued_token, now_ts),
+            "Recently issued token must not be deemed unsafe in candidate filtering"
+        );
     }
 }

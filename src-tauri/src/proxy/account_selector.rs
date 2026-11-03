@@ -156,10 +156,9 @@ impl AccountCandidate for crate::models::Account {
     fn remaining_quota(&self) -> Option<i32> {
         self.quota.as_ref().and_then(|q| {
             q.models
-                .values()
-                .filter_map(|m| m.percentage)
+                .iter()
+                .map(|m| m.percentage)
                 .min()
-                .map(|v| v as i32)
         })
     }
     fn is_model_protected(&self, model: &str) -> bool {
