@@ -318,16 +318,47 @@ impl TokenManager {
                         }
 
                         tick_count = tick_count.wrapping_add(1);
-                        // 每 180 秒 (12 * 15s) 执行一次后台主动巡检（提前预刷新 + 黄金老兵预热池巡检）
-                        if tick_count % 12 == 0 {
+                        // 启动后第 15s (tick == 1) 立即首次巡检，之后每 60 秒 (4 * 15s) 执行一次后台主动巡检（提前预刷新 + 黄金老兵动态储备池预热）
+                        if tick_count == 1 || tick_count % 4 == 0 {
                             let now = chrono::Utc::now().timestamp();
-                            let active_list: Vec<ProxyToken> = tokens_map.iter().map(|r| r.value().clone()).collect();
+                            let raw_list: Vec<ProxyToken> = tokens_map.iter().map(|r| r.value().clone()).collect();
 
-                            // 1. 后台静默预刷新：仅对处于温热活跃态（非 Tier1Cold）且进入过期前 10 分钟窗口的账号静默换发（闲置冷号保持 0 网络交互）
-                            for t in &active_list {
+                            // 过滤出真正健康可调度的候选账号（未疲劳休眠、未被限流、且严格代理模式下绑定的代理健康可用）
+                            let pool_opt = crate::proxy::proxy_pool::get_global_proxy_pool();
+                            let mut eligible_list = Vec::with_capacity(raw_list.len());
+                            for t in raw_list {
+                                if crate::proxy::account_selector::is_account_fatigued(&t.account_id)
+                                    || tracker.is_rate_limited(&t.account_id, None)
+                                {
+                                    continue;
+                                }
+                                if let Some(ref pool) = pool_opt {
+                                    if !pool.is_account_proxy_available(&t.account_id).await {
+                                        continue;
+                                    }
+                                }
+                                eligible_list.push(t);
+                            }
+
+                            // 动态计算黄金老兵目标储备池大小：至少 10 个，或健康总号数的 40%（例如 60 个号时储备 24 个黄金老兵）
+                            let target_sweet_count = std::cmp::min(
+                                eligible_list.len(),
+                                std::cmp::max(10, (eligible_list.len() * 40) / 100),
+                            );
+
+                            // 1. 后台静默预刷新：对所有已预热账号（非 Tier1Cold）以及目标储备池前列的候补账号，
+                            // 在进入过期前 10 分钟窗口（或已过期）时静默换发，单轮最多刷新 6 个以平抑突发
+                            let mut refreshed_in_tick = 0usize;
+                            for (idx, t) in eligible_list.iter().enumerate() {
+                                if refreshed_in_tick >= 6 {
+                                    break;
+                                }
                                 let is_warm = crate::proxy::account_selector::get_capacity_tier(&t.account_id)
                                     != crate::proxy::account_selector::CapacityTier::Tier1Cold;
-                                if is_warm && now >= t.timestamp - Self::OAUTH_PROACTIVE_REFRESH_WINDOW_SECS {
+                                let in_reserve_window = idx < target_sweet_count;
+                                if (is_warm || in_reserve_window)
+                                    && now >= t.timestamp - Self::OAUTH_PROACTIVE_REFRESH_WINDOW_SECS
+                                {
                                     let refresh_mu = {
                                         refresh_locks
                                             .entry(t.account_id.clone())
@@ -345,7 +376,11 @@ impl TokenManager {
                                             continue;
                                         }
                                     }
-                                    tracing::info!("🔄 [BackgroundWorker] 活跃账号 {} 进入 10 分钟预刷新窗口，静默换发...", t.email);
+                                    tracing::info!(
+                                        "🔄 [BackgroundWorker] 储备/活跃账号 {} 进入预刷新窗口，静默换发 ({}/6)...",
+                                        t.email,
+                                        refreshed_in_tick + 1
+                                    );
                                     if let Ok(token_response) = crate::modules::oauth::refresh_access_token(&t.refresh_token, Some(&t.account_id)).await {
                                         let refreshed_at = chrono::Utc::now().timestamp();
                                         if let Some(mut entry) = tokens_map.get_mut(&t.account_id) {
@@ -357,56 +392,94 @@ impl TokenManager {
                                             }
                                         }
                                         pacer.note_oauth_refreshed(&t.account_id);
-                                        tracing::info!("✅ [BackgroundWorker] 活跃账号 {} 静默换发完成", t.email);
+                                        refreshed_in_tick += 1;
+                                        tracing::info!("✅ [BackgroundWorker] 账号 {} 静默换发完成", t.email);
+                                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                                     }
                                 }
                             }
 
                             // 2. 黄金承重预热池巡检（Pre-warming Worker）：
-                            // 若池内黄金承重老兵账号 (Tier3SweetSpot + <60% 小时消耗) 少于 3 个（且总账号 >= 3），
-                            // 优先挑选 Tier2Warming（差 1 次晋升）或 Tier1Cold 账号执行后台拟人化交互垫刀预热
-                            if active_list.len() >= 3 {
-                                let sweet_count = active_list
+                            // 统计当前随时可战（未处于小憩 Napping）的黄金承重老兵数量
+                            if !eligible_list.is_empty() {
+                                let ready_sweet_count = eligible_list
                                     .iter()
-                                    .filter(|t| crate::proxy::account_selector::is_sweet_spot_for_oversized(&t.account_id))
+                                    .filter(|t| {
+                                        crate::proxy::account_selector::is_sweet_spot_for_oversized(&t.account_id)
+                                            && pacer.get_nap_remaining_seconds(&t.account_id).is_none()
+                                    })
                                     .count();
 
-                                if sweet_count < 3 {
-                                    let candidate = active_list
-                                        .iter()
-                                        .find(|t| {
-                                            crate::proxy::account_selector::get_capacity_tier(&t.account_id)
-                                                == crate::proxy::account_selector::CapacityTier::Tier2Warming
-                                                && crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id)
-                                        })
-                                        .or_else(|| {
-                                            active_list.iter().find(|t| {
-                                                crate::proxy::account_selector::get_capacity_tier(&t.account_id)
-                                                    == crate::proxy::account_selector::CapacityTier::Tier1Cold
-                                                    && crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id)
-                                            })
-                                        });
+                                if ready_sweet_count < target_sweet_count {
+                                    let deficit = target_sweet_count - ready_sweet_count;
+                                    let batch_limit = std::cmp::min(deficit, 4);
 
-                                    if let Some(target_acc) = candidate {
-                                        let mut access_tok = target_acc.access_token.clone();
-                                        if now >= target_acc.timestamp - Self::OAUTH_PRE_REFRESH_WINDOW_SECS {
-                                            if let Ok(token_response) = crate::modules::oauth::refresh_access_token(&target_acc.refresh_token, Some(&target_acc.account_id)).await {
-                                                let refreshed_at = chrono::Utc::now().timestamp();
-                                                access_tok = token_response.access_token.clone();
-                                                if let Some(mut entry) = tokens_map.get_mut(&target_acc.account_id) {
-                                                    entry.access_token = token_response.access_token.clone();
-                                                    entry.expires_in = token_response.expires_in;
-                                                    entry.timestamp = refreshed_at + token_response.expires_in;
-                                                    if let Some(rt) = token_response.refresh_token.clone() {
-                                                        entry.refresh_token = rt;
-                                                    }
-                                                }
-                                                pacer.note_oauth_refreshed(&target_acc.account_id);
+                                    // 优先挑选 Tier2Warming（仅差 1 次即可晋升老兵），其次挑选 Tier1Cold
+                                    let warming_candidates = eligible_list.iter().filter(|t| {
+                                        crate::proxy::account_selector::get_capacity_tier(&t.account_id)
+                                            == crate::proxy::account_selector::CapacityTier::Tier2Warming
+                                            && crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id)
+                                    });
+                                    let cold_candidates = eligible_list.iter().filter(|t| {
+                                        crate::proxy::account_selector::get_capacity_tier(&t.account_id)
+                                            == crate::proxy::account_selector::CapacityTier::Tier1Cold
+                                            && crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id)
+                                    });
+
+                                    let selected_batch: Vec<ProxyToken> = warming_candidates
+                                        .chain(cold_candidates)
+                                        .take(batch_limit)
+                                        .cloned()
+                                        .collect();
+
+                                    for (batch_idx, target_acc) in selected_batch.into_iter().enumerate() {
+                                        let tokens_map_clone = Arc::clone(&tokens_map);
+                                        let refresh_locks_clone = Arc::clone(&refresh_locks);
+                                        let pacer_clone = Arc::clone(&pacer);
+                                        tokio::spawn(async move {
+                                            if batch_idx > 0 {
+                                                tokio::time::sleep(std::time::Duration::from_millis((batch_idx as u64) * 800)).await;
                                             }
-                                        }
-                                        let proj = target_acc.project_id.clone().unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
-                                        tracing::info!("♨️ [PrewarmingWorker] 发现黄金承重账号仅 {}/3，挑选账号 {} 执行后台拟人化预热...", sweet_count, target_acc.email);
-                                        let _ = Self::execute_account_warmup_pad(&target_acc.account_id, &access_tok, &proj, &target_acc.email).await;
+                                            let now_inner = chrono::Utc::now().timestamp();
+                                            let mut access_tok = target_acc.access_token.clone();
+                                            if now_inner >= target_acc.timestamp - Self::OAUTH_PRE_REFRESH_WINDOW_SECS {
+                                                let refresh_mu = {
+                                                    refresh_locks_clone
+                                                        .entry(target_acc.account_id.clone())
+                                                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                                                        .value()
+                                                        .clone()
+                                                };
+                                                let _guard = match refresh_mu.try_lock() {
+                                                    Ok(g) => g,
+                                                    Err(_) => return,
+                                                };
+                                                if let Ok(token_response) = crate::modules::oauth::refresh_access_token(&target_acc.refresh_token, Some(&target_acc.account_id)).await {
+                                                    let refreshed_at = chrono::Utc::now().timestamp();
+                                                    access_tok = token_response.access_token.clone();
+                                                    if let Some(mut entry) = tokens_map_clone.get_mut(&target_acc.account_id) {
+                                                        entry.access_token = token_response.access_token.clone();
+                                                        entry.expires_in = token_response.expires_in;
+                                                        entry.timestamp = refreshed_at + token_response.expires_in;
+                                                        if let Some(rt) = token_response.refresh_token.clone() {
+                                                            entry.refresh_token = rt;
+                                                        }
+                                                    }
+                                                    pacer_clone.note_oauth_refreshed(&target_acc.account_id);
+                                                } else {
+                                                    return;
+                                                }
+                                            }
+                                            let proj = target_acc.project_id.clone().unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
+                                            tracing::info!(
+                                                "♨️ [PrewarmingWorker] 活跃老兵储备 {}/{}，并发预热账号 {} (batch #{})...",
+                                                ready_sweet_count,
+                                                target_sweet_count,
+                                                target_acc.email,
+                                                batch_idx + 1
+                                            );
+                                            let _ = Self::execute_account_warmup_pad(&target_acc.account_id, &access_tok, &proj, &target_acc.email).await;
+                                        });
                                     }
                                 }
                             }
