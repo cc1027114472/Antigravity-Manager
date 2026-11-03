@@ -1220,6 +1220,9 @@ impl HumanizedPacer {
             );
         }
 
+        let reserved_tokens = crate::proxy::account_selector::DEFAULT_IN_FLIGHT_RESERVED_TOKENS;
+        crate::proxy::account_selector::reserve_in_flight(account_id, reserved_tokens);
+
         let guard = SlotLeaseGuard {
             pacer: std::sync::Arc::clone(self),
             account_id: account_id.to_string(),
@@ -1231,6 +1234,7 @@ impl HumanizedPacer {
             triggered_nap: entered_nap,
             upstream_accepted: false,
             finished: false,
+            reserved_inflight_tokens: reserved_tokens,
         };
 
         Ok((guard, entered_nap))
@@ -1476,6 +1480,7 @@ pub struct SlotLeaseGuard {
     triggered_nap: bool,
     upstream_accepted: bool,
     finished: bool,
+    reserved_inflight_tokens: u64,
 }
 
 impl SlotLeaseGuard {
@@ -1507,6 +1512,10 @@ impl SlotLeaseGuard {
     pub fn complete(&mut self) {
         if !self.finished {
             self.upstream_accepted = true;
+            if self.reserved_inflight_tokens > 0 {
+                crate::proxy::account_selector::release_in_flight(&self.account_id, self.reserved_inflight_tokens);
+                self.reserved_inflight_tokens = 0;
+            }
             self.pacer
                 .complete_lease(&self.account_id, self.lease_id, self.footprint);
             self.finished = true;
@@ -1516,6 +1525,10 @@ impl SlotLeaseGuard {
     /// 请求未达上游或瞬时失败需要切号重试：退回预占热度与轮次，立即释放槽位
     pub fn abort_and_rollback(&mut self) {
         if !self.finished {
+            if self.reserved_inflight_tokens > 0 {
+                crate::proxy::account_selector::release_in_flight(&self.account_id, self.reserved_inflight_tokens);
+                self.reserved_inflight_tokens = 0;
+            }
             self.pacer.rollback_lease(
                 &self.account_id,
                 self.lease_id,

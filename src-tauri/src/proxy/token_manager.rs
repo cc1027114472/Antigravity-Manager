@@ -1094,6 +1094,13 @@ impl TokenManager {
     /// 记录账号消耗的 Output Tokens 并推进疲劳软上限熔断风控
     pub fn record_account_output_tokens(&self, account_id: &str, output_tokens: u64) {
         self.pacer.record_output_tokens(account_id, output_tokens);
+        let email = self.tokens.get(account_id).map(|t| t.email.clone()).unwrap_or_default();
+        let _ = crate::proxy::account_selector::record_token_usage(
+            account_id,
+            &email,
+            0,
+            output_tokens.min(u32::MAX as u64) as u32,
+        );
     }
 
     pub fn burn_estimated_quota(

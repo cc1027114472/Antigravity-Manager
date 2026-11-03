@@ -188,10 +188,10 @@ impl AccountCandidate for crate::models::Account {
         &self.email
     }
     fn is_disabled(&self) -> bool {
-        self.disabled
+        self.disabled || self.proxy_disabled
     }
     fn health_score(&self) -> f32 {
-        self.health_score.unwrap_or(1.0)
+        1.0
     }
     fn remaining_quota(&self) -> Option<i32> {
         self.quota.as_ref().and_then(|q| {
@@ -203,9 +203,8 @@ impl AccountCandidate for crate::models::Account {
     }
     fn is_model_protected(&self, model: &str) -> bool {
         self.protected_models
-            .as_ref()
-            .map(|pm| pm.iter().any(|m| m.eq_ignore_ascii_case(model)))
-            .unwrap_or(false)
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(model))
     }
     fn fatigue_until(&self) -> Option<i64> {
         None
@@ -843,15 +842,16 @@ mod tests {
             fatigue_until: None,
         };
 
+        let candidates = vec![acc.clone()];
         // 此时未预占前，账号仍可用
-        let avail = selector.filter_available(&[acc.clone()], None);
+        let avail = selector.filter_available(&candidates, None);
         assert_eq!(avail.len(), 1);
 
         // 现在第 1 个并发请求进来，发起 2000 tokens 预占
         selector.reserve_in_flight(acc_id, 2000);
 
         // 再次检查候选，已用 + 预占 >= hourly_limit，立即被阻断（filter 结果为 0）
-        let avail_blocked = selector.filter_available(&[acc.clone()], None);
+        let avail_blocked = selector.filter_available(&candidates, None);
         assert_eq!(avail_blocked.len(), 0, "在途预占生效，成功阻断并发穿透打爆软上限！");
 
         // 请求结束释放预占
@@ -885,5 +885,33 @@ mod tests {
         let rec3 = selector.check_and_update_fatigue(acc_id, email, now_ts + 7200).unwrap();
         assert_eq!(rec3.consecutive_strikes, 3);
         assert!(rec3.nap_duration_secs >= TIER3_NAP_MIN_SECS && rec3.nap_duration_secs <= TIER3_NAP_MAX_SECS);
+    }
+}
+
+
+// ==========================================
+// 兼容旧版常量与结构定义 (Backward Compatibility)
+// ==========================================
+pub const DAILY_OUTPUT_TOKEN_SOFT_LIMIT: u64 = 300_000;
+pub const HOURLY_OUTPUT_TOKEN_SOFT_LIMIT: u64 = 60_000;
+pub const FATIGUE_NAP_MIN_SECS: i64 = 3600;
+pub const FATIGUE_NAP_MAX_SECS: i64 = 7200;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoftLimitConfig {
+    pub daily_output_limit: u64,
+    pub hourly_output_limit: u64,
+    pub min_fatigue_nap_secs: i64,
+    pub max_fatigue_nap_secs: i64,
+}
+
+impl Default for SoftLimitConfig {
+    fn default() -> Self {
+        Self {
+            daily_output_limit: DAILY_OUTPUT_TOKEN_SOFT_LIMIT,
+            hourly_output_limit: HOURLY_OUTPUT_TOKEN_SOFT_LIMIT,
+            min_fatigue_nap_secs: FATIGUE_NAP_MIN_SECS,
+            max_fatigue_nap_secs: FATIGUE_NAP_MAX_SECS,
+        }
     }
 }
