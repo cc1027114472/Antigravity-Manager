@@ -180,6 +180,16 @@ struct AccountResponse {
     last_used: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     nap_remaining_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fatigue_until: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fatigue_remaining_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fatigue_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fatigue_strikes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capacity_tier: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -287,6 +297,11 @@ fn to_account_response(
         validation_blocked_until: account.validation_blocked_until,
         validation_blocked_reason: account.validation_blocked_reason.clone(),
         nap_remaining_seconds: None,
+        fatigue_until: None,
+        fatigue_remaining_seconds: None,
+        fatigue_reason: None,
+        fatigue_strikes: None,
+        capacity_tier: None,
     }
 }
 
@@ -1051,6 +1066,32 @@ async fn admin_list_accounts(
                 .pacer
                 .get_nap_remaining_seconds(&acc.id);
 
+            // [UI] 注入避峰休眠状态
+            let (fatigue_until, fatigue_remaining_seconds, fatigue_strikes, fatigue_reason) =
+                if let Some(fatigue_rec) = crate::proxy::get_account_fatigue_record(&acc.id) {
+                    let now = chrono::Utc::now().timestamp();
+                    let remaining = fatigue_rec.fatigue_until.saturating_sub(now) as u64;
+                    let reason_str = match fatigue_rec.reason {
+                        crate::proxy::FatigueReason::HourlyOutputLimitExceeded => "HourlyOutputLimitExceeded".to_string(),
+                        crate::proxy::FatigueReason::DailyOutputLimitExceeded => "DailyOutputLimitExceeded".to_string(),
+                        crate::proxy::FatigueReason::BothLimitsExceeded => "BothLimitsExceeded".to_string(),
+                        crate::proxy::FatigueReason::Manual => "Manual".to_string(),
+                    };
+                    (Some(fatigue_rec.fatigue_until), Some(remaining), Some(fatigue_rec.consecutive_strikes), Some(reason_str))
+                } else {
+                    (None, None, None, None)
+                };
+
+            // [UI] 注入慢启动容量梯队
+            let tier = crate::proxy::get_capacity_tier(&acc.id);
+            let is_sweet = crate::proxy::is_hourly_sweet_spot(&acc.id);
+            let capacity_tier = Some(match tier {
+                crate::proxy::CapacityTier::Tier1Cold => "Tier1Cold".to_string(),
+                crate::proxy::CapacityTier::Tier2Warming => "Tier2Warming".to_string(),
+                crate::proxy::CapacityTier::Tier3SweetSpot if is_sweet => "Tier3SweetSpot".to_string(),
+                crate::proxy::CapacityTier::Tier3SweetSpot => "Tier3Overheated".to_string(),
+            });
+
             AccountResponse {
                 id: acc.id,
                 email: acc.email,
@@ -1072,6 +1113,11 @@ async fn admin_list_accounts(
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
                 nap_remaining_seconds,
+                fatigue_until,
+                fatigue_remaining_seconds,
+                fatigue_reason,
+                fatigue_strikes,
+                capacity_tier,
             }
         })
         .collect();
@@ -1139,6 +1185,30 @@ async fn admin_get_current_account(
                 .pacer
                 .get_nap_remaining_seconds(&acc.id);
 
+            let (fatigue_until, fatigue_remaining_seconds, fatigue_strikes, fatigue_reason) =
+                if let Some(fatigue_rec) = crate::proxy::get_account_fatigue_record(&acc.id) {
+                    let now = chrono::Utc::now().timestamp();
+                    let remaining = fatigue_rec.fatigue_until.saturating_sub(now) as u64;
+                    let reason_str = match fatigue_rec.reason {
+                        crate::proxy::FatigueReason::HourlyOutputLimitExceeded => "HourlyOutputLimitExceeded".to_string(),
+                        crate::proxy::FatigueReason::DailyOutputLimitExceeded => "DailyOutputLimitExceeded".to_string(),
+                        crate::proxy::FatigueReason::BothLimitsExceeded => "BothLimitsExceeded".to_string(),
+                        crate::proxy::FatigueReason::Manual => "Manual".to_string(),
+                    };
+                    (Some(fatigue_rec.fatigue_until), Some(remaining), Some(fatigue_rec.consecutive_strikes), Some(reason_str))
+                } else {
+                    (None, None, None, None)
+                };
+
+            let tier = crate::proxy::get_capacity_tier(&acc.id);
+            let is_sweet = crate::proxy::is_hourly_sweet_spot(&acc.id);
+            let capacity_tier = Some(match tier {
+                crate::proxy::CapacityTier::Tier1Cold => "Tier1Cold".to_string(),
+                crate::proxy::CapacityTier::Tier2Warming => "Tier2Warming".to_string(),
+                crate::proxy::CapacityTier::Tier3SweetSpot if is_sweet => "Tier3SweetSpot".to_string(),
+                crate::proxy::CapacityTier::Tier3SweetSpot => "Tier3Overheated".to_string(),
+            });
+
             AccountResponse {
                 id: acc.id,
                 email: acc.email,
@@ -1160,6 +1230,11 @@ async fn admin_get_current_account(
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
                 nap_remaining_seconds,
+                fatigue_until,
+                fatigue_remaining_seconds,
+                fatigue_reason,
+                fatigue_strikes,
+                capacity_tier,
             }
         })
     } else {
