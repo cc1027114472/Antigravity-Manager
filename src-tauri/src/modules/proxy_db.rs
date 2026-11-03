@@ -784,3 +784,18 @@ pub fn get_token_usage_by_ip(limit: usize, hours: i64) -> Result<Vec<IpTokenStat
 
     Ok(stats)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cleanup_tiered_logs_execution() {
+        // 验证 init_db 与 cleanup_tiered_logs 能够正常执行且不发生死锁或语法错误
+        if let Ok(_) = init_db() {
+            let res = cleanup_tiered_logs();
+            assert!(res.is_ok(), "cleanup_tiered_logs should execute successfully: {:?}", res);
+        }
+    }
+}
+
