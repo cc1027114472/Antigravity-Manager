@@ -2147,36 +2147,57 @@ impl TokenManager {
             return false;
         }
 
-        let payload = serde_json::json!({
-            "model": "gemini-2.5-flash",
-            "project": project_id,
+        let session_id = format!(
+            "warmup_{}_{}",
+            chrono::Utc::now().timestamp_millis(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
+        let warmup_model = "gemini-3.8-flash-medium";
+        let base_request = serde_json::json!({
+            "model": warmup_model,
             "contents": [{
                 "role": "user",
                 "parts": [{ "text": prompt }]
             }],
             "generationConfig": {
-                "maxOutputTokens": 8
-            }
+                "temperature": 0
+            },
+            "session_id": session_id
         });
 
-        let wrapped = serde_json::json!({
-            "project": project_id,
-            "request": payload,
-            "metadata": {
-                "ideType": "ANTIGRAVITY",
-                "platform": "DESKTOP"
+        let mut wrapped = crate::proxy::mappers::gemini::wrapper::wrap_request(
+            &base_request,
+            project_id,
+            warmup_model,
+            Some(account_id),
+            Some(&session_id),
+            None,
+        );
+        if let Some(inner) = wrapped.get_mut("request") {
+            crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(inner);
+            crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::adapt_context_overhead(
+                inner,
+                Some(warmup_model),
+            );
+            crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(inner);
+        }
+        if let Some(obj) = wrapped.as_object_mut() {
+            if obj.get("requestType").and_then(|v| v.as_str()) != Some("image_gen") {
+                obj.remove("requestType");
             }
-        });
+        }
 
-        let url = "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
+        let url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
         let start = std::time::Instant::now();
         let resp = client
             .post(url)
             .bearer_auth(access_token)
             .header("User-Agent", crate::constants::USER_AGENT.as_str())
             .header("Content-Type", "application/json")
+            .header("x-client-name", "antigravity")
+            .header("x-client-version", crate::constants::CURRENT_VERSION.as_str())
             .json(&wrapped)
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(15))
             .send()
             .await;
 
