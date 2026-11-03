@@ -96,6 +96,18 @@ pub struct Account {
     /// [MODULE 3] 软上限疲劳休眠截止时间戳 (Unix timestamp)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fatigue_until: Option<i64>,
+    /// [UI] 疲劳休眠剩余秒数
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fatigue_remaining_seconds: Option<u64>,
+    /// [UI] 疲劳休眠原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fatigue_reason: Option<String>,
+    /// [UI] 疲劳触顶惩罚阶梯 (1, 2, 3)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fatigue_strikes: Option<u32>,
+    /// [UI] 慢启动容量梯队 (Tier1Cold | Tier2Warming | Tier3SweetSpot | Tier3Overheated)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_tier: Option<String>,
 }
 
 impl Account {
@@ -131,6 +143,10 @@ impl Account {
             auto_recovery_attempt: None,
             nap_remaining_seconds: None,
             fatigue_until: None,
+            fatigue_remaining_seconds: None,
+            fatigue_reason: None,
+            fatigue_strikes: None,
+            capacity_tier: None,
         }
     }
 

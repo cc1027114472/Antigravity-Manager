@@ -11,6 +11,7 @@ import { Gemini, Claude } from '@lobehub/icons';
 import { MODEL_CONFIG } from '../../config/modelConfig';
 import { MaxConcurrencyInput } from './MaxConcurrencyInput';
 import { showToast } from '../common/ToastContainer';
+import { AccountTierBadges } from './AccountTierBadges';
 
 interface AccountRowProps {
     account: Account;
@@ -130,6 +131,8 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                 <span>{t('accounts.humanized_napping', { mins: Math.ceil(account.nap_remaining_seconds / 60) })}</span>
                             </span>
                         )}
+
+                        <AccountTierBadges account={account} isDisabled={isDisabled} />
 
                         {account.quota?.subscription_tier && (() => {
                             const tier = account.quota.subscription_tier.toLowerCase();

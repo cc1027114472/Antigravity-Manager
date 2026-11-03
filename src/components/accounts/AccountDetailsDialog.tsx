@@ -1,11 +1,12 @@
 import { useState } from 'react';
-import { X, Clock, AlertCircle, Bot } from 'lucide-react';
+import { X, Clock, AlertCircle, Bot, Coffee } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { Account } from '../../types/account';
 import { formatDate } from '../../utils/format';
 import { useTranslation } from 'react-i18next';
 import { MODEL_CONFIG, sortModels } from '../../config/modelConfig';
 import { formatQuotaTooltip, getDisplayQuotaModels } from '../../utils/quotaDisplay';
+import { AccountTierBadges, formatFatigueTime, getFatigueReasonLabel } from './AccountTierBadges';
 
 interface AccountDetailsDialogProps {
     account: Account | null;
@@ -46,6 +47,7 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                                 {account.quota.subscription_tier}
                             </div>
                         )}
+                        <AccountTierBadges account={account} />
                     </div>
                     <button
                         onClick={onClose}
@@ -56,6 +58,23 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                 </div>
 
                 {/* Status Alerts */}
+                {account.fatigue_remaining_seconds != null && account.fatigue_remaining_seconds > 0 && (
+                    <div className="px-6 py-3 bg-purple-50 dark:bg-purple-950/30 border-b border-purple-100 dark:border-purple-900/40 flex items-center justify-between text-xs text-purple-700 dark:text-purple-300">
+                        <div className="flex items-center gap-2">
+                            <Coffee size={14} className="text-purple-600 dark:text-purple-400 shrink-0" />
+                            <span className="font-semibold">
+                                {t('accounts.fatigue_cooldown', { time: formatFatigueTime(account.fatigue_remaining_seconds) })}
+                            </span>
+                            <span className="text-purple-600/80 dark:text-purple-400/80">
+                                ({getFatigueReasonLabel(account.fatigue_reason, t)} · {t('accounts.fatigue_cooldown_tooltip', {
+                                    time: formatFatigueTime(account.fatigue_remaining_seconds),
+                                    strikes: account.fatigue_strikes || 1,
+                                    reason: getFatigueReasonLabel(account.fatigue_reason, t),
+                                })})
+                            </span>
+                        </div>
+                    </div>
+                )}
                 {(account.disabled || account.proxy_disabled) && (
                     <div className="px-6 py-3 bg-red-50 dark:bg-red-950/20 border-b border-red-100 dark:border-red-900/30 flex flex-col gap-1">
                         {account.disabled && (

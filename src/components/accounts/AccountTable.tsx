@@ -46,6 +46,7 @@ import {
 import type { Account } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
+import { AccountTierBadges } from './AccountTierBadges';
 
 import { QuotaItem } from './QuotaItem';
 import { getModelProtectionKey } from '../../utils/modelCategory';
@@ -405,6 +406,7 @@ function AccountRowContent({
 
 
                         {/* 订阅类型徽章 */}
+                        <AccountTierBadges account={account} isDisabled={isDisabled} />
                         {account.quota?.subscription_tier && (() => {
                             const tier = account.quota.subscription_tier.toLowerCase();
                             if (tier.includes('ultra')) {

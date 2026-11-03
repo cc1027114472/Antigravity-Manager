@@ -847,6 +847,16 @@ pub fn is_account_fatigued(account_id: &str) -> bool {
     AccountSelector.is_account_fatigued(account_id)
 }
 
+pub fn get_account_fatigue_record(account_id: &str) -> Option<FatigueRecord> {
+    let now = chrono::Utc::now().timestamp();
+    if let Some(entry) = GLOBAL_FATIGUE_REGISTRY.get(account_id) {
+        if now < entry.fatigue_until {
+            return Some(entry.clone());
+        }
+    }
+    None
+}
+
 pub fn clear_account_fatigue(account_id: &str) -> bool {
     AccountSelector.clear_fatigue(account_id)
 }

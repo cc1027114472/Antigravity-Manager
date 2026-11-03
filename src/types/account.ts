@@ -27,6 +27,13 @@ export interface Account {
     auto_recovery_attempt?: number;
     /** Runtime-only: remaining seconds of humanized micro-nap. Absent when not in nap. */
     nap_remaining_seconds?: number;
+    /** Runtime-only: token soft-cap fatigue cooldown. */
+    fatigue_until?: number;
+    fatigue_remaining_seconds?: number;
+    fatigue_reason?: "HourlyOutputLimitExceeded" | "DailyOutputLimitExceeded" | "BothLimitsExceeded" | string;
+    fatigue_strikes?: number;
+    /** Runtime-only: slow-start capacity tier */
+    capacity_tier?: "Tier1Cold" | "Tier2Warming" | "Tier3SweetSpot" | "Tier3Overheated";
     created_at: number;
     last_used: number;
 }

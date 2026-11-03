@@ -65,6 +65,32 @@ pub async fn list_accounts(
             if let Some(nap_secs) = instance.token_manager.pacer.get_nap_remaining_seconds(&account.id) {
                 account.nap_remaining_seconds = Some(nap_secs);
             }
+
+            // [UI] Inject fatigue cooldown (避峰休眠) details if currently fatigued
+            if let Some(fatigue_rec) = crate::proxy::get_account_fatigue_record(&account.id) {
+                let now = chrono::Utc::now().timestamp();
+                let remaining = fatigue_rec.fatigue_until.saturating_sub(now) as u64;
+                account.fatigue_until = Some(fatigue_rec.fatigue_until);
+                account.fatigue_remaining_seconds = Some(remaining);
+                account.fatigue_strikes = Some(fatigue_rec.consecutive_strikes);
+                let reason_str = match fatigue_rec.reason {
+                    crate::proxy::FatigueReason::HourlyOutputLimitExceeded => "HourlyOutputLimitExceeded".to_string(),
+                    crate::proxy::FatigueReason::DailyOutputLimitExceeded => "DailyOutputLimitExceeded".to_string(),
+                    crate::proxy::FatigueReason::BothLimitsExceeded => "BothLimitsExceeded".to_string(),
+                    crate::proxy::FatigueReason::Manual => "Manual".to_string(),
+                };
+                account.fatigue_reason = Some(reason_str);
+            }
+
+            // [UI] Inject slow-start capacity tier (慢启动容量阶梯)
+            let tier = crate::proxy::get_capacity_tier(&account.id);
+            let is_sweet = crate::proxy::is_hourly_sweet_spot(&account.id);
+            account.capacity_tier = Some(match tier {
+                crate::proxy::CapacityTier::Tier1Cold => "Tier1Cold".to_string(),
+                crate::proxy::CapacityTier::Tier2Warming => "Tier2Warming".to_string(),
+                crate::proxy::CapacityTier::Tier3SweetSpot if is_sweet => "Tier3SweetSpot".to_string(),
+                crate::proxy::CapacityTier::Tier3SweetSpot => "Tier3Overheated".to_string(),
+            });
         }
     }
 

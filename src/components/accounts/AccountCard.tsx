@@ -18,6 +18,7 @@ import {
 } from '../../utils/proxyUsageStatus';
 import { MaxConcurrencyInput } from './MaxConcurrencyInput';
 import { showToast } from '../common/ToastContainer';
+import { AccountTierBadges } from './AccountTierBadges';
 
 interface AccountCardProps {
     account: Account;
@@ -203,6 +204,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                     {t('accounts.humanized_napping', { mins: Math.ceil(account.nap_remaining_seconds / 60) })}
                                 </span>
                             )}
+                            <AccountTierBadges account={account} isDisabled={isDisabled} compact />
                             {/* 订阅类型徽章 */}
                             {account.quota?.subscription_tier && (() => {
                                 const tier = account.quota.subscription_tier.toLowerCase();
