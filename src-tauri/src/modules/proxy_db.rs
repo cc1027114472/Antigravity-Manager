@@ -15,13 +15,16 @@ fn connect_db() -> Result<Connection, String> {
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
 
-    // Set busy timeout to 5000ms: give concurrent writers enough time to resolve
-    conn.pragma_update(None, "busy_timeout", 5000)
+    // Set busy timeout to 10000ms: give concurrent writers enough time to resolve
+    conn.pragma_update(None, "busy_timeout", 10000)
         .map_err(|e| e.to_string())?;
 
     // Synchronous NORMAL is faster and safe enough for WAL
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
+
+    // Limit WAL journal size to 64MB: SQLite automatically truncates WAL on checkpoint
+    let _ = conn.pragma_update(None, "journal_size_limit", 67_108_864);
 
     Ok(conn)
 }
@@ -267,16 +270,18 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
     .map_err(|e| e.to_string())
 }
 
-/// Tiered log retention constants
-const SUCCESS_MAX_AGE_HOURS: i64 = 12;
-const SUCCESS_MAX_ROWS: usize = 3_000;
+/// Tiered log retention constants:
+/// 不截断 request/response 报文，通过高频紧凑的滑动窗口将数据量恒定在 ~200MB 以内，
+/// 依赖 SQLite Free-list 原生页复用，彻底避免全库锁死。
+const SUCCESS_MAX_AGE_HOURS: i64 = 4;
+const SUCCESS_MAX_ROWS: usize = 500; // 保持最新 500 条完整大包成功日志（约 150MB~250MB）
 
-const ERROR_MAX_AGE_DAYS: i64 = 30;
-const ERROR_MAX_ROWS: usize = 50_000;
+const ERROR_MAX_AGE_DAYS: i64 = 7;
+const ERROR_MAX_ROWS: usize = 2_000; // 保持最新 2,000 条错误诊断日志
 
 /// Soft target size for proxy_logs.db: if exceeded, prune oldest success logs progressively
-const DB_TARGET_SIZE_BYTES: u64 = 500 * 1024 * 1024; // 500 MB soft limit
-const DB_FUSE_SIZE_BYTES: u64 = 1536 * 1024 * 1024; // 1.5 GB hard circuit-breaker
+const DB_TARGET_SIZE_BYTES: u64 = 400 * 1024 * 1024; // 400 MB soft limit
+const DB_FUSE_SIZE_BYTES: u64 = 800 * 1024 * 1024; // 800 MB hard circuit-breaker
 
 /// Get total physical size on disk of proxy_logs.db (+ wal/shm)
 pub fn get_proxy_db_disk_size() -> Result<u64, String> {
@@ -395,48 +400,27 @@ pub fn cleanup_tiered_logs() -> Result<usize, String> {
     total_deleted += delete_beyond_keep(&conn, ERROR_CLAUSE, ERROR_MAX_ROWS, BATCH);
 
     // 5. Capacity adaptive management:
-    // If DB size exceeds target threshold (500MB), progressively trim oldest success logs.
-    // If DB size exceeds hard fuse (1.5GB), apply emergency pressure relief.
+    // If DB size exceeds target threshold, progressively trim oldest success logs.
+    // 关键优化：严禁在定时清理中执行锁库的 VACUUM！删除的空间由 SQLite 原生 Free-list 原地复用，
+    // 并在批处理完成后使用轻量级的 wal_checkpoint(TRUNCATE) 瞬间归零 WAL 文件。
     if let Ok(size) = get_proxy_db_disk_size() {
         if size > DB_FUSE_SIZE_BYTES {
             tracing::warn!(
-                "Proxy DB size ({} MB) exceeded 1.5GB circuit-breaker. Triggering emergency prune!",
+                "Proxy DB size ({} MB) exceeded fuse threshold. Pruning oldest success logs to relieve pressure...",
                 size / 1024 / 1024
             );
-            // Emergency: only keep 2 hours of success logs, 500 success rows
-            let emergency_success_cutoff = now_ms - (2 * 3600 * 1000);
+            let emergency_success_cutoff = now_ms - (1 * 3600 * 1000);
             total_deleted += delete_batched(&conn, SUCCESS_CLAUSE, emergency_success_cutoff, BATCH);
-            total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, 500, BATCH);
-            // Emergency error limit: keep newest 10,000
-            total_deleted += delete_beyond_keep(&conn, ERROR_CLAUSE, 10_000, BATCH);
-            // Force vacuum on emergency (only if enough free disk for the copy)
-            let free_bytes = free_disk_bytes();
-            if free_bytes > 2u64 * 1024 * 1024 * 1024 {
-                let _ = conn.execute("VACUUM", []);
-            }
+            total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, 200, BATCH);
+            total_deleted += delete_beyond_keep(&conn, ERROR_CLAUSE, 500, BATCH);
         } else if size > DB_TARGET_SIZE_BYTES {
-            tracing::info!(
-                "Proxy DB size ({} MB) exceeded soft target ({} MB). Pruning oldest success logs to preserve disk space...",
-                size / 1024 / 1024,
-                DB_TARGET_SIZE_BYTES / 1024 / 1024
-            );
-            // Prune down to 1,000 most recent success logs
-            total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, 1_000, BATCH);
-            let free_bytes = free_disk_bytes();
-            if free_bytes > 2u64 * 1024 * 1024 * 1024 {
-                let _ = conn.execute("VACUUM", []);
-            }
-        } else if total_deleted > 10_000 {
-            // Reclaim space when a large batch of rows was pruned
-            let size_mb = size / 1024 / 1024;
-            if size_mb > 200 {
-                let free_bytes = free_disk_bytes();
-                if free_bytes > 2u64 * 1024 * 1024 * 1024 {
-                    let _ = conn.execute("VACUUM", []);
-                }
-            }
+            // Prune down to 300 most recent success logs
+            total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, 300, BATCH);
         }
     }
+
+    // 每次清理后执行非阻塞的 WAL 检查点截断，立即释放预写日志磁盘占用
+    let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
 
     Ok(total_deleted)
 }
