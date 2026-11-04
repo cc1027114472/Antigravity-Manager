@@ -217,13 +217,16 @@ pub fn transform_openai_request(
     // 避免对 gemini-3-pro (preview) 等其实不支持 thinkingConfig 的模型注入参数导致 400
     // [FIX #1557] Allow "pro" models (e.g. gemini-3-pro, gemini-2.0-pro) to bypass thinking check
     // These models support thinking but do not have "-thinking" suffix
+    let is_modern_thinking =
+        crate::proxy::mappers::common_utils::is_modern_thinking_level_model(&mapped_model_lower);
     let is_gemini_3_thinking = mapped_model_lower.contains("gemini")
         && (mapped_model_lower.contains("-thinking")
             || mapped_model_lower.contains("gemini-2.0-pro")
             || mapped_model_lower.contains("gemini-3-pro")
             || mapped_model_lower.contains("gemini-3.1-pro")
             || mapped_model_lower.contains("gemini-pro")
-            || mapped_model_lower.contains("-pro-agent"))
+            || mapped_model_lower.contains("-pro-agent")
+            || is_modern_thinking)
         && !mapped_model_lower.contains("claude");
     // [FIX #2167] gemini-*-flash 支持 thinking，functionCall 必须携带 thoughtSignature
     // [FEATURE] 同时注入 includeThoughts:true 使 Gemini 返回 thought:true chunk，客户端可显示思维链
@@ -232,15 +235,36 @@ pub fn transform_openai_request(
             || mapped_model_lower.contains("-flash-")
             || mapped_model_lower.contains("-flash-agent"))
         && !mapped_model_lower.contains("claude");
-    let is_claude_thinking = mapped_model_lower.ends_with("-thinking");
+    let is_claude_thinking = mapped_model_lower.ends_with("-thinking")
+        || (is_modern_thinking && mapped_model_lower.contains("claude"));
     let is_thinking_model = is_gemini_3_thinking || is_claude_thinking || is_gemini_flash_thinking;
 
-    // [NEW] 检查用户是否在请求中显式启用 thinking
+    // [NEW] 检查用户是否在请求中显式启用或禁用 thinking
     let user_enabled_thinking = request
         .thinking
         .as_ref()
-        .map(|t| t.thinking_type.as_deref() == Some("enabled"))
-        .unwrap_or(false);
+        .map(|t| {
+            matches!(
+                t.thinking_type.as_deref(),
+                Some("enabled") | Some("adaptive")
+            )
+        })
+        .unwrap_or(false)
+        || request
+            .reasoning_effort
+            .as_deref()
+            .map(|e| !e.eq_ignore_ascii_case("none"))
+            .unwrap_or(false);
+    let user_disabled_thinking = request
+        .thinking
+        .as_ref()
+        .map(|t| t.thinking_type.as_deref() == Some("disabled"))
+        .unwrap_or(false)
+        || request
+            .reasoning_effort
+            .as_deref()
+            .map(|e| e.eq_ignore_ascii_case("none"))
+            .unwrap_or(false);
     let user_thinking_budget = request.thinking.as_ref().and_then(|t| t.budget_tokens);
 
     // [NEW] 检查历史消息是否兼容思维模型 (是否有 Assistant 消息缺失 reasoning_content)
@@ -258,10 +282,11 @@ pub fn transform_openai_request(
         .any(|msg| msg.role == "tool" || msg.role == "function" || msg.tool_calls.is_some());
 
     // [NEW] 决定是否开启 Thinking 功能:
-    // 1. 模型名包含 -thinking 时自动开启
-    // 2. 用户在请求中显式设置 thinking.type = "enabled" 时开启
+    // 1. 思维模型自动开启（除非显式禁用）
+    // 2. 用户在请求中显式设置 thinking.type = "enabled" / "adaptive" 或 reasoning_effort 时开启
     // 如果是 Claude 思考模型且历史不兼容且没有可用签名来占位, 则禁用 Thinking 以防 400
-    let mut actual_include_thinking = is_thinking_model || user_enabled_thinking;
+    let mut actual_include_thinking =
+        (is_thinking_model || user_enabled_thinking) && !user_disabled_thinking;
 
     // [REFACTORED] 使用 SignatureCache 获取 Session 级别的签名
     let session_thought_sig =
@@ -786,57 +811,84 @@ pub fn transform_openai_request(
             };
 
             let model_lower = mapped_model.to_lowercase();
-            let mut final_budget = budget;
-            if model_lower.contains("claude-opus-4-6-thinking") {
-                tracing::debug!(
-                    "[Opus-Alignment] Enforcing fixed thinkingBudget 24576 for Opus 4.6 (OpenAI)"
+            let is_modern =
+                crate::proxy::mappers::common_utils::is_modern_thinking_level_model(&model_lower);
+
+            if is_modern || tb_config.mode == crate::proxy::config::ThinkingBudgetMode::Adaptive {
+                let effort_str = request
+                    .reasoning_effort
+                    .as_deref()
+                    .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.as_deref()))
+                    .or(tb_config.effort.as_deref());
+
+                let level = crate::proxy::mappers::common_utils::resolve_modern_thinking_level(
+                    mapped_model,
+                    effort_str,
+                    "HIGH",
                 );
-                final_budget = 24576;
-            }
 
-            gen_config["thinkingConfig"] = json!({
-                "includeThoughts": true,
-                "thinkingBudget": final_budget
-            });
+                gen_config["thinkingConfig"] = json!({
+                    "includeThoughts": true,
+                    "thinkingLevel": level
+                });
 
-            // [CRITICAL] 思维模型的 maxOutputTokens 必须大于 thinkingBudget
-            // [FIX #1675] 针对图像模型使用更保守的 max_tokens 增量，避免触发 128k 限制
-            let overhead = if config.request_type == "image_gen" {
-                2048
-            } else {
-                32768
-            };
-            let min_overhead = if config.request_type == "image_gen" {
-                1024
-            } else {
-                8192
-            };
-
-            if model_lower.contains("claude-opus-4-6-thinking") {
-                gen_config["maxOutputTokens"] = json!(57344);
                 tracing::debug!(
-                    "[Opus-Alignment] Enforcing maxOutputTokens 57344 for Opus 4.6 (OpenAI)"
+                    "[OpenAI-Request] Injected thinkingConfig for modern/adaptive model {}: thinkingLevel={} (mode={:?})",
+                    mapped_model, level, tb_config.mode
                 );
-            } else if let Some(max_tokens) = request.max_tokens {
-                if (max_tokens as i64) <= final_budget {
-                    gen_config["maxOutputTokens"] = json!(final_budget + min_overhead);
+            } else {
+                let mut final_budget = budget;
+                if model_lower.contains("claude-opus-4-6-thinking") {
+                    tracing::debug!(
+                        "[Opus-Alignment] Enforcing fixed thinkingBudget 24576 for Opus 4.6 (OpenAI)"
+                    );
+                    final_budget = 24576;
                 }
-            } else {
-                // [FIX #1592] Use a more conservative default to avoid 400 error on 128k context models
-                gen_config["maxOutputTokens"] = json!(final_budget + overhead);
+
+                gen_config["thinkingConfig"] = json!({
+                    "includeThoughts": true,
+                    "thinkingBudget": final_budget
+                });
+
+                // [CRITICAL] 思维模型的 maxOutputTokens 必须大于 thinkingBudget
+                // [FIX #1675] 针对图像模型使用更保守的 max_tokens 增量，避免触发 128k 限制
+                let overhead = if config.request_type == "image_gen" {
+                    2048
+                } else {
+                    32768
+                };
+                let min_overhead = if config.request_type == "image_gen" {
+                    1024
+                } else {
+                    8192
+                };
+
+                if model_lower.contains("claude-opus-4-6-thinking") {
+                    gen_config["maxOutputTokens"] = json!(57344);
+                    tracing::debug!(
+                        "[Opus-Alignment] Enforcing maxOutputTokens 57344 for Opus 4.6 (OpenAI)"
+                    );
+                } else if let Some(max_tokens) = request.max_tokens {
+                    if (max_tokens as i64) <= final_budget {
+                        gen_config["maxOutputTokens"] = json!(final_budget + min_overhead);
+                    }
+                } else {
+                    // [FIX #1592] Use a more conservative default to avoid 400 error on 128k context models
+                    gen_config["maxOutputTokens"] = json!(final_budget + overhead);
+                }
+
+                let new_max = gen_config["maxOutputTokens"].as_i64().unwrap_or(0);
+                tracing::debug!(
+                    "[OpenAI-Request] Adjusted maxOutputTokens to {} for thinking model (budget={})",
+                    new_max,
+                    final_budget
+                );
+
+                tracing::debug!(
+                    "[OpenAI-Request] Injected thinkingConfig for model {}: thinkingBudget={} (mode={:?})",
+                    mapped_model, final_budget, tb_config.mode
+                );
             }
-
-            let new_max = gen_config["maxOutputTokens"].as_i64().unwrap_or(0);
-            tracing::debug!(
-                "[OpenAI-Request] Adjusted maxOutputTokens to {} for thinking model (budget={})",
-                new_max,
-                final_budget
-            );
-
-            tracing::debug!(
-                "[OpenAI-Request] Injected thinkingConfig for model {}: thinkingBudget={} (mode={:?})",
-                mapped_model, final_budget, tb_config.mode
-            );
         }
     }
 
@@ -1213,6 +1265,19 @@ pub fn transform_openai_request(
         }
     }
 
+    let account_id = token.map(|t| t.account_id.as_str());
+    let official_request_id = crate::proxy::common::session::generate_official_request_id(
+        account_id,
+        &session_id,
+        message_count,
+    );
+
+    let req_type = if config.request_type == "image_gen" {
+        "image_gen"
+    } else {
+        "agent"
+    };
+
     let mut final_body = json!({
         "project": project_id,
         // [CACHE] 使用重排后的字段顺序，稳定前缀在前
@@ -1220,13 +1285,9 @@ pub fn transform_openai_request(
         "model": config.final_model,
         "userAgent": "antigravity",
         // [CACHE] requestId 移到末尾避免动态 message_count 破坏前缀字节一致性
-        "requestId": format!("agent/antigravity/{}/{}", &session_id[..session_id.len().min(8)], message_count),
+        "requestId": official_request_id,
+        "requestType": req_type,
     });
-
-    // [DEFENSE] 3.8 网关严格校验：普通文本/Agent 请求绝不发送 requestType 包装字段（官方不发送，发送会触发假性 429）
-    if config.request_type == "image_gen" {
-        final_body["requestType"] = json!("image_gen");
-    }
 
     // [CACHE:L3] 使用多层级缓存的 compute_prefix_hash 计算组合哈希
     // Layer 1 + Layer 2 的独立 hash 组合 → Layer 3 key
@@ -1468,6 +1529,7 @@ mod tests {
         };
 
         // Pass explicit gemini-3-pro-preview which doesn't have "-thinking" suffix
+        crate::proxy::config::update_thinking_budget_config(crate::proxy::config::ThinkingBudgetConfig::default());
         let (result, _sid, _msg_count, _) =
             transform_openai_request(&req, "test-p", "gemini-3-pro-preview", None);
         let gen_config = &result["request"]["generationConfig"];
@@ -1643,7 +1705,7 @@ mod tests {
             transform_openai_request(&req, "test-v", mapped_model, None);
 
         // Extract the tool call part from contents
-        let contents = result["contents"].as_array().unwrap();
+        let contents = result["request"]["contents"].as_array().unwrap();
         // Identify the part with functionCall
         let parts = contents[0]["parts"].as_array().unwrap();
         let tool_part = parts
@@ -1795,8 +1857,66 @@ mod tests {
 
         assert!(has_functions, "Should contain functionDeclarations");
         assert!(
-            has_google_search,
-            "Should contain googleSearch (Gemini 2.0+ supports mixed tools)"
+            !has_google_search,
+            "Should NOT contain googleSearch due to functionDeclarations presence (v1internal limit)"
         );
+    }
+
+    #[test]
+    fn test_modern_models_thinking_level_alignment_openai() {
+        crate::proxy::config::update_thinking_budget_config(
+            crate::proxy::config::ThinkingBudgetConfig::default(),
+        );
+
+        let cases = [
+            ("gemini-3.8-flash-medium", "MEDIUM", 65535),
+            ("gemini-4-argon-high", "HIGH", 65535),
+            ("claude-sonnet-5-5-medium", "MEDIUM", 64000),
+            ("claude-opus-5-5-high", "HIGH", 64000),
+        ];
+
+        for (model_id, expected_level, expected_max_cap) in cases {
+            let req = OpenAIRequest {
+                model: model_id.to_string(),
+                messages: vec![OpenAIMessage {
+                    role: "user".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("Hello".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                }],
+                ..Default::default()
+            };
+
+            let (result, _sid, _msg_count, _) =
+                transform_openai_request(&req, "test-proj", model_id, None);
+
+            assert_eq!(result["requestType"], "agent");
+            let req_id = result["requestId"].as_str().expect("requestId must exist");
+            let segments: Vec<&str> = req_id.split('/').collect();
+            assert_eq!(segments.len(), 5, "requestId must be 5 segments: {}", req_id);
+            assert_eq!(segments[0], "agent");
+
+            let gen_config = &result["request"]["generationConfig"];
+            let tc = &gen_config["thinkingConfig"];
+            assert_eq!(tc["includeThoughts"], true, "[{}]", model_id);
+            assert_eq!(tc["thinkingLevel"], expected_level, "[{}]", model_id);
+            assert!(
+                tc.get("thinkingBudget").is_none(),
+                "[{}] modern model must NOT emit thinkingBudget",
+                model_id
+            );
+
+            let max_out = gen_config["maxOutputTokens"].as_u64().unwrap();
+            assert!(
+                max_out <= expected_max_cap,
+                "[{}] maxOutputTokens {} exceeded cap {}",
+                model_id,
+                max_out,
+                expected_max_cap
+            );
+        }
     }
 }

@@ -193,9 +193,44 @@ pub static CURRENT_VERSION: LazyLock<String> = LazyLock::new(|| {
     config.version
 });
 
-/// Native OAuth Authorization User-Agent
+/// Known valid Google language_server build versions and Piper changelist numbers.
+/// Extracted from official binary distributions.
+pub const VALID_AIDEV_VERSIONS: &[(&str, &str)] = &[
+    ("2.29.0", "1013060670"),
+    ("2.28.2", "1009437749"),
+];
+
+/// Known valid OS and architecture pairs for Go runtime.
+pub const VALID_AIDEV_PLATFORMS: &[(&str, &str)] = &[
+    ("windows", "amd64"),
+    ("darwin", "arm64"),
+    ("darwin", "amd64"),
+    ("linux", "amd64"),
+];
+
+/// Computes a stable, deterministic User-Agent string for an account.
+/// If account_id is None or empty, returns the default stable client UA.
+pub fn get_account_user_agent(account_id: Option<&str>) -> String {
+    let Some(id) = account_id.filter(|s| !s.is_empty()) else {
+        return "antigravity/hub/2.29.0 (aidev_client; os_type=windows; arch=amd64; cl=1013060670)".to_string();
+    };
+
+    // Deterministic 64-bit FNV-1a hash of account_id
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in id.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    let (version, cl) = VALID_AIDEV_VERSIONS[(hash as usize) % VALID_AIDEV_VERSIONS.len()];
+    let (os_type, arch) = VALID_AIDEV_PLATFORMS[((hash >> 16) as usize) % VALID_AIDEV_PLATFORMS.len()];
+
+    format!("antigravity/hub/{version} (aidev_client; os_type={os_type}; arch={arch}; cl={cl})")
+}
+
+/// Native OAuth Authorization User-Agent (matches official Go runtime OAuth token exchange)
 pub static NATIVE_OAUTH_USER_AGENT: LazyLock<String> =
-    LazyLock::new(|| format!("vscode/1.X.X (Antigravity/{})", CURRENT_VERSION.as_str()));
+    LazyLock::new(|| "Go-http-client/2.0".to_string());
 
 /// Current resolved Antigravity version (e.g., "4.3.0")
 pub fn get_current_version() -> String {
@@ -203,41 +238,16 @@ pub fn get_current_version() -> String {
 }
 
 /// Returns a full User-Agent string for the current version
-/// "Antigravity/4.3.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/132.0.6834.160 Electron/39.2.3"
 pub fn get_default_user_agent() -> String {
-    format!(
-        "Antigravity/{} (Macintosh; Intel Mac OS X 10_15_7) Chrome/132.0.6834.160 Electron/39.2.3",
-        env!("CARGO_PKG_VERSION")
-    )
+    get_account_user_agent(None)
 }
 
 /// Global Session ID (generated once per app launch)
 pub static SESSION_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
-/// Returns the best version choice between local and remote
-/// Version selection: max(local installation, remote latest, known stable 4.3.0)
-/// This prevents model rejection due to outdated client version headers.
-pub static USER_AGENT: LazyLock<String> = LazyLock::new(|| {
-    let (config, source) = resolve_version_config();
-
-    tracing::info!(
-        version = %config.version,
-        source = ?source,
-        "User-Agent initialized"
-    );
-
-    let platform_info = match std::env::consts::OS {
-        "macos" => "Macintosh; Intel Mac OS X 10_15_7",
-        "windows" => "Windows NT 10.0; Win64; x64",
-        "linux" => "X11; Linux x86_64",
-        _ => "X11; Linux x86_64",
-    };
-
-    format!(
-        "Antigravity/{} ({}) Chrome/{} Electron/{}",
-        config.version, platform_info, config.chrome, config.electron
-    )
-});
+/// Returns the official IDE User-Agent.
+/// Defaults to standard Windows amd64 2.29.0 aidev_client UA.
+pub static USER_AGENT: LazyLock<String> = LazyLock::new(|| get_account_user_agent(None));
 
 #[cfg(test)]
 mod tests {
@@ -247,6 +257,21 @@ mod tests {
     fn test_parse_version_from_updater_response() {
         let text = "Auto updater is running. Stable Version: 1.15.8-5724687216017408";
         assert_eq!(parse_version(text), Some("1.15.8".to_string()));
+    }
+
+    #[test]
+    fn test_get_account_user_agent_deterministic() {
+        let ua_none = get_account_user_agent(None);
+        assert_eq!(
+            ua_none,
+            "antigravity/hub/2.29.0 (aidev_client; os_type=windows; arch=amd64; cl=1013060670)"
+        );
+
+        let acc_a1 = get_account_user_agent(Some("acc_123456"));
+        let acc_a2 = get_account_user_agent(Some("acc_123456"));
+        assert_eq!(acc_a1, acc_a2);
+        assert!(acc_a1.starts_with("antigravity/hub/"));
+        assert!(acc_a1.contains("aidev_client"));
     }
 
     #[test]

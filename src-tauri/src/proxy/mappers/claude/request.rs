@@ -487,15 +487,20 @@ pub fn transform_claude_request_in(
 
     // Check if thinking is enabled in the request
     let thinking_type = claude_req.thinking.as_ref().map(|t| t.type_.as_str());
+    let is_modern_thinking =
+        crate::proxy::mappers::common_utils::is_modern_thinking_level_model(&mapped_model);
     let mut is_thinking_enabled = thinking_type == Some("enabled")
         || thinking_type == Some("adaptive")
-        || (thinking_type.is_none() && should_enable_thinking_by_default(&claude_req.model));
+        || (thinking_type.is_none()
+            && (should_enable_thinking_by_default(&claude_req.model)
+                || should_enable_thinking_by_default(&mapped_model)));
 
     // [NEW FIX] Check if target model supports thinking
     // Only models with "-thinking" suffix or Claude models support thinking
     // Regular Gemini models (gemini-2.5-flash, gemini-2.5-pro) do NOT support thinking
     // [FIX #1557] Allow "pro" models (e.g. gemini-3-pro, gemini-2.0-pro) to be recognized as thinking capable
-    let target_model_supports_thinking = mapped_model.contains("-thinking")
+    let target_model_supports_thinking = is_modern_thinking
+        || mapped_model.contains("-thinking")
         || mapped_model.starts_with("claude-")
         || mapped_model.contains("gemini-2.0-pro")
         || (mapped_model.contains("gemini-3-pro") && !mapped_model.contains("-high") && !mapped_model.contains("-low"))
@@ -562,10 +567,11 @@ pub fn transform_claude_request_in(
                 &session_id,
             )
         {
-            // [FIX #2167] Flash 模型无签名时使用哨兵值而不是禁用 thinking
+            // [FIX #2167] Flash 与新代际 Gemini 模型无签名时使用哨兵值而不是禁用 thinking
             // 禁用 thinking 会导致模型失去思考能力，哨兵值可让 Gemini 跳过签名校验
             let is_flash_model = mapped_model.contains("gemini-3-flash")
-                || mapped_model.contains("gemini-3.1-flash");
+                || mapped_model.contains("gemini-3.1-flash")
+                || (is_modern_thinking && mapped_model.contains("gemini"));
             if is_flash_model {
                 tracing::info!(
                     "[Thinking-Mode] [FIX #2167] No signature for flash model function calls. \
@@ -686,12 +692,17 @@ pub fn transform_claude_request_in(
     }
 
     // 生成 requestId
-    // [CHANGED v4.1.24] Structured requestId to match official format
-    let request_id = format!(
-        "agent/antigravity/{}/{}",
-        &session_id[..session_id.len().min(8)],
-        message_count
+    let request_id = crate::proxy::common::session::generate_official_request_id(
+        account_id,
+        &session_id,
+        message_count,
     );
+
+    let req_type = if config.request_type == "image_gen" {
+        "image_gen"
+    } else {
+        "agent"
+    };
 
     // 构建最终请求体
     let mut body = json!({
@@ -700,20 +711,8 @@ pub fn transform_claude_request_in(
         "request": inner_request,
         "model": config.final_model,
         "userAgent": "antigravity",
+        "requestType": req_type,
     });
-
-    // [DEFENSE] 3.8 网关严格校验：普通文本/Agent 请求绝不发送 requestType 包装字段（官方不发送，发送会触发假性 429）
-    // 仅当明确为图像生成时才保留 "image_gen"
-    if config.request_type == "image_gen" {
-        body["requestType"] = json!("image_gen");
-    }
-
-    // 如果提供了 metadata.user_id，则复用为 sessionId
-    if let Some(metadata) = &claude_req.metadata {
-        if let Some(user_id) = &metadata.user_id {
-            body["request"]["sessionId"] = json!(user_id);
-        }
-    }
 
     // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
     // 确保发送给 Antigravity 的请求中不包含任何 cache_control
@@ -770,6 +769,15 @@ fn should_enable_thinking_by_default(model: &str) -> bool {
     {
         tracing::debug!(
             "[Thinking-Mode] Auto-enabling thinking for Flash model: {}",
+            model
+        );
+        return true;
+    }
+
+    // 新代际分级思维模型默认开启 thinkingLevel
+    if crate::proxy::mappers::common_utils::is_modern_thinking_level_model(&model_lower) {
+        tracing::debug!(
+            "[Thinking-Mode] Auto-enabling thinking for modern thinkingLevel model: {}",
             model
         );
         return true;
@@ -1907,14 +1915,19 @@ fn build_generation_config(
             crate::proxy::config::ThinkingBudgetMode::Adaptive => budget_tokens as u64, // Adaptive 模式透传原始预算（但不作为限制），用于后续逻辑判断
         };
 
+        let lower_mapped = mapped_model.to_lowercase();
+        let is_modern =
+            crate::proxy::mappers::common_utils::is_modern_thinking_level_model(&lower_mapped);
+
         let global_mode_is_adaptive = matches!(
             tb_config.mode,
             crate::proxy::config::ThinkingBudgetMode::Adaptive
         );
         // 只要用户指定 adaptive 或者全局配置为 adaptive，且是支持的思维模型，就启用自适应
         let should_use_adaptive = (user_is_adaptive || global_mode_is_adaptive)
-            && (mapped_model.to_lowercase().contains("claude")
-                || mapped_model.to_lowercase().contains("gemini-3"));
+            && (lower_mapped.contains("claude")
+                || lower_mapped.contains("gemini-3")
+                || is_modern);
 
         let effort = claude_req
             .output_config
@@ -1922,52 +1935,40 @@ fn build_generation_config(
             .and_then(|c| c.effort.as_ref())
             .or_else(|| claude_req.thinking.as_ref().and_then(|t| t.effort.as_ref()));
 
-        if should_use_adaptive {
-            // [FIX #2208] thinkingLevel is ONLY supported by Claude models via Vertex AI native protocol.
-            // Gemini models (including gemini-3.x) use v1internal which only accepts thinkingBudget.
-            // Previous code incorrectly used contains("gemini-3") as the condition, causing 400 INVALID_ARGUMENT
-            // for gemini-3.1-pro-high / gemini-3.1-pro-low in adaptive mode.
-            let lower_mapped = mapped_model.to_lowercase();
-            if lower_mapped.contains("claude") {
-                // Claude 系列走 Vertex AI 原生协议，支持 thinkingLevel 分级参数
-                let mapped_level = match effort.map(|e| e.to_lowercase()).as_deref() {
-                    Some("low") => "low",
-                    Some("medium") => "medium",
-                    Some("high") | Some("max") => "high",
-                    _ => "high",
-                };
-                tracing::debug!(
-                    "[Claude-Request] Mapping adaptive mode to thinkingLevel: {} for Claude model",
-                    mapped_level
-                );
-                thinking_config["thinkingLevel"] = json!(mapped_level);
-                // Claude using thinkingLevel must NOT have thinkingBudget to avoid conflict
-                thinking_config
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("thinkingBudget");
-            } else {
-                // Gemini 系列（含 gemini-3.x）走 v1internal 协议，只接受 thinkingBudget，不支持 thinkingLevel
-                // [FIX #2007] Cherry Studio / Claude Protocol 400 Error Fix
-                // Gemini 1.5/2.0 models via Vertex AI often reject thinkingBudget: -1 (Adaptive) with 400 Invalid Argument
-                // especially when maxOutputTokens is high.
-                // We align with OpenAI mapper behavior: use 24576 as safe adaptive budget.
-                tracing::debug!("[Claude-Request] Mapping adaptive mode to safe budget (24576) for Gemini model (thinkingLevel not supported)");
-                thinking_config["thinkingBudget"] = json!(24576);
-            }
+        if is_modern || (should_use_adaptive && lower_mapped.contains("claude")) {
+            let mapped_level = crate::proxy::mappers::common_utils::resolve_modern_thinking_level(
+                mapped_model,
+                effort.map(|s| s.as_str()),
+                "HIGH",
+            );
+            tracing::debug!(
+                "[Claude-Request] Mapping to thinkingLevel: {} for model {}",
+                mapped_level,
+                mapped_model
+            );
+            thinking_config["thinkingLevel"] = json!(mapped_level);
+            // Models using thinkingLevel must NOT have thinkingBudget to avoid 400
+            thinking_config
+                .as_object_mut()
+                .unwrap()
+                .remove("thinkingBudget");
 
-            // 针对自适应模式，如果没有显式设置，确保 maxOutputTokens 给足空间
-            // OpenAI mapper uses 57344 (24576 + 32768), we normally use 64k limit.
+            if config.get("maxOutputTokens").is_none() {
+                config["maxOutputTokens"] = json!(64000);
+            }
+        } else if should_use_adaptive {
+            tracing::debug!(
+                "[Claude-Request] Mapping adaptive mode to safe budget (24576) for legacy model {}",
+                mapped_model
+            );
+            thinking_config["thinkingBudget"] = json!(24576);
             if config.get("maxOutputTokens").is_none() {
                 config["maxOutputTokens"] = json!(64000);
             }
         } else {
             // [FIX #2007] Opus 4.6 Thinking Alignment (OpenAI Protocol Recipe)
             // Explicitly set fixed budget for Opus 4.6 to match successful OpenAI pattern
-            if mapped_model
-                .to_lowercase()
-                .contains("claude-opus-4-6-thinking")
-            {
+            if lower_mapped.contains("claude-opus-4-6-thinking") {
                 tracing::debug!(
                     "[Opus-Alignment] Enforcing fixed thinkingBudget 24576 for Opus 4.6"
                 );
@@ -2005,10 +2006,7 @@ fn build_generation_config(
     let mut final_max_tokens: Option<i64> = claude_req.max_tokens.map(|t| t as i64);
 
     // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
-    // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
     let model_lower = mapped_model.to_lowercase();
-    // 重新计算 should_use_adaptive (因为上面定义的作用域仅在其 if 块内有效，或者我们可以假设在这里也需要同样的逻辑)
-    // 但为了简洁和解耦，我们这里重新从 config 读取
     let tb_config_chk = crate::proxy::config::get_thinking_budget_config();
     let global_adaptive = matches!(
         tb_config_chk.mode,
@@ -2051,10 +2049,10 @@ fn build_generation_config(
                     boosted, budget
                 );
             }
-        } else if is_adaptive_effective {
-            // [FIX] Adaptive mode (no budget set in thinkingConfig), apply default maxOutputTokens
+        } else if is_adaptive_effective || thinking_config.get("thinkingLevel").is_some() {
+            // [FIX] Adaptive / thinkingLevel mode (no budget set in thinkingConfig), apply default maxOutputTokens
             if final_max_tokens.is_none() {
-                final_max_tokens = Some(final_overhead as i64);
+                final_max_tokens = Some(64000);
             }
         }
     } else {
@@ -3063,13 +3061,14 @@ mod tests {
 
         // Check injection
         assert_eq!(thinking_config["includeThoughts"], true);
-        assert_eq!(thinking_config["thinkingBudget"], -1);
+        assert_eq!(thinking_config["thinkingLevel"], "HIGH");
+        assert!(thinking_config.get("thinkingBudget").is_none());
         assert!(thinking_config.get("thinkingType").is_none());
         assert!(thinking_config.get("effort").is_none());
 
         // Check maxOutputTokens default for adaptive
         let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
-        assert_eq!(max_output_tokens, 131072);
+        assert_eq!(max_output_tokens, 64000);
 
         // Reset global config
         crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig::default());
@@ -3188,5 +3187,59 @@ mod tests {
             "Older Gemini models should NOT have mixed tools"
         );
         assert!(has_functions);
+    }
+
+    #[test]
+    fn test_modern_models_thinking_level_alignment_claude() {
+        crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig::default());
+
+        let cases = [
+            ("gemini-3.8-flash-medium", "MEDIUM"),
+            ("gemini-4-argon-high", "HIGH"),
+            ("claude-sonnet-5-5-medium", "MEDIUM"),
+            ("claude-opus-5-5-low", "LOW"),
+        ];
+
+        for (model_id, expected_level) in cases {
+            let req = ClaudeRequest {
+                model: model_id.to_string(),
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String("Hello".to_string()),
+                }],
+                thinking: None,
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stream: true,
+                system: None,
+                tools: None,
+                metadata: None,
+                output_config: None,
+                size: None,
+                quality: None,
+            };
+
+            let result =
+                transform_claude_request_in(&req, "test-proj", false, None, "test_session", None)
+                    .unwrap();
+
+            assert_eq!(result["requestType"], "agent");
+            let req_id = result["requestId"].as_str().expect("requestId must exist");
+            let segments: Vec<&str> = req_id.split('/').collect();
+            assert_eq!(segments.len(), 5, "requestId must be 5 segments: {}", req_id);
+            assert_eq!(segments[0], "agent");
+
+            let gen_config = &result["request"]["generationConfig"];
+            let tc = &gen_config["thinkingConfig"];
+            assert_eq!(tc["includeThoughts"], true, "[{}]", model_id);
+            assert_eq!(tc["thinkingLevel"], expected_level, "[{}]", model_id);
+            assert!(
+                tc.get("thinkingBudget").is_none(),
+                "[{}] modern model must NOT emit thinkingBudget",
+                model_id
+            );
+        }
     }
 }

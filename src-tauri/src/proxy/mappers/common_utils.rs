@@ -105,12 +105,14 @@ pub fn resolve_request_config(
         || mapped_model.starts_with("gemini-pro-")
         || mapped_model.starts_with("gemini-3-flash")
         || mapped_model.starts_with("gemini-3.5-flash")
+        || mapped_model.starts_with("gemini-4")
         || mapped_model.starts_with("agent")
         || mapped_model.contains("claude-3-5-sonnet")
         || mapped_model.contains("claude-3-opus")
         || mapped_model.contains("claude-sonnet")
         || mapped_model.contains("claude-opus")
-        || mapped_model.contains("claude-4");
+        || mapped_model.contains("claude-4")
+        || mapped_model.contains("claude-5");
 
     // Determine if we should enable networking
     // [FIX] 禁用基于模型的自动联网逻辑，防止图像请求被联网搜索结果覆盖。
@@ -150,6 +152,48 @@ pub fn resolve_request_config(
         inject_google_search: enable_networking,
         final_model,
         image_config: None,
+    }
+}
+
+/// 判断是否为仅使用官方大写 `thinkingLevel`（禁止同时携带 `thinkingBudget`）的新代际模型
+pub fn is_modern_thinking_level_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    if m.contains("-image") {
+        return false;
+    }
+    m.contains("gemini-3.5")
+        || m.contains("gemini-3.8")
+        || m.contains("gemini-4")
+        || m.contains("claude-sonnet-5")
+        || m.contains("claude-opus-5")
+        || m.contains("claude-5")
+}
+
+/// 推导官方大写 `thinkingLevel`（`"MINIMAL" | "LOW" | "MEDIUM" | "HIGH"`）
+/// 优先级：显式参数 (`effort` / `thinkingLevel` / `reasoning_effort`) > 模型名后缀 (`-low` / `-medium` / `-high` / `flash-lite` / `-tiered`) > `fallback`
+pub fn resolve_modern_thinking_level(
+    model: &str,
+    explicit_level: Option<&str>,
+    fallback: &'static str,
+) -> &'static str {
+    if let Some(raw) = explicit_level {
+        match raw.trim().to_lowercase().as_str() {
+            "minimal" => return "MINIMAL",
+            "low" => return "LOW",
+            "medium" => return "MEDIUM",
+            "high" | "max" => return "HIGH",
+            _ => {}
+        }
+    }
+    let m = model.to_lowercase();
+    if m.contains("-low") || m.contains("flash-lite") || m.contains("-tiered") {
+        "LOW"
+    } else if m.contains("-medium") {
+        "MEDIUM"
+    } else if m.contains("-high") || m.contains("-max") {
+        "HIGH"
+    } else {
+        fallback
     }
 }
 

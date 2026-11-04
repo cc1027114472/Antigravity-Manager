@@ -77,6 +77,8 @@ pub async fn list_accounts(
                     crate::proxy::FatigueReason::HourlyOutputLimitExceeded => "HourlyOutputLimitExceeded".to_string(),
                     crate::proxy::FatigueReason::DailyOutputLimitExceeded => "DailyOutputLimitExceeded".to_string(),
                     crate::proxy::FatigueReason::BothLimitsExceeded => "BothLimitsExceeded".to_string(),
+                    crate::proxy::FatigueReason::HourlyInputLimitExceeded => "HourlyInputLimitExceeded".to_string(),
+                    crate::proxy::FatigueReason::HourlyRequestLimitExceeded => "HourlyRequestLimitExceeded".to_string(),
                     crate::proxy::FatigueReason::Manual => "Manual".to_string(),
                 };
                 account.fatigue_reason = Some(reason_str);

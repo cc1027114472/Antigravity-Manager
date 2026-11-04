@@ -49,19 +49,45 @@ pub fn split_proxy_url_credentials(url: &str) -> (String, Option<String>, Option
 // 全局 Thinking Budget 配置存储
 // 用于在 request transform 函数中访问配置（无需修改函数签名）
 // ============================================================================
+#[cfg(not(test))]
 static GLOBAL_THINKING_BUDGET_CONFIG: OnceLock<RwLock<ThinkingBudgetConfig>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TEST_THINKING_BUDGET_CONFIG: std::cell::RefCell<ThinkingBudgetConfig> =
+        std::cell::RefCell::new(ThinkingBudgetConfig::default());
+    static TEST_IMAGE_THINKING_MODE: std::cell::RefCell<String> =
+        std::cell::RefCell::new("enabled".to_string());
+    static TEST_ENABLE_G1_CREDITS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static TEST_COMPRESSION_CONFIG: std::cell::RefCell<(String, bool)> =
+        std::cell::RefCell::new(("disabled".to_string(), false));
+}
 
 /// 获取当前 Thinking Budget 配置
 pub fn get_thinking_budget_config() -> ThinkingBudgetConfig {
-    GLOBAL_THINKING_BUDGET_CONFIG
-        .get()
-        .and_then(|lock| lock.read().ok())
-        .map(|cfg| cfg.clone())
-        .unwrap_or_default()
+    #[cfg(test)]
+    {
+        return TEST_THINKING_BUDGET_CONFIG.with(|c| c.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        GLOBAL_THINKING_BUDGET_CONFIG
+            .get()
+            .and_then(|lock| lock.read().ok())
+            .map(|cfg| cfg.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// 更新全局 Thinking Budget 配置
 pub fn update_thinking_budget_config(config: ThinkingBudgetConfig) {
+    #[cfg(test)]
+    {
+        TEST_THINKING_BUDGET_CONFIG.with(|c| *c.borrow_mut() = config);
+        return;
+    }
+    #[cfg(not(test))]
     if let Some(lock) = GLOBAL_THINKING_BUDGET_CONFIG.get() {
         if let Ok(mut cfg) = lock.write() {
             *cfg = config.clone();
@@ -122,18 +148,32 @@ pub fn update_global_system_prompt_config(config: GlobalSystemPromptConfig) {
 // ============================================================================
 // 全局图像思维模式配置存储
 // ============================================================================
+#[cfg(not(test))]
 static GLOBAL_IMAGE_THINKING_MODE: OnceLock<RwLock<String>> = OnceLock::new();
 
 pub fn get_image_thinking_mode() -> String {
-    GLOBAL_IMAGE_THINKING_MODE
-        .get()
-        .and_then(|lock| lock.read().ok())
-        .map(|s| s.clone())
-        .unwrap_or_else(|| "enabled".to_string())
+    #[cfg(test)]
+    {
+        return TEST_IMAGE_THINKING_MODE.with(|m| m.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        GLOBAL_IMAGE_THINKING_MODE
+            .get()
+            .and_then(|lock| lock.read().ok())
+            .map(|s| s.clone())
+            .unwrap_or_else(|| "enabled".to_string())
+    }
 }
 
 pub fn update_image_thinking_mode(mode: Option<String>) {
     let val = mode.unwrap_or_else(|| "enabled".to_string());
+    #[cfg(test)]
+    {
+        TEST_IMAGE_THINKING_MODE.with(|m| *m.borrow_mut() = val);
+        return;
+    }
+    #[cfg(not(test))]
     if let Some(lock) = GLOBAL_IMAGE_THINKING_MODE.get() {
         if let Ok(mut cfg) = lock.write() {
             if *cfg != val {
@@ -151,23 +191,41 @@ pub fn update_image_thinking_mode(mode: Option<String>) {
 // 控制是否在请求中注入 enabledCreditTypes: ["GOOGLE_ONE_AI"]
 // 默认关闭 (false)，优先使用基础 5 小时免费额度，避免消耗 G1 点数并降低 403 风险
 // ============================================================================
+#[cfg(not(test))]
 static GLOBAL_ENABLE_G1_CREDITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn get_enable_g1_credits() -> bool {
-    GLOBAL_ENABLE_G1_CREDITS.load(std::sync::atomic::Ordering::Relaxed)
+    #[cfg(test)]
+    {
+        return TEST_ENABLE_G1_CREDITS.with(|c| c.get());
+    }
+    #[cfg(not(test))]
+    {
+        GLOBAL_ENABLE_G1_CREDITS.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 pub fn update_enable_g1_credits(enabled: bool) {
-    let old = GLOBAL_ENABLE_G1_CREDITS.swap(enabled, std::sync::atomic::Ordering::Relaxed);
-    if old != enabled {
-        tracing::info!("[G1-Credits] Global enable_g1_credits updated: {}", enabled);
+    #[cfg(test)]
+    {
+        TEST_ENABLE_G1_CREDITS.with(|c| c.set(enabled));
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let old = GLOBAL_ENABLE_G1_CREDITS.swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if old != enabled {
+            tracing::info!("[G1-Credits] Global enable_g1_credits updated: {}", enabled);
+        }
     }
 }
 
 // ============================================================================
 // 全局压缩等级配置存储
 // ============================================================================
+#[cfg(not(test))]
 static GLOBAL_COMPRESSION_LEVEL: OnceLock<RwLock<String>> = OnceLock::new();
+#[cfg(not(test))]
 static GLOBAL_USAGE_SCALING: OnceLock<RwLock<bool>> = OnceLock::new();
 static GLOBAL_THRESHOLD_L1: OnceLock<RwLock<f32>> = OnceLock::new();
 static GLOBAL_THRESHOLD_L2: OnceLock<RwLock<f32>> = OnceLock::new();
@@ -198,18 +256,24 @@ pub fn get_global_threshold_l3() -> f32 {
 }
 
 pub fn get_global_compression_level() -> String {
-    let level = GLOBAL_COMPRESSION_LEVEL
-        .get()
-        .and_then(|lock| lock.read().ok())
-        .map(|cfg| cfg.clone())
-        .unwrap_or_else(|| "disabled".to_string());
-
-    if level == "disabled" {
-        let scaling = GLOBAL_USAGE_SCALING
+    #[cfg(test)]
+    let (level, scaling) = TEST_COMPRESSION_CONFIG.with(|c| c.borrow().clone());
+    #[cfg(not(test))]
+    let (level, scaling) = {
+        let l = GLOBAL_COMPRESSION_LEVEL
+            .get()
+            .and_then(|lock| lock.read().ok())
+            .map(|cfg| cfg.clone())
+            .unwrap_or_else(|| "disabled".to_string());
+        let s = GLOBAL_USAGE_SCALING
             .get()
             .and_then(|lock| lock.read().ok())
             .map(|s| *s)
             .unwrap_or(false);
+        (l, s)
+    };
+
+    if level == "disabled" {
         if scaling {
             "high".to_string()
         } else {
@@ -221,20 +285,28 @@ pub fn get_global_compression_level() -> String {
 }
 
 pub fn update_global_compression_level(level: String, scaling: bool) {
-    if let Some(lock) = GLOBAL_COMPRESSION_LEVEL.get() {
-        if let Ok(mut cfg) = lock.write() {
-            *cfg = level;
-        }
-    } else {
-        let _ = GLOBAL_COMPRESSION_LEVEL.set(RwLock::new(level));
+    #[cfg(test)]
+    {
+        TEST_COMPRESSION_CONFIG.with(|c| *c.borrow_mut() = (level, scaling));
+        return;
     }
-
-    if let Some(lock) = GLOBAL_USAGE_SCALING.get() {
-        if let Ok(mut cfg) = lock.write() {
-            *cfg = scaling;
+    #[cfg(not(test))]
+    {
+        if let Some(lock) = GLOBAL_COMPRESSION_LEVEL.get() {
+            if let Ok(mut cfg) = lock.write() {
+                *cfg = level;
+            }
+        } else {
+            let _ = GLOBAL_COMPRESSION_LEVEL.set(RwLock::new(level));
         }
-    } else {
-        let _ = GLOBAL_USAGE_SCALING.set(RwLock::new(scaling));
+
+        if let Some(lock) = GLOBAL_USAGE_SCALING.get() {
+            if let Ok(mut cfg) = lock.write() {
+                *cfg = scaling;
+            }
+        } else {
+            let _ = GLOBAL_USAGE_SCALING.set(RwLock::new(scaling));
+        }
     }
 }
 

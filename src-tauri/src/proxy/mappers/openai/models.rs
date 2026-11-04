@@ -48,6 +48,8 @@ pub struct OpenAIRequest {
     // [NEW] Direct imageSize support (for Gemini native parameter)
     #[serde(default, rename = "imageSize")]
     pub image_size: Option<String>,
+    #[serde(default, rename = "reasoning_effort")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Thinking 配置 (兼容 Anthropic 和 OpenAI 扩展协议)

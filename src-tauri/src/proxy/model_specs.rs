@@ -52,8 +52,12 @@ pub fn get_max_output_tokens(model_id: &str, token: Option<&ProxyToken>) -> u64 
         }
     }
 
-    // 3. 全局兜底
-    65535
+    // 3. 全局兜底 (Claude 模型在 v1internal 上硬上限为 64000)
+    if std_id.to_ascii_lowercase().contains("claude") {
+        64000
+    } else {
+        65535
+    }
 }
 
 /// 获取思维链预算 (动态优先)
@@ -61,7 +65,7 @@ pub fn get_thinking_budget(model_id: &str, _token: Option<&ProxyToken>) -> u64 {
     let std_id = resolve_alias(model_id);
 
     // 1. 优先尝试从 token 的 quota 信息中推断 (如果以后 quota 返回了具体 budget)
-    // 目前 ProxyToken 结构体暂未直接缓存每个模型的 thinking_budget，
+    // 目前 ProxyToken 结构体暂未缓存每个模型的 thinking_budget，
     // 但可以通过 model_limits 比例或直接从 JSON 补全。
 
     // 2. 静态 JSON 配置
@@ -86,5 +90,7 @@ pub fn is_thinking_model(model_id: &str) -> bool {
     if let Some(spec) = SPECS.models.get(&std_id) {
         return spec.is_thinking.unwrap_or(false);
     }
-    model_id.contains("-thinking") || model_id.contains("thinking")
+    model_id.contains("-thinking")
+        || model_id.contains("thinking")
+        || crate::proxy::mappers::common_utils::is_modern_thinking_level_model(&std_id)
 }

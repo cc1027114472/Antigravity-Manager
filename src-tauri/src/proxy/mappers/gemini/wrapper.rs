@@ -323,9 +323,12 @@ pub fn wrap_request_v2(
     // [FIX #1557] Also apply to Pro/Thinking models to ensure budget processing
     // [FIX #1557] Auto-inject thinkingConfig if missing for these models
     let lower_model = final_model_name.to_lowercase();
+    let is_modern_thinking =
+        crate::proxy::mappers::common_utils::is_modern_thinking_level_model(&lower_model);
     if lower_model.contains("flash")
         || lower_model.contains("pro")
         || lower_model.contains("thinking")
+        || is_modern_thinking
     {
         // [NEW] Extract OpenAI-style max_tokens before mutably borrowing gen_config
         let req_max_tokens = inner_request.get("max_tokens").and_then(|v| v.as_u64());
@@ -333,23 +336,20 @@ pub fn wrap_request_v2(
         // Determine model family and capability beforehand to avoid borrow checker conflicts
         let is_claude = lower_model.contains("claude");
         let is_preview = lower_model.contains("preview");
-        let should_inject = lower_model.contains("thinking")
+        let should_inject = is_modern_thinking
+            || lower_model.contains("thinking")
             || (lower_model.contains("gemini-2.0-pro") && !is_preview)
             || (lower_model.contains("gemini-3-pro") && !is_preview)
             || (lower_model.contains("gemini-3.1-pro") && !is_preview);
 
         if should_inject {
             // Scope for borrowing inner_request/gen_config
-            let mut has_thinking = false;
+            let mut has_thinking = inner_request
+                .get("generationConfig")
+                .and_then(|v| v.as_object())
+                .map_or(false, |gc| gc.get("thinkingConfig").is_some());
             if is_claude {
-                has_thinking = inner_request.get("thinking").is_some();
-            } else {
-                if let Some(gc) = inner_request
-                    .get("generationConfig")
-                    .and_then(|v| v.as_object())
-                {
-                    has_thinking = gc.get("thinkingConfig").is_some();
-                }
+                has_thinking = has_thinking || inner_request.get("thinking").is_some();
             }
 
             if !has_thinking {
@@ -357,11 +357,6 @@ pub fn wrap_request_v2(
                     "[Gemini-Wrap] Auto-injecting default thinking for {}",
                     final_model_name
                 );
-
-                // [FIX] 统一注入到 generationConfig.thinkingConfig
-                // 使用动态规格提供的默认预算
-                let default_budget =
-                    crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
 
                 let gen_config = inner_request
                     .as_object_mut()
@@ -371,13 +366,31 @@ pub fn wrap_request_v2(
                     .as_object_mut()
                     .unwrap();
 
-                gen_config.insert(
-                    "thinkingConfig".to_string(),
-                    json!({
-                        "includeThoughts": true,
-                        "thinkingBudget": default_budget
-                    }),
-                );
+                if is_modern_thinking {
+                    let default_level =
+                        crate::proxy::mappers::common_utils::resolve_modern_thinking_level(
+                            final_model_name,
+                            None,
+                            "MEDIUM",
+                        );
+                    gen_config.insert(
+                        "thinkingConfig".to_string(),
+                        json!({
+                            "includeThoughts": true,
+                            "thinkingLevel": default_level
+                        }),
+                    );
+                } else {
+                    let default_budget =
+                        crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
+                    gen_config.insert(
+                        "thinkingConfig".to_string(),
+                        json!({
+                            "includeThoughts": true,
+                            "thinkingBudget": default_budget
+                        }),
+                    );
+                }
             }
         }
 
@@ -398,15 +411,29 @@ pub fn wrap_request_v2(
             gen_config.insert("topP".to_string(), json!(1.0));
         }
 
-        // [FIX] Convert v1beta thinkingLevel (string) to v1internal thinkingBudget (number).
-        // Clients (e.g. OpenClaw, Cline) may send thinkingLevel which v1internal does not accept,
-        // causing 400 INVALID_ARGUMENT. Convert before any budget processing below.
         if let Some(thinking_config) = gen_config.get_mut("thinkingConfig") {
-            if let Some(level) = thinking_config
+            if is_modern_thinking {
+                // 现代模型：确保使用大写 thinkingLevel (MINIMAL, LOW, MEDIUM, HIGH)，并且不能同时发送 thinkingBudget
+                let explicit = thinking_config
+                    .get("thinkingLevel")
+                    .and_then(|v| v.as_str());
+                let level = crate::proxy::mappers::common_utils::resolve_modern_thinking_level(
+                    final_model_name,
+                    explicit,
+                    "MEDIUM",
+                );
+
+                if let Some(tc) = thinking_config.as_object_mut() {
+                    tc.insert("thinkingLevel".to_string(), json!(level));
+                    tc.insert("includeThoughts".to_string(), json!(true));
+                    tc.remove("thinkingBudget");
+                }
+            } else if let Some(level) = thinking_config
                 .get("thinkingLevel")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_uppercase())
             {
+                // 旧模型：将客户端传入的 thinkingLevel 转为 thinkingBudget
                 let thinking_budget_cap =
                     crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
                 let budget: i64 = match level.as_str() {
@@ -414,10 +441,10 @@ pub fn wrap_request_v2(
                     "LOW" => (thinking_budget_cap / 4).max(4096) as i64,
                     "MEDIUM" => (thinking_budget_cap / 2).max(8192) as i64,
                     "HIGH" => thinking_budget_cap as i64,
-                    _ => (thinking_budget_cap / 2).max(8192) as i64, // safe default
+                    _ => (thinking_budget_cap / 2).max(8192) as i64,
                 };
                 tracing::info!(
-                    "[Gemini-Wrap] Converting thinkingLevel '{}' to thinkingBudget {}",
+                    "[Gemini-Wrap] Converting thinkingLevel '{}' to thinkingBudget {} for legacy model",
                     level,
                     budget
                 );
@@ -755,12 +782,7 @@ pub fn wrap_request_v2(
         }
     }
 
-    // [ADDED v4.1.24] 扩展 toolConfig 到 VALIDATED 模式
-    if inner_request.get("tools").is_some() && !inner_request.get("toolConfig").is_some() {
-        inner_request["toolConfig"] = json!({
-            "functionCallingConfig": { "mode": "VALIDATED" }
-        });
-    }
+    // [REMOVED] 官方客户端未配置 toolConfig 时从不主动注入 mode: VALIDATED，避免上游模式冲突
 
     // [ADDED v4.1.24] 注入基于账号的稳定 sessionId
     if let Some(account_id_str) = account_id {
@@ -770,12 +792,18 @@ pub fn wrap_request_v2(
     }
 
     let sid = session_id.unwrap_or("default");
+    let step_index = inner_request
+        .get("contents")
+        .and_then(|c| c.as_array())
+        .map(|arr| arr.len())
+        .unwrap_or(1);
 
-    // [NEW] 1. 深度对齐 requestId 格式 (官方格式: agent/{timestamp_ms}/{random_hex_8bytes})
-    // 每次请求生成完全唯一的 ID，避免重试时的幂等性冲突导致 Google 返回旧缓存
-    let timestamp_ms = chrono::Utc::now().timestamp_millis();
-    let random_hex = &uuid::Uuid::new_v4().simple().to_string()[..8]; // 移除对外部 hex crate 的依赖
-    let official_request_id = format!("agent/{}/{}", timestamp_ms, random_hex);
+    // [NEW] 1. 深度对齐 requestId 格式 (官方 5 段式: agent/{cascade_uuid}/{timestamp_ms}/{trajectory_uuid}/{step_index})
+    let official_request_id = crate::proxy::common::session::generate_official_request_id(
+        account_id,
+        sid,
+        step_index,
+    );
 
     // [NEW] 2. 动态 userAgent 仿真 (支持 jetski)
     // 根据账号属性或域名判断。Go Worker 中企业/GCP 账号通常使用 jetski 指纹。
@@ -867,10 +895,12 @@ pub fn wrap_request_v2(
         "requestId": official_request_id,
     });
 
-    // [DEFENSE] 3.8 网关严格校验：普通文本/Agent 请求绝不发送 requestType 包装字段
-    if !is_agent_request {
-        final_request_obj["requestType"] = json!("image_gen");
-    }
+    let req_type = if !is_agent_request {
+        "image_gen"
+    } else {
+        "agent"
+    };
+    final_request_obj["requestType"] = json!(req_type);
 
     if is_agent_request && enable_g1_credits {
         if let Some(obj) = final_request_obj.as_object_mut() {
@@ -1802,6 +1832,65 @@ mod tests {
 
         let text_5 = contents[4]["parts"][0]["text"].as_str().unwrap();
         assert!(text_5.contains("Please"));
+        crate::proxy::config::update_global_compression_level("disabled".to_string(), false);
+    }
+
+    #[test]
+    fn test_modern_models_thinking_level_and_official_request_id() {
+        crate::proxy::config::update_thinking_budget_config(
+            crate::proxy::config::ThinkingBudgetConfig::default(),
+        );
+
+        let cases = [
+            ("gemini-3.5-flash-lite", "LOW"),
+            ("gemini-3.8-flash-medium", "MEDIUM"),
+            ("gemini-4-argon-high", "HIGH"),
+            ("claude-sonnet-5-5-medium", "MEDIUM"),
+            ("claude-opus-5-5-high", "HIGH"),
+        ];
+
+        for (model_id, expected_level) in cases {
+            let body = json!({
+                "model": model_id,
+                "contents": [
+                    {"role": "user", "parts": [{"text": "Turn 1"}]},
+                    {"role": "model", "parts": [{"text": "Reply 1"}]},
+                    {"role": "user", "parts": [{"text": "Turn 2"}]}
+                ]
+            });
+
+            let wrapped = wrap_request(&body, "test-proj", model_id, None, None, None);
+            assert_eq!(wrapped["requestType"], "agent");
+            assert_eq!(wrapped["userAgent"], "antigravity");
+
+            let req_id = wrapped["requestId"].as_str().expect("requestId must exist");
+            let segments: Vec<&str> = req_id.split('/').collect();
+            assert_eq!(
+                segments.len(),
+                5,
+                "agent requestId must be 5 segments: {}",
+                req_id
+            );
+            assert_eq!(segments[0], "agent");
+            assert_eq!(segments[4], "3", "step_index should match contents.len()");
+
+            let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
+            assert_eq!(
+                tc["includeThoughts"], true,
+                "[{}] includeThoughts must be true",
+                model_id
+            );
+            assert_eq!(
+                tc["thinkingLevel"], expected_level,
+                "[{}] thinkingLevel mismatch",
+                model_id
+            );
+            assert!(
+                tc.get("thinkingBudget").is_none(),
+                "[{}] modern model must NOT emit thinkingBudget",
+                model_id
+            );
+        }
     }
 
     #[test]

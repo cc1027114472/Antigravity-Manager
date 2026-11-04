@@ -1075,6 +1075,8 @@ async fn admin_list_accounts(
                         crate::proxy::FatigueReason::HourlyOutputLimitExceeded => "HourlyOutputLimitExceeded".to_string(),
                         crate::proxy::FatigueReason::DailyOutputLimitExceeded => "DailyOutputLimitExceeded".to_string(),
                         crate::proxy::FatigueReason::BothLimitsExceeded => "BothLimitsExceeded".to_string(),
+                        crate::proxy::FatigueReason::HourlyInputLimitExceeded => "HourlyInputLimitExceeded".to_string(),
+                        crate::proxy::FatigueReason::HourlyRequestLimitExceeded => "HourlyRequestLimitExceeded".to_string(),
                         crate::proxy::FatigueReason::Manual => "Manual".to_string(),
                     };
                     (Some(fatigue_rec.fatigue_until), Some(remaining), Some(fatigue_rec.consecutive_strikes), Some(reason_str))
@@ -1193,6 +1195,8 @@ async fn admin_get_current_account(
                         crate::proxy::FatigueReason::HourlyOutputLimitExceeded => "HourlyOutputLimitExceeded".to_string(),
                         crate::proxy::FatigueReason::DailyOutputLimitExceeded => "DailyOutputLimitExceeded".to_string(),
                         crate::proxy::FatigueReason::BothLimitsExceeded => "BothLimitsExceeded".to_string(),
+                        crate::proxy::FatigueReason::HourlyInputLimitExceeded => "HourlyInputLimitExceeded".to_string(),
+                        crate::proxy::FatigueReason::HourlyRequestLimitExceeded => "HourlyRequestLimitExceeded".to_string(),
                         crate::proxy::FatigueReason::Manual => "Manual".to_string(),
                     };
                     (Some(fatigue_rec.fatigue_until), Some(remaining), Some(fatigue_rec.consecutive_strikes), Some(reason_str))

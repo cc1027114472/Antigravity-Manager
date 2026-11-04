@@ -55,7 +55,7 @@ pub async fn fetch_project_id(
         .post(url)
         .bearer_auth(access_token)
         // .header("Host", "cloudcode-pa.googleapis.com") // 移除 Host header，因为已切换域名
-        .header("User-Agent", crate::constants::USER_AGENT.as_str())
+        .header("User-Agent", crate::constants::get_account_user_agent(account_id).as_str())
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()

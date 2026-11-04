@@ -1,14 +1,26 @@
 use crate::modules::config::load_app_config;
 use once_cell::sync::Lazy;
 use rquest::{header, Client, ClientBuilder, Proxy};
-use rquest_util::Emulation;
+use rquest_util::{Emulation, EmulationOption};
 use std::time::Duration;
 
-/// Same TLS / HTTP2 / default UA as AI upstream (Chrome 132 + Antigravity Electron UA).
-/// Quota, OAuth, and generateContent must share this identity on a given egress IP.
+/// Same TLS / HTTP2 identity as official Antigravity IDE (BoringSSL Chrome 132 TLS & HTTP/2).
+/// Strips browser document navigation headers (sec-ch-ua, sec-fetch-*, etc.) via skip_headers(true).
 pub fn apply_chrome_identity(builder: ClientBuilder) -> ClientBuilder {
-    let builder = builder
+    let emu = EmulationOption::builder()
         .emulation(Emulation::Chrome132)
+        .skip_headers(true)
+        .build();
+
+    let mut default_headers = header::HeaderMap::new();
+    default_headers.insert(
+        header::ACCEPT_ENCODING,
+        header::HeaderValue::from_static("gzip"),
+    );
+
+    let builder = builder
+        .emulation(emu)
+        .default_headers(default_headers)
         .connect_timeout(Duration::from_secs(20))
         .pool_max_idle_per_host(20)
         .pool_idle_timeout(Duration::from_secs(90))

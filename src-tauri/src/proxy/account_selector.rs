@@ -44,6 +44,14 @@ pub const MAX_HOURLY_OUTPUT_TOKEN_LIMIT: u64 = 68_000;
 pub const MIN_DAILY_OUTPUT_TOKEN_LIMIT: u64 = 260_000;
 pub const MAX_DAILY_OUTPUT_TOKEN_LIMIT: u64 = 330_000;
 
+/// 单账号小时 Input 软上限随机区间：[1_000_000, 1_400_000]
+pub const MIN_HOURLY_INPUT_TOKEN_LIMIT: u64 = 1_000_000;
+pub const MAX_HOURLY_INPUT_TOKEN_LIMIT: u64 = 1_400_000;
+
+/// 单账号小时请求频次软上限随机区间：[25, 35]
+pub const MIN_HOURLY_REQUEST_LIMIT: u32 = 25;
+pub const MAX_HOURLY_REQUEST_LIMIT: u32 = 35;
+
 /// 疲劳阶梯退避配置 (秒)
 pub const TIER1_NAP_MIN_SECS: i64 = 3600;      // 1.0 小时
 pub const TIER1_NAP_MAX_SECS: i64 = 5400;      // 1.5 小时
@@ -86,12 +94,24 @@ pub struct AccountWarmthState {
     pub last_active_at: i64,
 }
 
+fn default_hourly_input_limit() -> u64 {
+    1_200_000
+}
+
+fn default_hourly_request_limit() -> u32 {
+    30
+}
+
 /// 单账号动态抖动软上限
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AccountJitterCap {
     pub hourly_limit: u64,
     pub daily_limit: u64,
     pub day_epoch: i64,
+    #[serde(default = "default_hourly_input_limit")]
+    pub hourly_input_limit: u64,
+    #[serde(default = "default_hourly_request_limit")]
+    pub hourly_request_limit: u32,
 }
 
 impl AccountJitterCap {
@@ -101,6 +121,8 @@ impl AccountJitterCap {
             hourly_limit: rng.gen_range(MIN_HOURLY_OUTPUT_TOKEN_LIMIT..=MAX_HOURLY_OUTPUT_TOKEN_LIMIT),
             daily_limit: rng.gen_range(MIN_DAILY_OUTPUT_TOKEN_LIMIT..=MAX_DAILY_OUTPUT_TOKEN_LIMIT),
             day_epoch,
+            hourly_input_limit: rng.gen_range(MIN_HOURLY_INPUT_TOKEN_LIMIT..=MAX_HOURLY_INPUT_TOKEN_LIMIT),
+            hourly_request_limit: rng.gen_range(MIN_HOURLY_REQUEST_LIMIT..=MAX_HOURLY_REQUEST_LIMIT),
         }
     }
 }
@@ -114,6 +136,10 @@ pub enum FatigueReason {
     DailyOutputLimitExceeded,
     /// 双上限同时超标
     BothLimitsExceeded,
+    /// 过去 1 小时 Input Tokens 超过动态软上限
+    HourlyInputLimitExceeded,
+    /// 过去 1 小时请求频次超过动态软上限
+    HourlyRequestLimitExceeded,
     /// 手动设置
     Manual,
 }
@@ -124,6 +150,8 @@ impl std::fmt::Display for FatigueReason {
             Self::HourlyOutputLimitExceeded => write!(f, "过去 1 小时 Output Tokens 触及动态软上限"),
             Self::DailyOutputLimitExceeded => write!(f, "过去 24 小时 Output Tokens 触及动态软上限"),
             Self::BothLimitsExceeded => write!(f, "小时与 24 小时滑动窗口 Output Tokens 均触及动态软上限"),
+            Self::HourlyInputLimitExceeded => write!(f, "过去 1 小时 Input Tokens 触及动态软上限"),
+            Self::HourlyRequestLimitExceeded => write!(f, "过去 1 小时请求频次触及动态软上限"),
             Self::Manual => write!(f, "人工或策略手动设置"),
         }
     }
@@ -148,6 +176,10 @@ pub struct FatigueRecord {
 pub struct HourlyBucket {
     pub epoch_hour: i64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub request_count: u32,
 }
 
 /// 账号实时 Token 统计快照
@@ -305,8 +337,8 @@ impl AccountSelector {
         new_cap
     }
 
-    /// 获取过去 1 小时与过去 24 小时的真实滑动窗口消耗
-    pub fn get_rolling_usage(&self, account_id: &str, now_ts: i64) -> (u64, u64) {
+    /// 获取真实滑动窗口消耗统计：(hourly_output, daily_rolling_output, hourly_input, hourly_requests)
+    pub fn get_rolling_usage_extended(&self, account_id: &str, now_ts: i64) -> (u64, u64, u64, u32) {
         let current_hour = now_ts / 3600;
         let min_retained_hour = current_hour - 23;
 
@@ -325,15 +357,25 @@ impl AccountSelector {
 
         let mut hourly_output = 0u64;
         let mut daily_rolling_output = 0u64;
+        let mut hourly_input = 0u64;
+        let mut hourly_requests = 0u32;
 
         for b in buckets.iter() {
             daily_rolling_output += b.output_tokens;
             if b.epoch_hour == current_hour {
                 hourly_output += b.output_tokens;
+                hourly_input += b.input_tokens;
+                hourly_requests += b.request_count;
             }
         }
 
-        (hourly_output, daily_rolling_output)
+        (hourly_output, daily_rolling_output, hourly_input, hourly_requests)
+    }
+
+    /// 获取过去 1 小时与过去 24 小时的真实滑动窗口消耗 (保持兼容旧接口)
+    pub fn get_rolling_usage(&self, account_id: &str, now_ts: i64) -> (u64, u64) {
+        let (hourly_out, daily_out, _, _) = self.get_rolling_usage_extended(account_id, now_ts);
+        (hourly_out, daily_out)
     }
 
     /// 请求派遣时预占在途 Output Tokens（防并发穿透）
@@ -394,13 +436,17 @@ impl AccountSelector {
         entry.last_active_at = now_ts;
     }
 
-    /// 判断账号是否处于当前小时“黄金承重区”（已用 + 在途 < 小时动态软上限的 60%）
+    /// 判断账号是否处于当前小时“黄金承重区”（Output/Input/Requests 均 < 小时动态软上限的 60%）
     pub fn is_hourly_sweet_spot(&self, account_id: &str, now_ts: i64) -> bool {
         let jitter_cap = self.get_or_init_jitter_cap(account_id, now_ts);
-        let (rolling_hourly, _) = self.get_rolling_usage(account_id, now_ts);
+        let (rolling_hourly, _, rolling_input, rolling_requests) =
+            self.get_rolling_usage_extended(account_id, now_ts);
         let in_flight = self.get_in_flight_reserved(account_id);
         let effective_hourly = rolling_hourly + in_flight;
+
         (effective_hourly as f64) < (jitter_cap.hourly_limit as f64) * SWEET_SPOT_HOURLY_USAGE_RATIO
+            && (rolling_input as f64) < (jitter_cap.hourly_input_limit as f64) * SWEET_SPOT_HOURLY_USAGE_RATIO
+            && (rolling_requests as f64) < (jitter_cap.hourly_request_limit as f64) * SWEET_SPOT_HOURLY_USAGE_RATIO
     }
 
     /// 评估是否为承接 Oversized (>50k) 巨包的“黄金老兵”（已破冰 Tier3 + 未过热 <60%）
@@ -436,7 +482,8 @@ impl AccountSelector {
         }
 
         let jitter_cap = self.get_or_init_jitter_cap(account_id, now_ts);
-        let (rolling_hourly, rolling_daily) = self.get_rolling_usage(account_id, now_ts);
+        let (rolling_hourly, rolling_daily, rolling_input, rolling_requests) =
+            self.get_rolling_usage_extended(account_id, now_ts);
         let in_flight = self.get_in_flight_reserved(account_id);
 
         let effective_hourly = rolling_hourly + in_flight;
@@ -444,8 +491,10 @@ impl AccountSelector {
 
         let hourly_exceeded = effective_hourly >= jitter_cap.hourly_limit;
         let daily_exceeded = effective_daily >= jitter_cap.daily_limit;
+        let input_exceeded = rolling_input >= jitter_cap.hourly_input_limit;
+        let requests_exceeded = rolling_requests >= jitter_cap.hourly_request_limit;
 
-        if !hourly_exceeded && !daily_exceeded {
+        if !hourly_exceeded && !daily_exceeded && !input_exceeded && !requests_exceeded {
             return None;
         }
 
@@ -453,8 +502,12 @@ impl AccountSelector {
             FatigueReason::BothLimitsExceeded
         } else if hourly_exceeded {
             FatigueReason::HourlyOutputLimitExceeded
-        } else {
+        } else if daily_exceeded {
             FatigueReason::DailyOutputLimitExceeded
+        } else if input_exceeded {
+            FatigueReason::HourlyInputLimitExceeded
+        } else {
+            FatigueReason::HourlyRequestLimitExceeded
         };
 
         // 计算阶梯退避惩罚（Backoff）
@@ -522,6 +575,7 @@ impl AccountSelector {
         let current_hour = now_ts / 3600;
         let total_tokens = (input_tokens as u64) + (output_tokens as u64);
         let output_u64 = output_tokens as u64;
+        let input_u64 = input_tokens as u64;
 
         // 1. 记入 24h 分桶滑动窗口
         {
@@ -532,16 +586,22 @@ impl AccountSelector {
             if let Some(last) = buckets.back_mut() {
                 if last.epoch_hour == current_hour {
                     last.output_tokens += output_u64;
+                    last.input_tokens += input_u64;
+                    last.request_count += 1;
                 } else {
                     buckets.push_back(HourlyBucket {
                         epoch_hour: current_hour,
                         output_tokens: output_u64,
+                        input_tokens: input_u64,
+                        request_count: 1,
                     });
                 }
             } else {
                 buckets.push_back(HourlyBucket {
                     epoch_hour: current_hour,
                     output_tokens: output_u64,
+                    input_tokens: input_u64,
+                    request_count: 1,
                 });
             }
 
@@ -1085,6 +1145,23 @@ mod tests {
         assert!(!selector.is_hourly_sweet_spot(acc_overheat, current_real_ts + 20), "消耗超 60% 退出黄金承重区");
         assert!(!selector.is_sweet_spot_for_oversized(acc_overheat, current_real_ts + 20));
         assert!(!selector.can_accept_input_tokens(acc_overheat, 80_000, current_real_ts + 20), "过热账号拒接大包以防 TPM 穿透");
+    }
+
+    #[test]
+    fn test_hourly_input_and_request_fatigue() {
+        let selector = AccountSelector::new();
+        let acc_id = "acc_input_test";
+        let email = "input_test@example.com";
+        let now_ts = chrono::Utc::now().timestamp();
+        let cap = selector.get_or_init_jitter_cap(acc_id, now_ts);
+
+        // 模拟 input_tokens 触顶
+        selector.record_token_usage(acc_id, email, cap.hourly_input_limit as u32, 100);
+        let rec = selector.check_and_update_fatigue(acc_id, email, now_ts).unwrap();
+        assert_eq!(rec.reason, FatigueReason::HourlyInputLimitExceeded);
+        assert!(selector.is_account_fatigued(acc_id));
+
+        selector.clear_fatigue(acc_id);
     }
 }
 

@@ -216,6 +216,7 @@ async fn fetch_project_id(
     };
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
 
+    let account_ua = crate::constants::get_account_user_agent(account_id);
     let res = client
         .post(format!("{}/v1internal:loadCodeAssist", CLOUD_CODE_BASE_URL))
         .header(
@@ -225,7 +226,7 @@ async fn fetch_project_id(
         .header(rquest::header::CONTENT_TYPE, "application/json")
         .header(
             rquest::header::USER_AGENT,
-            crate::constants::USER_AGENT.as_str(),
+            account_ua.as_str(),
         )
         .json(&meta)
         .send()
@@ -393,7 +394,7 @@ pub async fn fetch_quota_with_cache(
             .bearer_auth(access_token)
             .header(
                 rquest::header::USER_AGENT,
-                crate::constants::USER_AGENT.as_str(),
+                crate::constants::get_account_user_agent(account_id).as_str(),
             )
             .json(&payload)
             .send()
@@ -596,7 +597,7 @@ async fn fetch_quota_summary(
             .bearer_auth(access_token)
             .header(
                 rquest::header::USER_AGENT,
-                crate::constants::USER_AGENT.as_str(),
+                crate::constants::get_account_user_agent(account_id).as_str(),
             )
             .json(&payload)
             .send()

@@ -256,13 +256,13 @@ impl UpstreamClient {
         tracing::debug!("UpstreamClient User-Agent override updated: {:?}", lock);
     }
 
-    /// Get current User-Agent
-    pub async fn get_user_agent(&self) -> String {
+    /// Get current User-Agent (resolving deterministic per-account UA when account_id is present)
+    pub async fn get_user_agent(&self, account_id: Option<&str>) -> String {
         let ua_override = self.user_agent_override.read().await;
         ua_override
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| crate::constants::USER_AGENT.clone())
+            .unwrap_or_else(|| crate::constants::get_account_user_agent(account_id))
     }
 
     /// Get client for a specific account (or default if no proxy bound).
@@ -503,13 +503,6 @@ impl UpstreamClient {
             }
         }
 
-        // [DEFENSE] 3.8 网关严格校验：普通文本/Agent 请求绝不发送非官方包装字段（仅保留真实的 image_gen）
-        if let Some(obj) = body.as_object_mut() {
-            if obj.get("requestType").and_then(|v| v.as_str()) != Some("image_gen") {
-                obj.remove("requestType");
-            }
-        }
-
         // [DEFENSE] 3.8 网关严格校验：工具链互斥物理收敛（functionDeclarations 存在时物理剥离 googleSearch）
         if let Some(inner) = body.get_mut("request") {
             crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(inner);
@@ -534,40 +527,14 @@ impl UpstreamClient {
 
         headers.insert(
             header::USER_AGENT,
-            header::HeaderValue::from_str(&self.get_user_agent().await).unwrap_or_else(|e| {
+            header::HeaderValue::from_str(&self.get_user_agent(account_id).await).unwrap_or_else(|e| {
                 tracing::warn!("Invalid User-Agent header value, using fallback: {}", e);
                 header::HeaderValue::from_static("antigravity")
             }),
         );
 
-        // [ENHANCED] 注入 Antigravity 官方客户端关键特征 Headers
-        // 1. Client Identity
-        headers.insert(
-            "x-client-name",
-            header::HeaderValue::from_static("antigravity"),
-        );
-        if let Ok(ver) = header::HeaderValue::from_str(&crate::constants::CURRENT_VERSION) {
-            headers.insert("x-client-version", ver);
-        }
-
-        // 2. Device & Session Identity (严格使用官方标准 DeviceProfile，保证单账号有且仅有一个专属设备指纹)
-        let (machine_id, session_id) = if let Some(acc_id) = account_id {
-            let dp = get_or_init_account_device_profile(acc_id);
-            let mid = dp.mac_machine_id;
-            let sess = format!("sess-{}", &dp.dev_device_id.replace('-', "")[..24]);
-            (mid, sess)
-        } else {
-            let rand_dp = crate::modules::device::generate_profile();
-            let mid = rand_dp.mac_machine_id;
-            let sess = format!("sess-{}", &rand_dp.dev_device_id.replace('-', "")[..24]);
-            (mid, sess)
-        };
-        if let Ok(mid_val) = header::HeaderValue::from_str(&machine_id) {
-            headers.insert("x-machine-id", mid_val);
-        }
-        if let Ok(sess_val) = header::HeaderValue::from_str(&session_id) {
-            headers.insert("x-vscode-sessionid", sess_val);
-        }
+        // [REMOVED] 真实官方客户端语言服务器从不发送 x-client-name, x-client-version, x-machine-id, x-vscode-sessionid.
+        // 仅保留官方原生 HTTP/2 标头：Host, User-Agent, Authorization, Content-Type, Accept-Encoding.
 
         // [REMOVED v4.1.24] x-goog-api-client (gl-node/fire/grpc) header has been removed.
         // This header belongs to the IDE's JS layer, not the official client's egress.

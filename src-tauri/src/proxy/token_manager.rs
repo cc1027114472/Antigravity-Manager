@@ -2120,7 +2120,7 @@ impl TokenManager {
         "Optimize string allocation in logging formatter",
     ];
 
-    /// 执行真实 IDE 场景交互垫刀破冰（用于大包遭遇冷号兜底时的安全探活与拟人化破冰）
+    /// 执行真实 IDE 场景官方握手热机（零 Token 消耗，建立 TLS 连接与会话状态）
     pub async fn execute_account_warmup_pad(
         account_id: &str,
         access_token: &str,
@@ -2138,12 +2138,6 @@ impl TokenManager {
             account_id,
             crate::proxy::account_selector::MIN_BACKGROUND_WARMUP_INTERVAL_SECS,
         );
-
-        let prompt = {
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            Self::REALISTIC_IDE_WARMUP_PROMPTS[rng.gen_range(0..Self::REALISTIC_IDE_WARMUP_PROMPTS.len())]
-        };
 
         let (client, route) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
             pool.get_effective_standard_client_with_route(Some(account_id), 30).await
@@ -2165,111 +2159,131 @@ impl TokenManager {
             return false;
         }
 
-        let warmup_model = "gemini-3.8-flash-medium";
-        // 严禁在 base_request 中塞入非标准 "model" 或 "session_id": "warmup_..."，
-        // 避免被 wrapper.rs 原样拷贝进 inner "request" 字典造成探针特征泄漏
-        let base_request = serde_json::json!({
-            "contents": [{
-                "role": "user",
-                "parts": [{ "text": prompt }]
-            }],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 256
+        let ua = crate::constants::get_account_user_agent(Some(account_id));
+        let start = std::time::Instant::now();
+
+        // 步骤 1: POST /v1internal:loadCodeAssist {"metadata":{"ideType":"ANTIGRAVITY"}}
+        let step1_url = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+        let step1_body = serde_json::json!({
+            "metadata": {
+                "ideType": "ANTIGRAVITY"
             }
         });
 
-        let token_obj = crate::proxy::server::try_get_shared_token_manager()
-            .and_then(|tm| tm.get_token_by_id(account_id));
-
-        let mut wrapped = crate::proxy::mappers::gemini::wrapper::wrap_request(
-            &base_request,
-            project_id,
-            warmup_model,
-            Some(account_id),
-            None,
-            token_obj.as_ref(),
-        );
-        if let Some(inner) = wrapped.get_mut("request") {
-            crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(inner);
-            crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::adapt_context_overhead(
-                inner,
-                Some(warmup_model),
-            );
-            crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(inner);
-        }
-        if let Some(obj) = wrapped.as_object_mut() {
-            if obj.get("requestType").and_then(|v| v.as_str()) != Some("image_gen") {
-                obj.remove("requestType");
-            }
-        }
-
-        // 严格对齐 UpstreamClient::call_v1_internal_with_headers 的账号专属持久化设备指纹与分块流式传输
-        let dp = crate::proxy::upstream::client::get_or_init_account_device_profile(account_id);
-        let machine_id = dp.mac_machine_id;
-        let vscode_session_id = format!("sess-{}", &dp.dev_device_id.replace('-', "")[..24]);
-
-        let body_bytes = match serde_json::to_vec(&wrapped) {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
-        let stream_body = rquest::Body::wrap_stream(
-            futures::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) }),
-        );
-
-        let url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
-        let start = std::time::Instant::now();
-        let resp = client
-            .post(url)
+        let resp1 = client
+            .post(step1_url)
             .bearer_auth(access_token)
-            .header("User-Agent", crate::constants::USER_AGENT.as_str())
+            .header("User-Agent", ua.as_str())
             .header("Content-Type", "application/json")
-            .header("x-client-name", "antigravity")
-            .header("x-client-version", crate::constants::CURRENT_VERSION.as_str())
-            .header("x-machine-id", &machine_id)
-            .header("x-vscode-sessionid", &vscode_session_id)
-            .body(stream_body)
-            .timeout(std::time::Duration::from_secs(30))
+            .json(&step1_body)
+            .timeout(std::time::Duration::from_secs(15))
             .send()
             .await;
 
-        match resp {
+        let mut discovered_project_id: Option<String> = None;
+        match resp1 {
             Ok(res) if res.status().is_success() => {
-                // 完整消费 SSE 响应流直至服务端自然结束 (END_STREAM)，严禁收到 Header 瞬间直接 Drop 触发 HTTP/2 RST_STREAM
-                let stream_consumed = tokio::time::timeout(
-                    std::time::Duration::from_secs(25),
-                    res.bytes(),
-                )
-                .await;
-                if let Err(_) | Ok(Err(_)) = stream_consumed {
+                if let Ok(bytes_res) = tokio::time::timeout(std::time::Duration::from_secs(10), res.bytes()).await {
+                    if let Ok(b) = bytes_res {
+                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&b) {
+                            if let Some(pid) = val.get("cloudaicompanionProject").and_then(|v| v.as_str()) {
+                                if !pid.is_empty() {
+                                    discovered_project_id = Some(pid.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(res) => {
+                let status_code = res.status().as_u16();
+                let err_body = res.text().await.unwrap_or_default();
+                if status_code == 403 {
                     tracing::warn!(
-                        "⚠️ [WarmupPad] Cold account {} SSE stream interrupted before EOF. Backing off 10m.",
+                        "🚫 [WarmupPad] Cold account {} returned HTTP 403 during loadCodeAssist. Marking forbidden & removing from active pool!",
                         email
                     );
-                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 600);
+                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 86400);
+                    let _ = crate::modules::account::mark_account_forbidden(account_id, &err_body);
+                    if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                        tm.remove_account(account_id);
+                    }
+                    return false;
+                } else if status_code == 429 {
+                    tracing::warn!(
+                        "⚠️ [WarmupPad] Cold account {} returned HTTP 429 during loadCodeAssist. Backing off 30m.",
+                        email
+                    );
+                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 1800);
+                    return false;
+                } else {
+                    tracing::warn!(
+                        "⚠️ [WarmupPad] Cold account {} loadCodeAssist returned HTTP {}. Backing off 15m.",
+                        email,
+                        status_code
+                    );
+                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
                     return false;
                 }
+            }
+            Err(e) => {
+                tracing::warn!("⚠️ [WarmupPad] Cold account {} loadCodeAssist network error: {}", email, e);
+                crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
+                return false;
+            }
+        }
+
+        // 步骤间微抖动 (200..=500ms)
+        let jitter_ms = {
+            use rand::Rng;
+            rand::thread_rng().gen_range(200..=500)
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+
+        // 步骤 2: POST /v1internal:fetchUserInfo {"project": effective_project_id}
+        // 关键防坑：优先使用账号自身的 project_id 或步骤 1 发现的 project_id，仅在为空时才回退 "aicode-consumers"
+        let effective_project = if !project_id.is_empty() {
+            project_id
+        } else if let Some(ref d_pid) = discovered_project_id {
+            d_pid.as_str()
+        } else {
+            "aicode-consumers"
+        };
+
+        let step2_url = "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo";
+        let step2_body = serde_json::json!({
+            "project": effective_project
+        });
+
+        let resp2 = client
+            .post(step2_url)
+            .bearer_auth(access_token)
+            .header("User-Agent", ua.as_str())
+            .header("Content-Type", "application/json")
+            .json(&step2_body)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await;
+
+        match resp2 {
+            Ok(res) if res.status().is_success() => {
+                // 完整消费响应流
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), res.bytes()).await;
                 let elapsed_ms = start.elapsed().as_millis();
                 tracing::info!(
-                    "✨ [WarmupPad] Successfully warmed up cold account {} via realistic prompt in {}ms (SSE stream completed). Introducing jitter delay...",
+                    "✨ [WarmupPad] Successfully warmed up cold account {} via zero-token handshake in {}ms. Marking warm.",
                     email,
                     elapsed_ms
                 );
-                let jitter_ms = {
-                    use rand::Rng;
-                    rand::thread_rng().gen_range(2500..=5000)
-                };
-                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                 crate::proxy::account_selector::record_warm_interaction(account_id);
                 true
             }
             Ok(res) => {
-                let status = res.status();
-                let status_code = status.as_u16();
+                let status_code = res.status().as_u16();
                 let err_body = res.text().await.unwrap_or_default();
                 if status_code == 403 {
                     tracing::warn!(
-                        "🚫 [WarmupPad] Cold account {} returned HTTP 403 Forbidden during warmup. Marking forbidden & removing from active pool!",
+                        "🚫 [WarmupPad] Cold account {} returned HTTP 403 during fetchUserInfo. Marking forbidden & removing from active pool!",
                         email
                     );
                     crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 86400);
@@ -2279,37 +2293,22 @@ impl TokenManager {
                     }
                 } else if status_code == 429 {
                     tracing::warn!(
-                        "⚠️ [WarmupPad] Cold account {} returned HTTP 429 during warmup. Backing off 30m.",
+                        "⚠️ [WarmupPad] Cold account {} returned HTTP 429 during fetchUserInfo. Backing off 30m.",
                         email
                     );
                     crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 1800);
-                    if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
-                        tm.mark_rate_limited_async(
-                            email,
-                            429,
-                            None,
-                            &err_body,
-                            Some(warmup_model),
-                            None,
-                        )
-                        .await;
-                    }
                 } else {
                     tracing::warn!(
-                        "⚠️ [WarmupPad] Cold account {} warmup pad returned HTTP {}. Backing off 15m.",
+                        "⚠️ [WarmupPad] Cold account {} fetchUserInfo returned HTTP {}. Backing off 15m.",
                         email,
-                        status
+                        status_code
                     );
                     crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
                 }
                 false
             }
-            Err(err) => {
-                tracing::warn!(
-                    "⚠️ [WarmupPad] Cold account {} warmup pad error: {}. Backing off 15m.",
-                    email,
-                    err
-                );
+            Err(e) => {
+                tracing::warn!("⚠️ [WarmupPad] Cold account {} fetchUserInfo network error: {}", email, e);
                 crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
                 false
             }
@@ -4444,6 +4443,12 @@ impl TokenManager {
                                 bound_token.email,
                                 reset_sec,
                                 normalized_target
+                            );
+                            self.session_accounts.remove(sid);
+                        } else if crate::proxy::account_selector::is_account_fatigued(acc_id) {
+                            tracing::info!(
+                                "Sticky Session: Bound account {} reached fatigue sleep limit, unbinding and switching to fresh account.",
+                                bound_token.email
                             );
                             self.session_accounts.remove(sid);
                         } else if self.pacer.is_in_nap(acc_id) {
