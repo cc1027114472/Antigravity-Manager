@@ -156,43 +156,40 @@ pub async fn handle_warmup(
             }
         }
     } else {
-        // Gemini 模型：使用 wrap_request
-        let session_id = format!(
-            "warmup_{}_{}",
-            chrono::Utc::now().timestamp_millis(),
-            &uuid::Uuid::new_v4().to_string()[..8]
-        );
-
+        // Gemini 模型：使用 wrap_request（不塞入非官方 "model" 或 "session_id": "warmup_..."）
         let base_request = if is_image {
             json!({
-                "model": req.model,
                 "contents": [{"role": "user", "parts": [{"text": "Say hi"}]}],
                 "generationConfig": {
                     "maxOutputTokens": 10,
                     "temperature": 0,
                     "responseModalities": ["TEXT"]
-                },
-                "session_id": session_id
+                }
             })
         } else {
             json!({
-                "model": req.model,
                 "contents": [{"role": "user", "parts": [{"text": "Say hi"}]}],
                 "generationConfig": {
-                    "temperature": 0
-                },
-                "session_id": session_id
+                    "temperature": 0.2,
+                    "maxOutputTokens": 128
+                }
             })
+        };
+
+        let acc_opt = if account_id.is_empty() {
+            None
+        } else {
+            Some(account_id.as_str())
         };
 
         wrap_request(
             &base_request,
             &project_id,
             &req.model,
+            acc_opt,
             None,
-            Some(&session_id),
             None,
-        ) // [FIX] Added None for token param
+        )
     };
 
     // ===== 步骤 3: 调用 UpstreamClient =====
@@ -273,6 +270,12 @@ pub async fn handle_warmup(
             state.monitor.log_request(log).await;
 
             let mut response = if status.is_success() {
+                // 完整消费响应流，避免提前 Drop 连接触发 HTTP/2 RST_STREAM
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(25),
+                    response.bytes(),
+                )
+                .await;
                 info!(
                     "[Warmup-API] ========== SUCCESS: {} / {} ({}ms) ==========",
                     req.email, req.model, duration
@@ -289,7 +292,7 @@ pub async fn handle_warmup(
             } else {
                 let error_text = response.text().await.unwrap_or_default();
 
-                // [FIX] 预热阶段检测到 403 时，标记账号为 forbidden，避免无效账号继续参与轮询
+                // [FIX] 预热阶段检测到 403 时，标记账号为 forbidden 并立即从内存池移除，避免无效账号继续参与轮询
                 // 如果 account_id 为空（直接传入 access_token 的场景），通过 email 从索引中找到 ID
                 if status_code == 403 {
                     let resolved_account_id = if !account_id.is_empty() {
@@ -302,13 +305,14 @@ pub async fn handle_warmup(
 
                     if !resolved_account_id.is_empty() {
                         warn!(
-                            "[Warmup-API] 403 Forbidden detected for {}, marking account as forbidden",
+                            "[Warmup-API] 403 Forbidden detected for {}, marking account as forbidden and removing from memory pool",
                             req.email
                         );
                         let _ = crate::modules::account::mark_account_forbidden(
                             &resolved_account_id,
                             &error_text,
                         );
+                        state.token_manager.remove_account(&resolved_account_id);
                     } else {
                         warn!(
                             "[Warmup-API] 403 Forbidden detected for {} but could not resolve account_id, skipping mark",

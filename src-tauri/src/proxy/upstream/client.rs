@@ -81,7 +81,7 @@ pub struct UpstreamClient {
 }
 
 /// [STRICT DEVICE ISOLATION] 获取指定账号绑定且唯一的官方标准设备指纹 (内存缓存加速，确保一个账号有且仅有一个永久设备指纹)
-fn get_or_init_account_device_profile(account_id: &str) -> crate::models::DeviceProfile {
+pub fn get_or_init_account_device_profile(account_id: &str) -> crate::models::DeviceProfile {
     static PROFILE_CACHE: once_cell::sync::Lazy<dashmap::DashMap<String, crate::models::DeviceProfile>> =
         once_cell::sync::Lazy::new(dashmap::DashMap::new);
 

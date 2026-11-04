@@ -193,6 +193,13 @@ static GLOBAL_USAGE_TRACKER: Lazy<Arc<DashMap<String, AccountTokenUsage>>> =
 static GLOBAL_WARMTH_TRACKER: Lazy<Arc<DashMap<String, AccountWarmthState>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
+/// 全局单例：后台预热失败退避冷却表 account_id -> backoff_until_ts
+static GLOBAL_WARMUP_BACKOFF: Lazy<Arc<DashMap<String, i64>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// 同一账号两次后台预热之间的最小安全冷却间隔（秒）：至少间隔 240s（4 分钟），杜绝 30~40s 连打 2 次
+pub const MIN_BACKGROUND_WARMUP_INTERVAL_SECS: i64 = 240;
+
 /// 可参与调度的账号候选对象 Trait
 pub trait AccountCandidate {
     fn account_id(&self) -> &str;
@@ -882,7 +889,34 @@ pub fn get_capacity_tier(account_id: &str) -> CapacityTier {
 
 pub fn record_warm_interaction(account_id: &str) {
     let now = chrono::Utc::now().timestamp();
+    GLOBAL_WARMUP_BACKOFF.remove(account_id);
     AccountSelector.record_warm_interaction(account_id, now);
+}
+
+/// 记录后台预热失败退避冷却（如 403 / 429 / 5xx / 网络超时），在退避窗口内禁止后台巡检重复轰炸
+pub fn record_warmup_failure_backoff(account_id: &str, duration_secs: i64) {
+    let now = chrono::Utc::now().timestamp();
+    GLOBAL_WARMUP_BACKOFF.insert(account_id.to_string(), now + duration_secs);
+}
+
+/// 检查账号是否允许参与本轮后台预热：
+/// 1. 未处于预热失败退避窗口（GLOBAL_WARMUP_BACKOFF）；
+/// 2. 距离上一次成功交互（last_active_at）已间隔 >= MIN_BACKGROUND_WARMUP_INTERVAL_SECS (240s)，杜绝单号 30s 内连打 2 次。
+pub fn is_ready_for_background_warmup(account_id: &str) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    if let Some(until) = GLOBAL_WARMUP_BACKOFF.get(account_id) {
+        if now < *until {
+            return false;
+        }
+    }
+    if let Some(entry) = GLOBAL_WARMTH_TRACKER.get(account_id) {
+        if entry.last_active_at > 0
+            && now.saturating_sub(entry.last_active_at) < MIN_BACKGROUND_WARMUP_INTERVAL_SECS
+        {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn is_hourly_sweet_spot(account_id: &str) -> bool {

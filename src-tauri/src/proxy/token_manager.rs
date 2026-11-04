@@ -412,18 +412,20 @@ impl TokenManager {
 
                                 if ready_sweet_count < target_sweet_count {
                                     let deficit = target_sweet_count - ready_sweet_count;
-                                    let batch_limit = std::cmp::min(deficit, 4);
+                                    let batch_limit = std::cmp::min(deficit, 2);
 
-                                    // 优先挑选 Tier2Warming（仅差 1 次即可晋升老兵），其次挑选 Tier1Cold
+                                    // 优先挑选 Tier2Warming（仅差 1 次即可晋升老兵，且距上次交互已满 240s 冷却），其次挑选 Tier1Cold
                                     let warming_candidates = eligible_list.iter().filter(|t| {
                                         crate::proxy::account_selector::get_capacity_tier(&t.account_id)
                                             == crate::proxy::account_selector::CapacityTier::Tier2Warming
                                             && crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id)
+                                            && crate::proxy::account_selector::is_ready_for_background_warmup(&t.account_id)
                                     });
                                     let cold_candidates = eligible_list.iter().filter(|t| {
                                         crate::proxy::account_selector::get_capacity_tier(&t.account_id)
                                             == crate::proxy::account_selector::CapacityTier::Tier1Cold
                                             && crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id)
+                                            && crate::proxy::account_selector::is_ready_for_background_warmup(&t.account_id)
                                     });
 
                                     let selected_batch: Vec<ProxyToken> = warming_candidates
@@ -438,7 +440,11 @@ impl TokenManager {
                                         let pacer_clone = Arc::clone(&pacer);
                                         tokio::spawn(async move {
                                             if batch_idx > 0 {
-                                                tokio::time::sleep(std::time::Duration::from_millis((batch_idx as u64) * 800)).await;
+                                                let stagger_ms = {
+                                                    use rand::Rng;
+                                                    rand::thread_rng().gen_range(3500..=6000)
+                                                };
+                                                tokio::time::sleep(std::time::Duration::from_millis(stagger_ms)).await;
                                             }
                                             let now_inner = chrono::Utc::now().timestamp();
                                             let mut access_tok = target_acc.access_token.clone();
@@ -467,6 +473,7 @@ impl TokenManager {
                                                     }
                                                     pacer_clone.note_oauth_refreshed(&target_acc.account_id);
                                                 } else {
+                                                    crate::proxy::account_selector::record_warmup_failure_backoff(&target_acc.account_id, 900);
                                                     return;
                                                 }
                                             }
@@ -478,7 +485,12 @@ impl TokenManager {
                                                 target_acc.email,
                                                 batch_idx + 1
                                             );
-                                            let _ = Self::execute_account_warmup_pad(&target_acc.account_id, &access_tok, &proj, &target_acc.email).await;
+                                            let ok = Self::execute_account_warmup_pad(&target_acc.account_id, &access_tok, &proj, &target_acc.email).await;
+                                            if !ok {
+                                                if Self::get_account_state_on_disk(&target_acc.account_path).await == OnDiskAccountState::Disabled {
+                                                    tokens_map_clone.remove(&target_acc.account_id);
+                                                }
+                                            }
                                         });
                                     }
                                 }
@@ -2121,6 +2133,12 @@ impl TokenManager {
             return true;
         }
 
+        // 先预占 240s 冷却锁，防止在途请求或相邻巡检周期对同一账号重复并发触发预热
+        crate::proxy::account_selector::record_warmup_failure_backoff(
+            account_id,
+            crate::proxy::account_selector::MIN_BACKGROUND_WARMUP_INTERVAL_SECS,
+        );
+
         let prompt = {
             use rand::Rng;
             let mut rng = rand::thread_rng();
@@ -2128,7 +2146,7 @@ impl TokenManager {
         };
 
         let (client, route) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-            pool.get_effective_standard_client_with_route(Some(account_id), 15).await
+            pool.get_effective_standard_client_with_route(Some(account_id), 30).await
         } else if let Ok(app_cfg) = crate::modules::config::load_app_config() {
             let up = app_cfg.proxy.upstream_proxy;
             if up.enabled && !up.url.is_empty() {
@@ -2147,31 +2165,30 @@ impl TokenManager {
             return false;
         }
 
-        let session_id = format!(
-            "warmup_{}_{}",
-            chrono::Utc::now().timestamp_millis(),
-            &uuid::Uuid::new_v4().to_string()[..8]
-        );
         let warmup_model = "gemini-3.8-flash-medium";
+        // 严禁在 base_request 中塞入非标准 "model" 或 "session_id": "warmup_..."，
+        // 避免被 wrapper.rs 原样拷贝进 inner "request" 字典造成探针特征泄漏
         let base_request = serde_json::json!({
-            "model": warmup_model,
             "contents": [{
                 "role": "user",
                 "parts": [{ "text": prompt }]
             }],
             "generationConfig": {
-                "temperature": 0
-            },
-            "session_id": session_id
+                "temperature": 0.2,
+                "maxOutputTokens": 256
+            }
         });
+
+        let token_obj = crate::proxy::server::try_get_shared_token_manager()
+            .and_then(|tm| tm.get_token_by_id(account_id));
 
         let mut wrapped = crate::proxy::mappers::gemini::wrapper::wrap_request(
             &base_request,
             project_id,
             warmup_model,
             Some(account_id),
-            Some(&session_id),
             None,
+            token_obj.as_ref(),
         );
         if let Some(inner) = wrapped.get_mut("request") {
             crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(inner);
@@ -2187,6 +2204,19 @@ impl TokenManager {
             }
         }
 
+        // 严格对齐 UpstreamClient::call_v1_internal_with_headers 的账号专属持久化设备指纹与分块流式传输
+        let dp = crate::proxy::upstream::client::get_or_init_account_device_profile(account_id);
+        let machine_id = dp.mac_machine_id;
+        let vscode_session_id = format!("sess-{}", &dp.dev_device_id.replace('-', "")[..24]);
+
+        let body_bytes = match serde_json::to_vec(&wrapped) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let stream_body = rquest::Body::wrap_stream(
+            futures::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) }),
+        );
+
         let url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
         let start = std::time::Instant::now();
         let resp = client
@@ -2196,16 +2226,32 @@ impl TokenManager {
             .header("Content-Type", "application/json")
             .header("x-client-name", "antigravity")
             .header("x-client-version", crate::constants::CURRENT_VERSION.as_str())
-            .json(&wrapped)
-            .timeout(std::time::Duration::from_secs(15))
+            .header("x-machine-id", &machine_id)
+            .header("x-vscode-sessionid", &vscode_session_id)
+            .body(stream_body)
+            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await;
 
         match resp {
             Ok(res) if res.status().is_success() => {
+                // 完整消费 SSE 响应流直至服务端自然结束 (END_STREAM)，严禁收到 Header 瞬间直接 Drop 触发 HTTP/2 RST_STREAM
+                let stream_consumed = tokio::time::timeout(
+                    std::time::Duration::from_secs(25),
+                    res.bytes(),
+                )
+                .await;
+                if let Err(_) | Ok(Err(_)) = stream_consumed {
+                    tracing::warn!(
+                        "⚠️ [WarmupPad] Cold account {} SSE stream interrupted before EOF. Backing off 10m.",
+                        email
+                    );
+                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 600);
+                    return false;
+                }
                 let elapsed_ms = start.elapsed().as_millis();
                 tracing::info!(
-                    "✨ [WarmupPad] Successfully warmed up cold account {} via realistic prompt in {}ms. Introducing jitter delay...",
+                    "✨ [WarmupPad] Successfully warmed up cold account {} via realistic prompt in {}ms (SSE stream completed). Introducing jitter delay...",
                     email,
                     elapsed_ms
                 );
@@ -2218,19 +2264,53 @@ impl TokenManager {
                 true
             }
             Ok(res) => {
-                tracing::warn!(
-                    "⚠️ [WarmupPad] Cold account {} warmup pad returned HTTP {}. Skipping promotion.",
-                    email,
-                    res.status()
-                );
+                let status = res.status();
+                let status_code = status.as_u16();
+                let err_body = res.text().await.unwrap_or_default();
+                if status_code == 403 {
+                    tracing::warn!(
+                        "🚫 [WarmupPad] Cold account {} returned HTTP 403 Forbidden during warmup. Marking forbidden & removing from active pool!",
+                        email
+                    );
+                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 86400);
+                    let _ = crate::modules::account::mark_account_forbidden(account_id, &err_body);
+                    if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                        tm.remove_account(account_id);
+                    }
+                } else if status_code == 429 {
+                    tracing::warn!(
+                        "⚠️ [WarmupPad] Cold account {} returned HTTP 429 during warmup. Backing off 30m.",
+                        email
+                    );
+                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 1800);
+                    if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                        tm.mark_rate_limited_async(
+                            email,
+                            429,
+                            None,
+                            &err_body,
+                            Some(warmup_model),
+                            None,
+                        )
+                        .await;
+                    }
+                } else {
+                    tracing::warn!(
+                        "⚠️ [WarmupPad] Cold account {} warmup pad returned HTTP {}. Backing off 15m.",
+                        email,
+                        status
+                    );
+                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
+                }
                 false
             }
             Err(err) => {
                 tracing::warn!(
-                    "⚠️ [WarmupPad] Cold account {} warmup pad error: {}. Skipping promotion.",
+                    "⚠️ [WarmupPad] Cold account {} warmup pad error: {}. Backing off 15m.",
                     email,
                     err
                 );
+                crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
                 false
             }
         }
