@@ -945,14 +945,64 @@ pub fn upsert_account(
             Ok(mut account) => {
                 let old_access_token = account.token.access_token.clone();
                 let old_refresh_token = account.token.refresh_token.clone();
-                account.token = token;
-                account.name = name.clone();
-                // If an account was previously disabled (e.g. invalid_grant), any explicit token upsert
-                // should re-enable it (user manually updated credentials in the UI).
-                if account.disabled
-                    && (account.token.refresh_token != old_refresh_token
-                        || account.token.access_token != old_access_token)
+                let old_expires_in = account.token.expires_in;
+                let old_expiry_timestamp = account.token.expiry_timestamp;
+                let old_project_id = account.token.project_id.clone();
+                let old_session_id = account.token.session_id.clone();
+                let old_is_gcp_tos = account.token.is_gcp_tos;
+                let old_id_token = account.token.id_token.clone();
+                let old_oauth_client_key = account.token.oauth_client_key.clone();
+                let old_name = account.name.clone();
+
+                let incoming_access_empty = token.access_token.trim().is_empty();
+                let same_refresh_token = token.refresh_token.trim() == old_refresh_token.trim();
+                let effective_name = name
+                    .clone()
+                    .filter(|n| !n.trim().is_empty())
+                    .or_else(|| old_name.clone());
+
+                // [ANTI-BAN IDEMPOTENCY] 静默重推幂等保护：
+                // 当通过 API / add_account_direct 重新推送已存在的账号（incoming access_token 为空且 refresh_token 未变）时，
+                // 严禁抹除老账号现有的有效 access_token、expiry_timestamp 和 project_id！
+                // 若显示名称也无变化，直接零磁盘写入幂等返回，绝不惊动正在跑流量的活跃账号。
+                if incoming_access_empty && same_refresh_token && effective_name == old_name {
+                    return Ok(account);
+                }
+
+                let mut merged_token = token;
+                if incoming_access_empty && same_refresh_token {
+                    merged_token.access_token = old_access_token.clone();
+                    merged_token.expires_in = old_expires_in;
+                    merged_token.expiry_timestamp = old_expiry_timestamp;
+                }
+                if merged_token
+                    .project_id
+                    .as_deref()
+                    .map_or(true, |s| s.trim().is_empty())
                 {
+                    merged_token.project_id = old_project_id;
+                }
+                if merged_token.session_id.is_none() {
+                    merged_token.session_id = old_session_id;
+                }
+                if !merged_token.is_gcp_tos && old_is_gcp_tos {
+                    merged_token.is_gcp_tos = true;
+                }
+                if merged_token.id_token.is_none() {
+                    merged_token.id_token = old_id_token;
+                }
+                if merged_token.oauth_client_key.is_none() {
+                    merged_token.oauth_client_key = old_oauth_client_key;
+                }
+
+                account.token = merged_token;
+                account.name = effective_name.clone();
+
+                // If an account was previously disabled (e.g. invalid_grant), only a genuine credential change
+                // should re-enable it (user manually updated credentials in the UI).
+                let credentials_changed = !same_refresh_token
+                    || (!incoming_access_empty && account.token.access_token != old_access_token);
+                if account.disabled && credentials_changed {
                     account.disabled = false;
                     account.disabled_reason = None;
                     account.disabled_at = None;
@@ -962,8 +1012,10 @@ pub fn upsert_account(
 
                 // Sync name in index
                 if let Some(idx_summary) = index.accounts.iter_mut().find(|s| s.id == account_id) {
-                    idx_summary.name = name;
-                    save_account_index(&index)?;
+                    if idx_summary.name != effective_name {
+                        idx_summary.name = effective_name;
+                        save_account_index(&index)?;
+                    }
                 }
 
                 return Ok(account);
@@ -1993,6 +2045,50 @@ pub async fn fetch_quota_with_retry_opts(
         ));
     }
 
+    // 0. [ANTI-RACE SYNC] 优先与内存 TokenManager 同步最新 Token 与 Project ID，并复用单账号刷新互斥锁：
+    // 防止后台配额刷新与在途业务请求/预热协程并发向 Google OAuth 重复换发多个 Token。
+    if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+        if let Some(mem_tok) = tm.get_token_by_id(&account.id) {
+            if !mem_tok.access_token.is_empty()
+                && mem_tok.timestamp > account.token.expiry_timestamp
+            {
+                account.token.access_token = mem_tok.access_token.clone();
+                account.token.expires_in = mem_tok.expires_in;
+                account.token.expiry_timestamp = mem_tok.timestamp;
+            }
+            if account
+                .token
+                .project_id
+                .as_deref()
+                .map_or(true, |s| s.trim().is_empty())
+                && mem_tok
+                    .project_id
+                    .as_deref()
+                    .map_or(false, |s| !s.trim().is_empty())
+            {
+                account.token.project_id = mem_tok.project_id.clone();
+            }
+            let now = chrono::Utc::now().timestamp();
+            if now >= account.token.expiry_timestamp - 300 || account.token.access_token.is_empty()
+            {
+                if let Ok(refreshed_mem) = tm.ensure_token_valid(mem_tok).await {
+                    account.token.access_token = refreshed_mem.access_token;
+                    account.token.expires_in = refreshed_mem.expires_in;
+                    account.token.expiry_timestamp = refreshed_mem.timestamp;
+                    account.token.refresh_token = refreshed_mem.refresh_token;
+                    if account
+                        .token
+                        .project_id
+                        .as_deref()
+                        .map_or(true, |s| s.trim().is_empty())
+                    {
+                        account.token.project_id = refreshed_mem.project_id;
+                    }
+                }
+            }
+        }
+    }
+
     // 1. Time-based check - ensure Token is valid first
     let token = match oauth::ensure_fresh_token(&account.token, Some(&account.id)).await {
         Ok(t) => t,
@@ -2297,6 +2393,11 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
 
                 let _global = global_sem.acquire().await.unwrap();
                 let _egress = per_egress.acquire().await.unwrap();
+
+                // 获锁后重新从磁盘读取最新 Account 快照，避免排队等待期间在途请求已刷新过 Token 却仍使用旧快照重复刷新
+                if let Ok(latest_acc) = load_account(&account_id) {
+                    account = latest_acc;
+                }
 
                 crate::modules::logger::log_info(&format!(
                     "  - Processing {} (egress={})",

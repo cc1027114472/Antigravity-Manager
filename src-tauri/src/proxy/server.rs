@@ -4693,13 +4693,35 @@ async fn admin_sync_batch_import_with_proxies(
                 }
 
                 if let Some(proxy_id) = resolved_proxy_id {
-                    let should_bind = if payload.overwrite_existing_bindings {
-                        true
-                    } else {
-                        state
-                            .proxy_pool_manager
-                            .get_account_binding(&account.id)
-                            .is_none()
+                    let existing_bound_id =
+                        state.proxy_pool_manager.get_account_binding(&account.id);
+                    let should_bind = match existing_bound_id.as_ref() {
+                        None => true,
+                        Some(cur_pid) if cur_pid == proxy_id => {
+                            // 幂等保护：已绑定在同一代理上，跳过重复绑定，防止误触发 EGRESS_SETTLE 冷却锁
+                            false
+                        }
+                        Some(_cur_pid) => {
+                            if !payload.overwrite_existing_bindings {
+                                false
+                            } else if was_existing
+                                && state
+                                    .proxy_pool_manager
+                                    .is_account_proxy_available(&account.id)
+                                    .await
+                            {
+                                // 防封保护：已存在的活跃账号且当前绑定的代理健康可用（非 RED/禁用），
+                                // 拒绝在批量重推时强切出口 IP，严防会话中途瞬移 IP 触发 403 风控！
+                                tracing::info!(
+                                    "[BatchImport] Preserving healthy existing proxy binding {:?} for active account {} to prevent mid-session IP jump",
+                                    existing_bound_id,
+                                    account.email
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        }
                     };
 
                     if should_bind {
@@ -4743,6 +4765,23 @@ async fn admin_sync_batch_import_with_proxies(
                             error: None,
                         });
                     }
+                } else if was_existing
+                    && state
+                        .proxy_pool_manager
+                        .get_account_binding(&account.id)
+                        .is_some()
+                {
+                    // 已存在账号未传入新代理时，保留原有代理绑定，严禁解绑导致退化为无代理
+                    binding_stats.success_count += 1;
+                    let existing_bound_id =
+                        state.proxy_pool_manager.get_account_binding(&account.id);
+                    details.push(BatchImportDetailItem {
+                        email: account.email.clone(),
+                        account_id: Some(account.id.clone()),
+                        proxy_id: existing_bound_id,
+                        status: "bound".to_string(),
+                        error: None,
+                    });
                 } else {
                     // No proxy provided: unbind and mark as direct_warning
                     state
@@ -4775,14 +4814,13 @@ async fn admin_sync_batch_import_with_proxies(
         }
     }
 
-    // e. Reload accounts in TokenManager and clear client cache
+    // e. Reload accounts in TokenManager (incremental & zero-downtime, preserve active HTTP/2 client pool)
     if let Err(e) = state.token_manager.load_accounts().await {
         tracing::error!(
             "[BatchImport] Failed to reload accounts in TokenManager: {}",
             e
         );
     }
-    state.upstream.clear_client_cache();
 
     // f. Construct response
     let response = BatchImportWithProxiesResponse {

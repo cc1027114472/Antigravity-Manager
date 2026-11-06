@@ -323,11 +323,14 @@ impl TokenManager {
                             let now = chrono::Utc::now().timestamp();
                             let raw_list: Vec<ProxyToken> = tokens_map.iter().map(|r| r.value().clone()).collect();
 
-                            // 过滤出真正健康可调度的候选账号（未疲劳休眠、未被限流、且严格代理模式下绑定的代理健康可用）
+                            // 过滤出真正健康可调度的候选账号（未疲劳休眠、未被限流、未处于配额保护锁死状态、且严格代理模式下绑定的代理健康可用）
                             let pool_opt = crate::proxy::proxy_pool::get_global_proxy_pool();
+                            let selector = crate::proxy::account_selector::AccountSelector::new();
                             let mut eligible_list = Vec::with_capacity(raw_list.len());
+                            let mut active_in_hour_count = 0usize;
                             for t in raw_list {
-                                if crate::proxy::account_selector::is_account_fatigued(&t.account_id)
+                                if !t.protected_models.is_empty()
+                                    || crate::proxy::account_selector::is_account_fatigued(&t.account_id)
                                     || tracker.is_rate_limited(&t.account_id, None)
                                 {
                                     continue;
@@ -337,26 +340,30 @@ impl TokenManager {
                                         continue;
                                     }
                                 }
+                                let (_, _, _, hourly_reqs) = selector.get_rolling_usage_extended(&t.account_id, now);
+                                if hourly_reqs > 0 {
+                                    active_in_hour_count += 1;
+                                }
                                 eligible_list.push(t);
                             }
 
-                            // 动态计算黄金老兵目标储备池大小：至少 10 个，或健康总号数的 40%（例如 60 个号时储备 24 个黄金老兵）
+                            // 动态按需计算黄金老兵目标储备池大小：
+                            // 仅根据当前小时真实活跃账号数动态维持 (活跃数 + 2) 个热备（下限 2 个，上限 6 个），
+                            // 彻底杜绝夜间低谷期将十几个闲置账号每 2 小时反复空跑 Warmup 或每 50 分钟空转刷新 OAuth。
                             let target_sweet_count = std::cmp::min(
                                 eligible_list.len(),
-                                std::cmp::max(10, (eligible_list.len() * 40) / 100),
+                                (active_in_hour_count + 2).clamp(2, 6),
                             );
 
-                            // 1. 后台静默预刷新：对所有已预热账号（非 Tier1Cold）以及目标储备池前列的候补账号，
-                            // 在进入过期前 10 分钟窗口（或已过期）时静默换发，单轮最多刷新 6 个以平抑突发
+                            // 1. 后台静默预刷新：仅对【当前小时有真实业务请求 (hourly_reqs > 0)】的热态活跃账号，
+                            // 在进入过期前 10 分钟窗口时静默换发；彻底禁止对无真实流量的闲置储备号每 50 分钟机械空刷 OAuth！
                             let mut refreshed_in_tick = 0usize;
-                            for (idx, t) in eligible_list.iter().enumerate() {
-                                if refreshed_in_tick >= 6 {
+                            for t in eligible_list.iter() {
+                                if refreshed_in_tick >= 4 {
                                     break;
                                 }
-                                let is_warm = crate::proxy::account_selector::get_capacity_tier(&t.account_id)
-                                    != crate::proxy::account_selector::CapacityTier::Tier1Cold;
-                                let in_reserve_window = idx < target_sweet_count;
-                                if (is_warm || in_reserve_window)
+                                let (_, _, _, hourly_reqs) = selector.get_rolling_usage_extended(&t.account_id, now);
+                                if hourly_reqs > 0
                                     && now >= t.timestamp - Self::OAUTH_PROACTIVE_REFRESH_WINDOW_SECS
                                 {
                                     let refresh_mu = {
@@ -390,6 +397,9 @@ impl TokenManager {
                                             if let Some(rt) = token_response.refresh_token.clone() {
                                                 entry.refresh_token = rt;
                                             }
+                                        }
+                                        if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                                            let _ = tm.save_refreshed_token(&t.account_id, &token_response).await;
                                         }
                                         pacer.note_oauth_refreshed(&t.account_id);
                                         refreshed_in_tick += 1;
@@ -471,13 +481,16 @@ impl TokenManager {
                                                             entry.refresh_token = rt;
                                                         }
                                                     }
+                                                    if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                                                        let _ = tm.save_refreshed_token(&target_acc.account_id, &token_response).await;
+                                                    }
                                                     pacer_clone.note_oauth_refreshed(&target_acc.account_id);
                                                 } else {
                                                     crate::proxy::account_selector::record_warmup_failure_backoff(&target_acc.account_id, 900);
                                                     return;
                                                 }
                                             }
-                                            let proj = target_acc.project_id.clone().unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
+                                            let proj = target_acc.project_id.clone().unwrap_or_default();
                                             tracing::info!(
                                                 "♨️ [PrewarmingWorker] 活跃老兵储备 {}/{}，并发预热账号 {} (batch #{})...",
                                                 ready_sweet_count,
@@ -510,6 +523,38 @@ impl TokenManager {
         *guard = Some(handle);
 
         tracing::info!("Rate limit auto-cleanup & prewarm task started (interval: 15s)");
+    }
+
+    /// 合并磁盘重载的 ProxyToken 与内存中已有的最新运行态（防止磁盘旧快照倒退覆盖内存中刚换发的 Token 或 ProjectID）
+    fn merge_with_in_memory_state(&self, account_id: &str, mut disk_token: ProxyToken) -> ProxyToken {
+        if let Some(existing) = self.tokens.get(account_id) {
+            if existing.refresh_token == disk_token.refresh_token {
+                if !existing.access_token.is_empty() && existing.timestamp > disk_token.timestamp {
+                    disk_token.access_token = existing.access_token.clone();
+                    disk_token.expires_in = existing.expires_in;
+                    disk_token.timestamp = existing.timestamp;
+                }
+                if disk_token
+                    .project_id
+                    .as_deref()
+                    .map_or(true, |s| s.trim().is_empty())
+                    && existing
+                        .project_id
+                        .as_deref()
+                        .map_or(false, |s| !s.trim().is_empty())
+                {
+                    disk_token.project_id = existing.project_id.clone();
+                }
+                if disk_token.pending_cu_5h.is_empty() && !existing.pending_cu_5h.is_empty() {
+                    disk_token.pending_cu_5h = existing.pending_cu_5h.clone();
+                }
+                if disk_token.pending_cu_weekly.is_empty() && !existing.pending_cu_weekly.is_empty()
+                {
+                    disk_token.pending_cu_weekly = existing.pending_cu_weekly.clone();
+                }
+            }
+        }
+        disk_token
     }
 
     /// 从主应用账号目录加载所有账号（两阶段零停机平滑原子同步）
@@ -554,9 +599,10 @@ impl TokenManager {
         // 阶段 2：零停机平滑原子同步到 self.tokens
         // 剔除已在磁盘删除或停用的账号
         self.tokens.retain(|k, _| new_tokens.contains_key(k));
-        // 更新或插入新载入的有效账号
+        // 更新或插入新载入的有效账号（保留内存中更新的 access_token / project_id 状态）
         for (k, v) in new_tokens {
-            self.tokens.insert(k, v);
+            let merged = self.merge_with_in_memory_state(&k, v);
+            self.tokens.insert(k, merged);
         }
 
         // 若上次记录的使用账号已不在池中，则安全清理
@@ -584,7 +630,8 @@ impl TokenManager {
 
         match self.load_single_account(&path).await {
             Ok(Some(token)) => {
-                self.tokens.insert(account_id.to_string(), token);
+                let merged = self.merge_with_in_memory_state(account_id, token);
+                self.tokens.insert(account_id.to_string(), merged);
                 // [NEW] 重新加载账号时自动清除该账号的限流记录
                 self.clear_rate_limit(account_id);
                 Ok(())
@@ -2242,7 +2289,17 @@ impl TokenManager {
 
         // 步骤 2: POST /v1internal:fetchUserInfo {"project": effective_project_id}
         // 关键防坑：优先使用账号自身的 project_id 或步骤 1 发现的 project_id，仅在为空时才回退 "aicode-consumers"
-        let effective_project = if !project_id.is_empty() {
+        if let Some(ref d_pid) = discovered_project_id {
+            if project_id.is_empty() || project_id == "bamboo-precept-lgxtn" {
+                if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                    if let Some(mut entry) = tm.tokens.get_mut(account_id) {
+                        entry.project_id = Some(d_pid.clone());
+                    }
+                    let _ = tm.save_project_id(account_id, d_pid).await;
+                }
+            }
+        }
+        let effective_project = if !project_id.is_empty() && project_id != "bamboo-precept-lgxtn" {
             project_id
         } else if let Some(ref d_pid) = discovered_project_id {
             d_pid.as_str()
@@ -3075,9 +3132,11 @@ impl TokenManager {
                     } => {
                         let tier = crate::proxy::account_selector::get_capacity_tier(&t.account_id);
                         let hourly_ok = crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id);
+                        let is_saturated = self.pacer.is_heat_saturated(&t.account_id);
 
-                        if !hourly_ok {
-                            // 本小时已消耗 >= 60% 动态软上限（过热梯队）：绝对禁止伪装成冷号被优先破冰，仅作为末位兜底
+                        if !hourly_ok || is_saturated {
+                            // 本小时已消耗 >= 60% 动态软上限 或 瞬时热度已饱和 (Heat >= 1.5)：
+                            // 绝对禁止留在 SweetSpot / Warming 队列被重复抽中（防止刚因 heat-saturated 解绑又被原样选回），仅作为全池饱和时的末位兜底
                             if wait_ms == 0 {
                                 overheated_zero.push((t, current_heat, free_slots));
                             } else if wait_ms <= FALLBACK_MAX_SLOT_WAIT_MS {
@@ -3679,6 +3738,7 @@ impl TokenManager {
                                     fine_target
                                 );
                                 self.session_accounts.remove(sid);
+                                self.unbind_account_session(acc_id);
                             } else if is_protected {
                                 tracing::info!(
                                     "Sticky Session: Bound account {} is quota-protected for {}, unbinding before request.",
@@ -3686,6 +3746,7 @@ impl TokenManager {
                                     target_model
                                 );
                                 self.session_accounts.remove(sid);
+                                self.unbind_account_session(acc_id);
                             } else if self.pacer.is_heat_saturated(acc_id) {
                                 tracing::info!(
                                     "Sticky Session: Bound account {} is heat-saturated ({:.2} >= threshold), unbinding before request to route to cold account.",
@@ -3693,6 +3754,7 @@ impl TokenManager {
                                     self.pacer.get_account_heat(acc_id)
                                 );
                                 self.session_accounts.remove(sid);
+                                self.unbind_account_session(acc_id);
                             } else if footprint.prompt_tokens > crate::proxy::account_selector::TIER2_WARMING_MAX_INPUT_TOKENS
                                 && !crate::proxy::account_selector::is_hourly_sweet_spot(acc_id)
                             {
