@@ -345,11 +345,13 @@ fn extract_output_tokens(usage: &Value) -> Option<u32> {
 /// Check if the request is a metadata probe/model list query (purely local, 0 tokens, no upstream call)
 /// that should be bypassed from traffic logging to avoid log pollution.
 pub(crate) fn is_metadata_probe(method: &str, uri: &str) -> bool {
-    if method != "GET" {
+    if method != "GET" && method != "HEAD" {
         return false;
     }
     let path = uri.split('?').next().unwrap_or(uri);
-    path == "/v1beta/models"
+    path == "/health"
+        || path == "/healthz"
+        || path == "/v1beta/models"
         || path.starts_with("/v1beta/models/")
         || path == "/v1/models"
         || path.starts_with("/v1/models/")
@@ -1231,7 +1233,10 @@ mod tests {
 
     #[test]
     fn test_is_metadata_probe() {
-        // GET model queries should be bypassed (no logging, no upstream token cost)
+        // GET/HEAD health & model queries should be bypassed (no logging, no upstream token cost)
+        assert!(is_metadata_probe("GET", "/health"));
+        assert!(is_metadata_probe("GET", "/healthz"));
+        assert!(is_metadata_probe("HEAD", "/healthz"));
         assert!(is_metadata_probe("GET", "/v1beta/models"));
         assert!(is_metadata_probe("GET", "/v1beta/models?key=test_api_key"));
         assert!(is_metadata_probe("GET", "/v1beta/models/gemini-2.0-flash"));

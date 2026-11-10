@@ -899,13 +899,25 @@ pub async fn handle_generate(
         Ok((
             StatusCode::TOO_MANY_REQUESTS,
             headers,
-            format!("All accounts exhausted. Last error: {}", last_error),
+            Json(json!({
+                "error": {
+                    "code": 429,
+                    "message": format!("All accounts exhausted. Last error: {}", last_error),
+                    "status": "RESOURCE_EXHAUSTED"
+                }
+            })),
         )
             .into_response())
     } else {
         Ok((
             StatusCode::TOO_MANY_REQUESTS,
-            format!("All accounts exhausted. Last error: {}", last_error),
+            Json(json!({
+                "error": {
+                    "code": 429,
+                    "message": format!("All accounts exhausted. Last error: {}", last_error),
+                    "status": "RESOURCE_EXHAUSTED"
+                }
+            })),
         )
             .into_response())
     }

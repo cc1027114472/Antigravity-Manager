@@ -30,8 +30,11 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
 
     // 别名映射
     m.insert("claude-sonnet-4-5-20250929", "claude-sonnet-4-6-thinking");
+    m.insert("claude-3-5-sonnet", "claude-sonnet-4-6");
     m.insert("claude-3-5-sonnet-20241022", "claude-sonnet-4-6");
     m.insert("claude-3-5-sonnet-20240620", "claude-sonnet-4-6");
+    m.insert("claude-3-7-sonnet", "claude-sonnet-4-6");
+    m.insert("claude-3-7-sonnet-20250219", "claude-sonnet-4-6");
     // [Redirect] Opus 4.5 -> Opus 4.6 (Issue #1743)
     m.insert("claude-opus-4", "claude-opus-4-6-thinking");
     m.insert("claude-opus-4-5-thinking", "claude-opus-4-6-thinking");
@@ -85,6 +88,8 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     m.insert("gemini-2.5-flash", "gemini-2.5-flash");
     m.insert("gemini-3-flash", "gemini-3-flash");
     m.insert("gemini-3-pro-image", "gemini-3-pro-image");
+    m.insert("gemini-3.8-flash", "gemini-3.8-flash-medium");
+    m.insert("gemini-3.8", "gemini-3.8-flash-medium");
 
     // [New] Unified Virtual ID for Background Tasks (Title, Summary, etc.)
     // Allows users to override all background tasks via custom_mapping

@@ -1353,6 +1353,13 @@ pub async fn handle_chat_completions(
     }
 
     // 所有尝试均失败
+    let exhausted_err = Json(json!({
+        "error": {
+            "message": format!("All accounts exhausted. Last error: {}", last_error),
+            "type": "rate_limit_error",
+            "code": 429
+        }
+    }));
     if let Some(email) = last_email {
         Ok((
             StatusCode::TOO_MANY_REQUESTS,
@@ -1363,14 +1370,14 @@ pub async fn handle_chat_completions(
                 crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
                 crate::proxy::account_inflight::SOURCE_LOCAL,
             ),
-            format!("All accounts exhausted. Last error: {}", last_error),
+            exhausted_err,
         )
             .into_response())
     } else {
         Ok((
             StatusCode::TOO_MANY_REQUESTS,
             [("X-Mapped-Model", mapped_model)],
-            format!("All accounts exhausted. Last error: {}", last_error),
+            exhausted_err,
         )
             .into_response())
     }
@@ -3193,6 +3200,13 @@ pub async fn handle_completions(
     }
 
     // 所有尝试均失败
+    let exhausted_err = Json(json!({
+        "error": {
+            "message": format!("All accounts exhausted. Last error: {}", last_error),
+            "type": "rate_limit_error",
+            "code": 429
+        }
+    }));
     if let Some(email) = last_email {
         (
             StatusCode::TOO_MANY_REQUESTS,
@@ -3203,14 +3217,14 @@ pub async fn handle_completions(
                 crate::proxy::account_inflight::sample_peak(&mut inflight_guard),
                 crate::proxy::account_inflight::SOURCE_LOCAL,
             ),
-            format!("All accounts exhausted. Last error: {}", last_error),
+            exhausted_err,
         )
             .into_response()
     } else {
         (
             StatusCode::TOO_MANY_REQUESTS,
             [("X-Mapped-Model", mapped_model)],
-            format!("All accounts exhausted. Last error: {}", last_error),
+            exhausted_err,
         )
             .into_response()
     }

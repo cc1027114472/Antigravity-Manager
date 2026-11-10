@@ -109,8 +109,8 @@ static RE_IDENTITY_DECLARATION: Lazy<Regex> = Lazy::new(|| {
         // C. 归属 / 版本声明（动词 + 介词，或 based on）
         r"(?i:[^.!?。！？\r\n<>]{0,8}?\b(?:created|built|made|developed|designed|trained|powered|maintained|published|released|provided)\s+(?:by|on|upon|at)\s+",
         r"|[^.!?。！？\r\n<>]{0,8}?\bbased\s+on\s+)",
-        // D. 归属对象：一路取到句读边界，杜绝残留孤立词片段，严格包含全角半角感叹号问号分号，防止贪婪吞噬后续规则
-        r"[^.,，。!?！？;；\r\n<>]{1,80}",
+        // D. 归属对象：一路取到句读边界（允许版本号小数点如 gemini-3.8 / GPT-4.5），杜绝残留孤立词片段，严格包含全角半角感叹号问号分号，防止贪婪吞噬后续规则
+        r"(?:[^.,，。!?！？;；\r\n<>]|\.[a-zA-Z0-9]){1,80}",
         // E. 紧随其后的句读，用于决定替换后的标点（`,` 续写 → 保留逗号）
         r"([.,，。!?！？;；]?)"
     ))
@@ -234,7 +234,14 @@ impl PromptSanitizer {
 
         for (idx, ch) in text.char_indices() {
             let is_newline = ch == '\n';
-            let is_terminator = matches!(ch, '.' | '!' | '?' | '。' | '！' | '？');
+            // 忽略版本号中的小数点（如 gemini-3.8、GPT-4.5），仅将真正的句末标点计为句界
+            let is_version_dot = ch == '.'
+                && text[idx + ch.len_utf8()..]
+                    .chars()
+                    .next()
+                    .map_or(false, |next_ch| next_ch.is_ascii_alphanumeric());
+            let is_terminator =
+                !is_version_dot && matches!(ch, '.' | '!' | '?' | '。' | '！' | '？');
 
             if is_terminator || (is_newline && prev_newline) {
                 sentence_count += 1;
@@ -256,8 +263,9 @@ impl PromptSanitizer {
     /// System 轨：把系统提示词头部窗口内的「身份归属声明句」与已知客户端开场白归一化为官方 Antigravity 身份。
     ///
     /// 归一化规则（广谱、协议无关）：命中 `RE_IDENTITY_DECLARATION` 或 `RE_KNOWN_CLIENT_DECLARATION` 的声明句
-    /// 整体替换为 `OFFICIAL_ANTIGRAVITY_IDENTITY`；若原文以逗号续写功能指令，则保留逗号，续写内容逐字不动。
-    /// 代码块（``` 与行内 `）内的身份文本 100% 豁免，头部窗口之后的原文逐字保留。
+    /// 整体替换为 `OFFICIAL_ANTIGRAVITY_IDENTITY`（若头部窗口内存在多句连续身份声明，仅首句替换为官方身份，
+    /// 后续冗余身份句剥离去重，防止产生双倍重复身份声明触发上游 WAF 429）；若原文以逗号续写功能指令，
+    /// 则保留逗号，续写内容逐字不动。代码块（``` 与行内 `）内的身份文本 100% 豁免，头部窗口之后的原文逐字保留。
     pub fn normalize_system_identity(text: &str) -> String {
         // 快速前置检查：无任何归属类或已知客户端特征词则零开销返回
         let lower = text.to_lowercase();
@@ -284,25 +292,40 @@ impl PromptSanitizer {
             format!("__PROMPT_SANITIZER_CODE_BLOCK_{}__", idx)
         });
 
-        // 步骤 2：归一化身份声明句（逗号续写场景保留逗号，避免出现 ", ," 或 ", and" 断裂）
+        // 步骤 2：归一化身份声明句（首句替换为 OFFICIAL_ANTIGRAVITY_IDENTITY，后续冗余身份声明句去重剥离）
+        let mut emitted_identity = false;
         // 2.1 广谱归属声明归一化
         let pass1 = RE_IDENTITY_DECLARATION.replace_all(
             &protected_head,
-            |caps: &regex::Captures| match caps.get(1).map(|m| m.as_str()).unwrap_or("") {
-                "," | "，" => format!("{},", OFFICIAL_ANTIGRAVITY_IDENTITY),
-                _ => OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
+            |caps: &regex::Captures| {
+                let punct = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                if !emitted_identity {
+                    emitted_identity = true;
+                    match punct {
+                        "," | "，" => format!("{},", OFFICIAL_ANTIGRAVITY_IDENTITY),
+                        _ => OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
+                    }
+                } else {
+                    String::new()
+                }
             },
         );
 
         // 2.2 知名特定客户端开场白归一化（如 Claude Code CLI 开场白）
         let pass2 = RE_KNOWN_CLIENT_DECLARATION.replace_all(&pass1, |caps: &regex::Captures| {
-            match caps.get(1).map(|m| m.as_str()).unwrap_or("") {
-                "," | "，" => format!("{},", OFFICIAL_ANTIGRAVITY_IDENTITY),
-                _ => OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
+            let punct = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            if !emitted_identity {
+                emitted_identity = true;
+                match punct {
+                    "," | "，" => format!("{},", OFFICIAL_ANTIGRAVITY_IDENTITY),
+                    _ => OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
+                }
+            } else {
+                String::new()
             }
         });
 
-        let normalized = pass2.into_owned();
+        let normalized = RE_MULTI_NEWLINE.replace_all(&pass2, "\n\n").into_owned();
 
         // 步骤 3：单趟无递归还原受保护的代码块，并拼回头部窗口之后的原文
         let mut restored = RE_CODE_BLOCK_PLACEHOLDER
@@ -317,7 +340,7 @@ impl PromptSanitizer {
             .into_owned();
 
         restored.push_str(&text[head.len()..]);
-        restored
+        RE_MULTI_NEWLINE.replace_all(&restored, "\n\n").into_owned()
     }
 
     /// 清洗 parts 数组中的所有文本节点，并严格捍卫：
@@ -469,11 +492,24 @@ impl PromptSanitizer {
         }
     }
 
-    /// 官方 Antigravity IDE 标准工作区环境上下文骨架
+    /// 官方 Antigravity IDE 标准工作区环境上下文骨架（带工具调用场景）
     pub const OFFICIAL_WORKSPACE_CONTEXT_BLOCK: &str = concat!(
         "\n<environment_permissions>\n",
         "Execution of local read, write, and command inspection tools is granted within current workspace.\n",
         "Absolute path formatting and atomic patch applications are enforced.\n",
+        "</environment_permissions>\n",
+        "<app_context>\n",
+        "Language Server: Active\n",
+        "Workspace Sync: Indexing Complete\n",
+        "</app_context>"
+    );
+
+    /// 官方 Antigravity IDE 标准工作区环境上下文骨架（纯对话/无 functionDeclarations 工具挂载场景）
+    /// 保持完全一致的 XML 标签结构与 Token 密度，同时避免无工具时暗示存在本地工具导致模型盲调触发 MALFORMED_FUNCTION_CALL。
+    pub const OFFICIAL_WORKSPACE_CHAT_CONTEXT_BLOCK: &str = concat!(
+        "\n<environment_permissions>\n",
+        "Direct conversational response mode is active within current workspace.\n",
+        "Standard formatting and structured output specifications are enforced.\n",
         "</environment_permissions>\n",
         "<app_context>\n",
         "Language Server: Active\n",
@@ -529,12 +565,29 @@ impl PromptSanitizer {
         }
 
         if need_injection {
+            let has_function_tools = request
+                .get("tools")
+                .and_then(Value::as_array)
+                .map_or(false, |tools| {
+                    tools.iter().any(|t| {
+                        t.get("functionDeclarations")
+                            .and_then(Value::as_array)
+                            .map_or(false, |arr| !arr.is_empty())
+                    })
+                });
+
+            let context_block = if has_function_tools {
+                Self::OFFICIAL_WORKSPACE_CONTEXT_BLOCK
+            } else {
+                Self::OFFICIAL_WORKSPACE_CHAT_CONTEXT_BLOCK
+            };
+
             if let Some(si) = request.get_mut("systemInstruction") {
                 if let Some(parts) = si.get_mut("parts").and_then(Value::as_array_mut) {
                     if let Some(first_part) = parts.first_mut() {
                         if let Some(txt) = first_part.get_mut("text") {
                             if let Some(s) = txt.as_str() {
-                                *txt = json!(format!("{}{}", s, Self::OFFICIAL_WORKSPACE_CONTEXT_BLOCK));
+                                *txt = json!(format!("{}{}", s, context_block));
                             }
                         }
                     }
@@ -546,7 +599,7 @@ impl PromptSanitizer {
                     json!({
                         "role": "system",
                         "parts": [{
-                            "text": format!("{}{}", OFFICIAL_ANTIGRAVITY_IDENTITY, Self::OFFICIAL_WORKSPACE_CONTEXT_BLOCK)
+                            "text": format!("{}{}", OFFICIAL_ANTIGRAVITY_IDENTITY, context_block)
                         }]
                     }),
                 );
@@ -1343,7 +1396,7 @@ mod tests {
 
     #[test]
     fn test_adapt_context_overhead_short_request_vs_long_session() {
-        // 场景 1：3.8 模型的超短请求 -> 自适应注入官方环境骨架
+        // 场景 1a：3.8 模型的无工具超短对话请求 -> 注入无工具暗示的对话模式骨架
         let mut short_req = json!({
             "contents": [
                 { "role": "user", "parts": [{ "text": "hello" }] }
@@ -1353,7 +1406,22 @@ mod tests {
         let si_text = short_req["systemInstruction"]["parts"][0]["text"].as_str().unwrap();
         assert!(si_text.contains(OFFICIAL_ANTIGRAVITY_IDENTITY));
         assert!(si_text.contains("<environment_permissions>"));
+        assert!(si_text.contains("Direct conversational response mode is active"));
+        assert!(!si_text.contains("command inspection tools is granted"));
         assert!(si_text.contains("<app_context>"));
+
+        // 场景 1b：3.8 模型的带工具超短请求 -> 注入完整工具授权骨架
+        let mut short_tool_req = json!({
+            "contents": [
+                { "role": "user", "parts": [{ "text": "hello" }] }
+            ],
+            "tools": [
+                { "functionDeclarations": [{ "name": "read_file" }] }
+            ]
+        });
+        PromptSanitizer::adapt_context_overhead(&mut short_tool_req, Some("gemini-3.8-pro-high"));
+        let si_tool_text = short_tool_req["systemInstruction"]["parts"][0]["text"].as_str().unwrap();
+        assert!(si_tool_text.contains("command inspection tools is granted"));
 
         // 场景 2：长会话请求 (文本 > 1500 字符) -> 0 额外开销，绝对不注入
         let long_text = "A".repeat(2000);
@@ -1364,5 +1432,33 @@ mod tests {
         });
         PromptSanitizer::adapt_context_overhead(&mut long_req, Some("gemini-3.8-pro-high"));
         assert!(long_req.get("systemInstruction").is_none());
+    }
+
+    #[test]
+    fn test_normalize_identity_deepseek_harness_multi_sentence_with_version_dot() {
+        // 真实复现 DeepSeek Harness / Mowan-Agent 双重身份声明 + 模型版本号含小数点 (gemini-3.8-flash-high)：
+        // 1. 不得在 3.8 的小数点处截断残留 "8-flash-high model."；
+        // 2. 连续两句身份声明必须去重合并为单句 OFFICIAL_ANTIGRAVITY_IDENTITY，杜绝双倍重复身份触发上游 WAF 429。
+        let raw = concat!(
+            "You are an AI agent powered by DeepSeek Harness.\n\n",
+            "You are a coding agent powered by the gemini-3.8-flash-high model.\n\n",
+            "## Progress Narration & Language Consistency\n\n",
+            "- **Language Matching (STRICT)**: Respond in the user's language."
+        );
+        let normalized = PromptSanitizer::normalize_system_identity(raw);
+        assert_eq!(
+            normalized,
+            concat!(
+                "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\n",
+                "## Progress Narration & Language Consistency\n\n",
+                "- **Language Matching (STRICT)**: Respond in the user's language."
+            )
+        );
+        assert!(!normalized.contains("8-flash-high"));
+        assert_eq!(
+            normalized.matches(OFFICIAL_ANTIGRAVITY_IDENTITY).count(),
+            1,
+            "OFFICIAL_ANTIGRAVITY_IDENTITY must appear exactly once"
+        );
     }
 }
