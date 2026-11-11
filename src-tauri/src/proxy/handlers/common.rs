@@ -43,22 +43,17 @@ pub fn determine_retry_strategy(
             RetryStrategy::FixedDelay(Duration::from_millis(200))
         }
 
-        // 429 限流错误：无论长短延迟一视同仁，立即切号（50ms缓冲），账号无条件立即写盘禁用并进自愈退避队列
+        // 429 限流错误：单次请求内严禁切号重试（防止毒请求或风控请求一尸三命连坐多个账号），
+        // 当前账号已由 mark_rate_limited_async 写盘禁用并进自愈退避队列，直接返回
         429 => {
             tracing::info!(
-                "429 rate limit encountered; rotate immediately to next account (disable & enqueue recovery)"
+                "429 rate limit encountered; stopping retry in current request (no account rotation) to prevent cascading lockouts"
             );
-            RetryStrategy::FixedDelay(Duration::from_millis(50))
+            RetryStrategy::NoRetry
         }
 
-        // 503 服务不可用 / 529 服务器过载
-        503 | 529 => {
-            // 指数退避：起始 10s，上限 60s (针对 Google 边缘节点过载)
-            RetryStrategy::ExponentialBackoff {
-                base_ms: 10000,
-                max_ms: 60000,
-            }
-        }
+        // 503 服务不可用 / 529 服务器过载：保持当前账号原地等待 1.5s 重试最多 1 次（严禁切号与 10s+ 长睡）
+        503 | 529 => RetryStrategy::GraceRetry(Duration::from_millis(1500)),
 
         // 500 服务器内部错误
         500 => {
@@ -89,6 +84,27 @@ pub async fn apply_retry_strategy(
     status_code: u16,
     trace_id: &str,
 ) -> bool {
+    // 若已到达最后一次尝试，禁止无效休眠，立即返回 false 由上层按真实状态码返回
+    if attempt + 1 >= max_attempts {
+        debug!(
+            "[{}] Max retry attempts reached ({}/{}), stopping on status {}",
+            trace_id,
+            attempt + 1,
+            max_attempts,
+            status_code
+        );
+        return false;
+    }
+
+    // 503/529 算力过载最多原地微等重试 1 次（attempt == 0），避免超过上游中转站 10s 超时
+    if (status_code == 503 || status_code == 529) && attempt >= 1 {
+        info!(
+            "[{}] 503/529 in-place retry already performed once, returning upstream 503 immediately",
+            trace_id
+        );
+        return false;
+    }
+
     match strategy {
         RetryStrategy::NoRetry => {
             debug!(
@@ -160,10 +176,10 @@ pub fn should_rotate_account(status_code: u16, strategy: Option<&RetryStrategy>)
     }
 
     match status_code {
-        // 这些错误是账号级别或特定节点配额的，需要轮换
-        429 | 401 | 403 | 404 | 500 => true,
-        // 503/529 通常是后端过载，切号效果有限，暂不轮换
-        503 | 529 => false,
+        // 401/404/500 允许轮换账号
+        401 | 404 | 500 => true,
+        // 429/403 严禁切号防连坐；503/529 为后端算力拥塞，保持原号不切号
+        429 | 403 | 503 | 529 => false,
         _ => false,
     }
 }

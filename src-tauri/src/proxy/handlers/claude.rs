@@ -1730,10 +1730,8 @@ pub async fn handle_messages(
         }
 
         // 3. 标记限流状态(用于 UI 显示) - 使用异步版本以支持实时配额刷新
-        // 🆕 传入实际使用的模型,实现模型级别限流,避免不同模型配额互相影响
+        // 注意：503/529 为后端算力拥塞，并非账号限流，严禁给账号上锁或解绑粘性会话
         if status_code == 429
-            || status_code == 529
-            || status_code == 503
             || status_code == 500
             || status_code == 404
         {

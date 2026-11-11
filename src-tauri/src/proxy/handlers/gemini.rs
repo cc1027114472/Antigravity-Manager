@@ -102,10 +102,11 @@ pub async fn handle_generate(
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
+    let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
     let mut force_rotate = false;
     let mut inflight_guard: Option<crate::proxy::account_inflight::AccountInflightGuard> = None;
     let mut lease_guard: Option<crate::proxy::SlotLeaseGuard> = None;
@@ -696,6 +697,7 @@ pub async fn handle_generate(
 
         // 处理错误并重试
         let status_code = status.as_u16();
+        last_status = status;
         let error_text = response
             .text()
             .await
@@ -725,9 +727,8 @@ pub async fn handle_generate(
         }
 
         // 标记限流状态(用于 UI 显示与 429 自动禁用/退避自愈)
+        // 注意：503/529 为 Google 机房算力拥塞，并非账号限流，严禁给账号上锁或解绑粘性会话
         if status_code == 429
-            || status_code == 529
-            || status_code == 503
             || status_code == 500
             || status_code == 404
         {
@@ -859,9 +860,9 @@ pub async fn handle_generate(
             continue; // 重试
         }
 
-        // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错，不进行无效轮换
+        // 停止重试时直接透传真实上游 HTTP 状态码与错误内容（绝不将 503 伪装成 429 All accounts exhausted）
         error!(
-            "Gemini Upstream non-retryable error {}: {}",
+            "Gemini Upstream error {} (returning without further retry): {}",
             status_code, error_text
         );
         let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
@@ -871,21 +872,34 @@ pub async fn handle_generate(
             Some(mapped_model.as_str()),
             peak,
         );
-        return Ok((
-            status,
-            headers,
-            // [FIX] Return JSON error
-            Json(json!({
-                "error": {
-                    "code": status_code,
-                    "message": error_text,
-                    "status": "UPSTREAM_ERROR"
-                }
-            })),
-        )
-            .into_response());
+        let err_json = serde_json::from_str::<Value>(&error_text)
+            .ok()
+            .filter(|v| v.get("error").is_some())
+            .unwrap_or_else(|| {
+                let status_label = match status_code {
+                    429 => "RESOURCE_EXHAUSTED",
+                    503 | 529 => "UNAVAILABLE",
+                    404 => "NOT_FOUND",
+                    400 => "INVALID_ARGUMENT",
+                    _ => "UPSTREAM_ERROR",
+                };
+                json!({
+                    "error": {
+                        "code": status_code,
+                        "message": error_text,
+                        "status": status_label
+                    }
+                })
+            });
+        return Ok((status, headers, Json(err_json)).into_response());
     }
 
+    let final_code = last_status.as_u16();
+    let final_status_label = match final_code {
+        429 => "RESOURCE_EXHAUSTED",
+        503 | 529 => "UNAVAILABLE",
+        _ => "UPSTREAM_ERROR",
+    };
     if let Some(email) = last_email {
         let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
         let headers =
@@ -894,28 +908,28 @@ pub async fn handle_generate(
                 None,
                 None,
                 peak,
-                crate::proxy::account_inflight::SOURCE_LOCAL,
+                crate::proxy::account_inflight::SOURCE_REMOTE,
             );
         Ok((
-            StatusCode::TOO_MANY_REQUESTS,
+            last_status,
             headers,
             Json(json!({
                 "error": {
-                    "code": 429,
-                    "message": format!("All accounts exhausted. Last error: {}", last_error),
-                    "status": "RESOURCE_EXHAUSTED"
+                    "code": final_code,
+                    "message": last_error,
+                    "status": final_status_label
                 }
             })),
         )
             .into_response())
     } else {
         Ok((
-            StatusCode::TOO_MANY_REQUESTS,
+            last_status,
             Json(json!({
                 "error": {
-                    "code": 429,
-                    "message": format!("All accounts exhausted. Last error: {}", last_error),
-                    "status": "RESOURCE_EXHAUSTED"
+                    "code": final_code,
+                    "message": last_error,
+                    "status": final_status_label
                 }
             })),
         )

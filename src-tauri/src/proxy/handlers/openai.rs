@@ -1155,8 +1155,8 @@ pub async fn handle_chat_completions(
         // 确定重试策略
         let strategy = determine_retry_strategy(status_code, &error_text, false);
 
-        // 3. 标记限流状态(用于 UI 显示)
-        if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
+        // 3. 标记限流状态(用于 UI 显示，503/529 算力拥塞不锁号)
+        if status_code == 429 || status_code == 500 || status_code == 404 {
             // [FIX] Use async version with model parameter for fine-grained rate limiting
             let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
             token_manager
@@ -3152,8 +3152,8 @@ pub async fn handle_completions(
             error_text
         );
 
-        // 3. 标记限流状态(用于 UI 显示)
-        if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
+        // 3. 标记限流状态(用于 UI 显示，503/529 算力拥塞不锁号)
+        if status_code == 429 || status_code == 500 || status_code == 404 {
             let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
             token_manager
                 .mark_rate_limited_async(
@@ -3168,10 +3168,9 @@ pub async fn handle_completions(
         }
 
         // 确定重试策略
-        // 确定重试策略 (对齐官方 1.5s Grace Window)
         let strategy = determine_retry_strategy(status_code, &error_text, false);
 
-        // 执行退备
+        // 执行退避
         if apply_retry_strategy(
             strategy.clone(),
             attempt,
@@ -3181,7 +3180,11 @@ pub async fn handle_completions(
         )
         .await
         {
-            // 继续重试 (loop 会增加 attempt, 导致 force_rotate=true)
+            if !should_rotate_account(status_code, Some(&strategy)) {
+                force_rotate = false;
+            } else {
+                force_rotate = true;
+            }
             continue;
         } else {
             // 不可重试
