@@ -84,6 +84,25 @@ pub async fn handle_generate(
         tracing::warn!("🚫 [Gemini] Fast early rejection on toxic request fingerprint: {}", fp_prefix);
         return Ok((toxic_status, [("content-type", "application/json")], toxic_body).into_response());
     }
+    // [REQUEST 503 BREAKER] 同一请求累计 4 次 503 后本地冷却 45s，防止客户端死循环重发打爆多个账号
+    if let Some((retry_secs, err_body)) = crate::proxy::toxic_cache::check_request_503_cooldown(&toxic_fp) {
+        let fp_prefix = if toxic_fp.len() >= 12 { &toxic_fp[..12] } else { &toxic_fp };
+        tracing::warn!(
+            "🛑 [Gemini] Request-level 503 cooldown active for fingerprint {} (retry_after={}s)",
+            fp_prefix,
+            retry_secs
+        );
+        let retry_str = retry_secs.to_string();
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                ("content-type", "application/json"),
+                ("retry-after", retry_str.as_str()),
+            ],
+            err_body,
+        )
+            .into_response());
+    }
 
     let client_wants_stream = method == "streamGenerateContent";
     // [AUTO-CONVERSION] 强制内部流式化
@@ -428,6 +447,7 @@ pub async fn handle_generate(
                 if let Some(g) = lease_guard.as_mut() {
                     g.mark_upstream_accepted();
                 }
+                crate::proxy::toxic_cache::clear_request_503(&toxic_fp);
 
                 let s_id_for_stream = s_id.clone();
                 let model_name_for_stream = mapped_model.clone();
@@ -638,6 +658,7 @@ pub async fn handle_generate(
             if let Some(g) = lease_guard.as_mut() {
                 g.mark_upstream_accepted();
             }
+            crate::proxy::toxic_cache::clear_request_503(&toxic_fp);
             let mut gemini_resp: Value = response
                 .json()
                 .await
@@ -727,7 +748,6 @@ pub async fn handle_generate(
         }
 
         // 标记限流状态(用于 UI 显示与 429 自动禁用/退避自愈)
-        // 注意：503/529 为 Google 机房算力拥塞，并非账号限流，严禁给账号上锁或解绑粘性会话
         if status_code == 429
             || status_code == 500
             || status_code == 404
@@ -738,6 +758,25 @@ pub async fn handle_generate(
                     &email,
                     status_code,
                     retry_after.as_deref(),
+                    &error_text,
+                    Some(&mapped_model),
+                    peak,
+                )
+                .await;
+        } else if status_code == 503 || status_code == 529 {
+            // [503/529 双层防重压熔断]
+            // 1. 保留本次请求已消耗的槽位冷却、60s RPM 计数与预占热度，绝不回滚
+            if let Some(g) = lease_guard.as_mut() {
+                g.complete_on_upstream_overload();
+            }
+            // 2. 记录请求指纹级 503 计数（满 4 次本地冷却该请求 45s）
+            crate::proxy::toxic_cache::record_request_503(&toxic_fp, &error_text);
+            // 3. 记录账号级连续 503 计数（满 3 次或出现 PER_STUB 则解绑粘性会话、降权并本地冷却 150s/300s）
+            let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+            token_manager
+                .record_account_503_async(
+                    &email,
+                    status_code,
                     &error_text,
                     Some(&mapped_model),
                     peak,

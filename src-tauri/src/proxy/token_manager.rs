@@ -1821,6 +1821,51 @@ impl TokenManager {
             return Some(out);
         }
 
+        // Gemini 4 Argon (A/B 灰度放量模型):
+        // 若当前选中账号的 quota.models 包含原生 gemini-4-argon-* 则优先直发原生模型；
+        // 若该账号未进入灰度白名单（95% 账号），则按同档位自动降级到全量开放的 gemini-3.8-flash-* / gemini-3-flash，避免上游 404。
+        match model.as_str() {
+            "gemini-4-argon-low" => {
+                return Some(vec![
+                    "gemini-4-argon-low".to_string(),
+                    "gemini-3.8-flash-low".to_string(),
+                    "gemini-3.8-flash-medium".to_string(),
+                    "gemini-3-flash".to_string(),
+                ]);
+            }
+            "gemini-4-argon-medium" | "gemini-4-argon" | "gemini-4" => {
+                return Some(vec![
+                    "gemini-4-argon-medium".to_string(),
+                    "gemini-3.8-flash-medium".to_string(),
+                    "gemini-3.8-flash-high".to_string(),
+                    "gemini-3-flash".to_string(),
+                ]);
+            }
+            "gemini-4-argon-high" => {
+                return Some(vec![
+                    "gemini-4-argon-high".to_string(),
+                    "gemini-3.8-flash-high".to_string(),
+                    "gemini-3.8-flash-medium".to_string(),
+                    "gemini-3-flash".to_string(),
+                ]);
+            }
+            // Claude 5.5 灰度内测模型按账号能力自动回退到全量 4.6
+            "claude-sonnet-5-5" | "claude-sonnet-5-5-thinking" => {
+                return Some(vec![
+                    model.clone(),
+                    "claude-sonnet-4-6-thinking".to_string(),
+                    "claude-sonnet-4-6".to_string(),
+                ]);
+            }
+            "claude-opus-5-5" | "claude-opus-5-5-thinking" => {
+                return Some(vec![
+                    model.clone(),
+                    "claude-opus-4-6-thinking".to_string(),
+                ]);
+            }
+            _ => {}
+        }
+
         let pro_family = [
             "gemini-3-pro",
             "gemini-3-pro-preview",
@@ -2135,9 +2180,29 @@ impl TokenManager {
         );
     }
 
-    /// 解绑账号的活跃会话记录（如遇到 429、小憩、禁用或过热换号）
+    /// 解绑账号的活跃会话记录（如遇到 429、小憩、禁用或过热换号），并清理对应会话的签名缓存
     pub fn unbind_account_session(&self, account_id: &str) {
-        self.account_active_sessions.remove(account_id);
+        if let Some((_, (bound_sid, _))) = self.account_active_sessions.remove(account_id) {
+            crate::proxy::SignatureCache::global().delete_session_signature(&bound_sid);
+        }
+    }
+
+    /// 按会话 ID 解绑粘性账号，并同步清理该会话缓存的上游思维签名（防止跨号串签名触发 403/400）
+    pub fn unbind_session_by_id(&self, session_id: &str) {
+        if self.session_accounts.remove(session_id).is_some() {
+            crate::proxy::SignatureCache::global().delete_session_signature(session_id);
+        }
+    }
+
+    /// 将会话绑定到指定账号；若从旧账号切换至新账号（或新绑定），清理残留会话级签名以确保跨号签名隔离
+    pub fn bind_session_account(&self, session_id: &str, account_id: &str) {
+        let prev = self
+            .session_accounts
+            .insert(session_id.to_string(), account_id.to_string());
+        if prev.as_deref() != Some(account_id) {
+            crate::proxy::SignatureCache::global().delete_session_signature(session_id);
+        }
+        self.record_account_session_activity(account_id, session_id);
     }
 
     /// P2C 算法的候选池大小 - 从前 N 个最优候选中随机选择
@@ -3737,7 +3802,7 @@ impl TokenManager {
                                     reset_sec,
                                     fine_target
                                 );
-                                self.session_accounts.remove(sid);
+                                self.unbind_session_by_id(sid);
                                 self.unbind_account_session(acc_id);
                             } else if is_protected {
                                 tracing::info!(
@@ -3745,15 +3810,15 @@ impl TokenManager {
                                     bound_token.email,
                                     target_model
                                 );
-                                self.session_accounts.remove(sid);
+                                self.unbind_session_by_id(sid);
                                 self.unbind_account_session(acc_id);
-                            } else if self.pacer.is_heat_saturated(acc_id) {
+                            } else if self.pacer.is_sticky_heat_saturated(acc_id) {
                                 tracing::info!(
-                                    "Sticky Session: Bound account {} is heat-saturated ({:.2} >= threshold), unbinding before request to route to cold account.",
+                                    "Sticky Session: Bound account {} is sticky-heat-saturated ({:.2} >= sticky threshold), unbinding before request to route to cold account.",
                                     bound_token.email,
                                     self.pacer.get_account_heat(acc_id)
                                 );
-                                self.session_accounts.remove(sid);
+                                self.unbind_session_by_id(sid);
                                 self.unbind_account_session(acc_id);
                             } else if footprint.prompt_tokens > crate::proxy::account_selector::TIER2_WARMING_MAX_INPUT_TOKENS
                                 && !crate::proxy::account_selector::is_hourly_sweet_spot(acc_id)
@@ -3763,7 +3828,7 @@ impl TokenManager {
                                     bound_token.email,
                                     footprint.prompt_tokens
                                 );
-                                self.session_accounts.remove(sid);
+                                self.unbind_session_by_id(sid);
                                 self.unbind_account_session(acc_id);
                             } else {
                                 let max_slots = self.effective_slot_count(acc_id);
@@ -3835,14 +3900,14 @@ impl TokenManager {
                                                 );
                                             }
                                         }
-                                        self.session_accounts.remove(sid);
+                                        self.unbind_session_by_id(sid);
                                         self.unbind_account_session(acc_id);
                                     }
                                 }
                             }
                         }
                     } else {
-                        self.session_accounts.remove(sid);
+                        self.unbind_session_by_id(sid);
                     }
                 }
             }
@@ -3928,9 +3993,7 @@ impl TokenManager {
                                 .retain(|_, v| v != &selected.account_id);
                             self.unbind_account_session(&selected.account_id);
                         } else if scheduling.mode != SchedulingMode::PerformanceFirst {
-                            self.session_accounts
-                                .insert(sid.to_string(), selected.account_id.clone());
-                            self.record_account_session_activity(&selected.account_id, sid);
+                            self.bind_session_account(sid, &selected.account_id);
                             tracing::info!(
                                 "Sticky Session: Bound healthy account {} to session {}",
                                 selected.email,
@@ -3986,9 +4049,7 @@ impl TokenManager {
                                     if !entered_nap
                                         && scheduling.mode != SchedulingMode::PerformanceFirst
                                     {
-                                        self.session_accounts
-                                            .insert(sid.to_string(), selected.account_id.clone());
-                                        self.record_account_session_activity(&selected.account_id, sid);
+                                        self.bind_session_account(sid, &selected.account_id);
                                     }
                                 }
                                 (selected, guard, entered_nap)
@@ -4506,25 +4567,25 @@ impl TokenManager {
                                 reset_sec,
                                 normalized_target
                             );
-                            self.session_accounts.remove(sid);
+                            self.unbind_session_by_id(sid);
                         } else if crate::proxy::account_selector::is_account_fatigued(acc_id) {
                             tracing::info!(
                                 "Sticky Session: Bound account {} reached fatigue sleep limit, unbinding and switching to fresh account.",
                                 bound_token.email
                             );
-                            self.session_accounts.remove(sid);
+                            self.unbind_session_by_id(sid);
                         } else if self.pacer.is_in_nap(acc_id) {
                             tracing::info!(
                                 "Sticky Session: Bound account {} is in micro-nap, unbinding and switching.",
                                 bound_token.email
                             );
-                            self.session_accounts.remove(sid);
+                            self.unbind_session_by_id(sid);
                         } else if self.is_concurrency_full(acc_id) {
                             tracing::debug!(
                                 "Sticky Session: Bound account {} at concurrency cap, unbinding and switching.",
                                 bound_token.email
                             );
-                            self.session_accounts.remove(sid);
+                            self.unbind_session_by_id(sid);
                         } else if quota_protection_enabled
                             && Self::is_model_quota_protected(&bound_token.protected_models, target_model)
                         {
@@ -4533,7 +4594,7 @@ impl TokenManager {
                                 bound_token.email,
                                 target_model
                             );
-                            self.session_accounts.remove(sid);
+                            self.unbind_session_by_id(sid);
                         } else if pacer_wait > 2000 {
                             // [NEW] 最佳流派规则：粘性账号冷却时间超过阈值 (2s)，长等容易导致客户端超时，解绑并切换到空闲账号
                             tracing::info!(
@@ -4541,15 +4602,15 @@ impl TokenManager {
                                 bound_token.email,
                                 pacer_wait
                             );
-                            self.session_accounts.remove(sid);
-                        } else if self.pacer.is_heat_saturated(acc_id) {
-                            // [Heat Protection] 粘性账号大任务热度饱和 (Heat >= 1.5)，主动解绑分流给冷账号
+                            self.unbind_session_by_id(sid);
+                        } else if self.pacer.is_sticky_heat_saturated(acc_id) {
+                            // [Heat Protection] 粘性账号大任务热度饱和，主动解绑分流给冷账号
                             tracing::info!(
-                                "Sticky Session: Bound account {} is heat-saturated ({:.2} >= 1.5), unbinding to route to cold account.",
+                                "Sticky Session: Bound account {} is sticky-heat-saturated ({:.2} >= sticky threshold), unbinding to route to cold account.",
                                 bound_token.email,
                                 self.pacer.get_account_heat(acc_id)
                             );
-                            self.session_accounts.remove(sid);
+                            self.unbind_session_by_id(sid);
                         } else if !attempted.contains(acc_id) {
                             // 账号可用且未被标记为尝试失败，优先复用（若 wait <= 2000ms 会在返回前微等以保 Prompt Cache）
                             tracing::debug!(
@@ -4567,7 +4628,7 @@ impl TokenManager {
                             bound_id,
                             sid
                         );
-                        self.session_accounts.remove(sid);
+                        self.unbind_session_by_id(sid);
                     }
                 }
             }
@@ -4662,8 +4723,7 @@ impl TokenManager {
                         // 如果是会话首次分配且需要粘性，在此建立绑定
                         if let Some(sid) = session_id {
                             if scheduling.mode != SchedulingMode::PerformanceFirst {
-                                self.session_accounts
-                                    .insert(sid.to_string(), selected.account_id.clone());
+                                self.bind_session_account(sid, &selected.account_id);
                                 tracing::debug!(
                                     "Sticky Session: Bound new account {} to session {}",
                                     selected.email,
@@ -4706,8 +4766,7 @@ impl TokenManager {
                     // [FIX] 发生切号或重新选号后，若当前属于粘性会话模式，自动把会话重新绑定到新的健康账号
                     if let Some(sid) = session_id {
                         if scheduling.mode != SchedulingMode::PerformanceFirst {
-                            self.session_accounts
-                                .insert(sid.to_string(), selected.account_id.clone());
+                            self.bind_session_account(sid, &selected.account_id);
                             tracing::info!(
                                 "Sticky Session: Re-bound new healthy account {} to session {}",
                                 selected.email,
@@ -5617,6 +5676,126 @@ impl TokenManager {
             error_body,
             peak,
         );
+    }
+
+    /// 账号级 503/529 连续过载追踪与熔断器：
+    /// - 每次 503 累加连续计数并小幅推高热度（`+0.3`）以降低路由权重；
+    /// - 连续达到 3 次 503（或上游返回 `OVERLOADED_TOO_MANY_RETRIES_PER_STUB` 桩级过载）时触发熔断：
+    ///   1. 立即解绑该账号所有粘性会话（`session_accounts` + `unbind_account_session`）；
+    ///   2. 本地锁定该账号 150s（二次复发升级为 300s），使所有选号路径跳过该号并在 UI 展示倒计时；
+    ///   3. 热度惩罚抬升至 `>= 2.6`，即使 150s 解锁后仍处于 `overheated` 降权兜底桶约 5~8 分钟，避免刚恢复就被塞大包。
+    pub async fn record_account_503_async(
+        &self,
+        email: &str,
+        status: u16,
+        error_body: &str,
+        model: Option<&str>,
+        in_flight_peak: Option<u32>,
+    ) -> bool {
+        let normalized_model =
+            model.and_then(|m| crate::proxy::common::model_mapping::normalize_to_standard_id(m));
+        let model_to_track = normalized_model.as_deref().or(model);
+
+        let account_id = self
+            .email_to_account_id(email)
+            .unwrap_or_else(|| email.to_string());
+
+        let is_stub_overload = error_body.contains("OVERLOADED_TOO_MANY_RETRIES_PER_STUB");
+        let (streak, trip_cooldown) = self
+            .pacer
+            .record_503_and_check_breaker(&account_id, is_stub_overload);
+        let current_heat = self.pacer.get_account_heat(&account_id);
+
+        if let Some(cooldown_secs) = trip_cooldown {
+            // 1. 立即解绑所有绑定在该账号上的粘性会话
+            self.session_accounts.retain(|sid, bound_id| {
+                if bound_id == &account_id {
+                    tracing::warn!(
+                        "🔓 [503CircuitBreaker] Unbound sticky session {} from account {} ({}) after {} consecutive 503s (stub_overload={})",
+                        sid,
+                        email,
+                        account_id,
+                        streak,
+                        is_stub_overload
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            self.unbind_account_session(&account_id);
+
+            // 2. 本地限流锁定 cooldown_secs（150s / 300s），覆盖模型级与账号全局级，确保该 Google Stub 彻底静默冷却
+            let config = self.circuit_breaker_config.read().await.clone();
+            if config.enabled {
+                let peak = in_flight_peak.or_else(|| {
+                    let cur = self.account_inflight.current(&account_id);
+                    if cur > 0 {
+                        Some(cur as u32)
+                    } else {
+                        None
+                    }
+                });
+                let reset_at =
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(cooldown_secs);
+                let reason = crate::proxy::rate_limit::RateLimitReason::ModelCapacityExhausted;
+
+                self.rate_limit_tracker.set_lockout_until(
+                    &account_id,
+                    reset_at,
+                    reason,
+                    model_to_track.map(|s| s.to_string()),
+                );
+                if model_to_track.is_some() {
+                    self.rate_limit_tracker
+                        .set_lockout_until(&account_id, reset_at, reason, None);
+                }
+                self.persist_live_limit(
+                    &account_id,
+                    model_to_track,
+                    status,
+                    reason,
+                    error_body,
+                    peak,
+                );
+            }
+
+            // 3. 若启用了串行池且当前游标指向该账号，推进游标
+            let serial_cfg = self.serial_pool.read().await.clone();
+            if serial_cfg.enabled && serial_cfg.should_advance_on("rate_limit") {
+                let preferred = self.preferred_account_id.read().await.clone();
+                if preferred.as_deref() == Some(account_id.as_str()) {
+                    if let Ok(next) = self.advance_serial_account("rate_limit", model_to_track).await
+                    {
+                        tracing::info!(
+                            "[SerialPool] cursor advanced after 503 breaker {} -> {}",
+                            account_id,
+                            next
+                        );
+                    }
+                }
+            }
+
+            tracing::warn!(
+                "🚨 [503CircuitBreaker] Account {} ({}) tripped after {} consecutive 503s (stub_overload={}) -> locked for {}s, heat={:.2}",
+                email,
+                account_id,
+                streak,
+                is_stub_overload,
+                cooldown_secs,
+                current_heat
+            );
+            true
+        } else {
+            tracing::warn!(
+                "⚠️ [503Tracker] Account {} ({}) recorded 503 ({}/3 consecutive), heat increased to {:.2}",
+                email,
+                account_id,
+                streak,
+                current_heat
+            );
+            false
+        }
     }
 
     fn classify_rate_limit_reason(
@@ -8461,5 +8640,81 @@ mod tests {
             !TokenManager::token_unsafe_for_medium_or_oversized(&just_issued_token, now_ts),
             "Recently issued token must not be deemed unsafe in candidate filtering"
         );
+    }
+
+    #[tokio::test]
+    async fn test_gemini_4_argon_dynamic_model_resolution_per_account() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-argon-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account_with_models = |id: &str, models: serde_json::Value| {
+            let path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": format!("{}@test.com", id),
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": "test-project"
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "quota": {
+                    "models": models
+                },
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        // 账号 1：在 Google 灰度白名单内，拥有原生 gemini-4-argon-medium
+        write_account_with_models(
+            "acc_argon_whitelist",
+            serde_json::json!([
+                { "name": "gemini-4-argon-medium", "percentage": 100 },
+                { "name": "gemini-3.8-flash-medium", "percentage": 100 }
+            ]),
+        );
+
+        // 账号 2：普通全量账号（95% 多数派），只有 gemini-3.8-flash-medium
+        write_account_with_models(
+            "acc_standard_flash",
+            serde_json::json!([
+                { "name": "gemini-3.8-flash-low", "percentage": 100 },
+                { "name": "gemini-3.8-flash-medium", "percentage": 100 },
+                { "name": "gemini-3.8-flash-high", "percentage": 100 }
+            ]),
+        );
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        // 1. 灰度账号请求 gemini-4-argon-medium -> 保持原生 gemini-4-argon-medium
+        let resolved_whitelist = manager
+            .resolve_dynamic_model_for_account("acc_argon_whitelist", "gemini-4-argon-medium")
+            .await;
+        assert_eq!(resolved_whitelist, "gemini-4-argon-medium");
+
+        // 2. 普通账号请求 gemini-4-argon-medium -> 自动按同档位改写为 gemini-3.8-flash-medium
+        let resolved_standard = manager
+            .resolve_dynamic_model_for_account("acc_standard_flash", "gemini-4-argon-medium")
+            .await;
+        assert_eq!(resolved_standard, "gemini-3.8-flash-medium");
+
+        // 3. 普通账号请求 gemini-4-argon-high -> 自动按同档位改写为 gemini-3.8-flash-high
+        let resolved_high = manager
+            .resolve_dynamic_model_for_account("acc_standard_flash", "gemini-4-argon-high")
+            .await;
+        assert_eq!(resolved_high, "gemini-3.8-flash-high");
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

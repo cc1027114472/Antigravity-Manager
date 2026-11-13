@@ -1266,17 +1266,23 @@ pub fn transform_openai_request(
     }
 
     let account_id = token.map(|t| t.account_id.as_str());
-    let official_request_id = crate::proxy::common::session::generate_official_request_id(
-        account_id,
-        &session_id,
-        message_count,
-    );
+    let (official_request_id, official_labels) =
+        crate::proxy::common::session::generate_official_request_id_and_labels(
+            account_id,
+            &session_id,
+            message_count,
+            &config.final_model,
+        );
 
     let req_type = if config.request_type == "image_gen" {
         "image_gen"
     } else {
         "agent"
     };
+
+    if req_type == "agent" && reordered_request.get("labels").is_none() {
+        reordered_request["labels"] = official_labels;
+    }
 
     let mut final_body = json!({
         "project": project_id,

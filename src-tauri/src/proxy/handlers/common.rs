@@ -52,8 +52,10 @@ pub fn determine_retry_strategy(
             RetryStrategy::NoRetry
         }
 
-        // 503 服务不可用 / 529 服务器过载：保持当前账号原地等待 1.5s 重试最多 1 次（严禁切号与 10s+ 长睡）
-        503 | 529 => RetryStrategy::GraceRetry(Duration::from_millis(1500)),
+        // 503 服务不可用 / 529 服务器过载：直接透传给客户端由客户端退避重试，
+        // 严禁在单次请求内部做隐藏原地重发（防止单次请求翻倍打爆 Google Stub 触发 403 TOS_VIOLATION）；
+        // 账号级连续 3 次 503 解绑降权与单请求累计 4 次 503 冷却锁由 TokenManager 与 ToxicCache 统一接管。
+        503 | 529 => RetryStrategy::NoRetry,
 
         // 500 服务器内部错误
         500 => {

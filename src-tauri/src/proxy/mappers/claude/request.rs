@@ -691,18 +691,24 @@ pub fn transform_claude_request_in(
             json!(crate::proxy::common::session::derive_session_id(account_id));
     }
 
-    // 生成 requestId
-    let request_id = crate::proxy::common::session::generate_official_request_id(
-        account_id,
-        &session_id,
-        message_count,
-    );
+    // 生成 requestId 与配套 request.labels
+    let (request_id, official_labels) =
+        crate::proxy::common::session::generate_official_request_id_and_labels(
+            account_id,
+            &session_id,
+            message_count,
+            &config.final_model,
+        );
 
     let req_type = if config.request_type == "image_gen" {
         "image_gen"
     } else {
         "agent"
     };
+
+    if req_type == "agent" && inner_request.get("labels").is_none() {
+        inner_request["labels"] = official_labels;
+    }
 
     // 构建最终请求体
     let mut body = json!({

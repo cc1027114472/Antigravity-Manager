@@ -416,6 +416,24 @@ pub async fn handle_chat_completions(
         tracing::warn!("🚫 [OpenAI] Fast early rejection on toxic request fingerprint: {}", fp_prefix);
         return Ok((toxic_status, [("content-type", "application/json")], toxic_body).into_response());
     }
+    if let Some((retry_secs, err_body)) = crate::proxy::toxic_cache::check_request_503_cooldown(&toxic_fp) {
+        let fp_prefix = if toxic_fp.len() >= 12 { &toxic_fp[..12] } else { &toxic_fp };
+        tracing::warn!(
+            "🛑 [OpenAI] Request-level 503 cooldown active for fingerprint {} (retry_after={}s)",
+            fp_prefix,
+            retry_secs
+        );
+        let retry_str = retry_secs.to_string();
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                ("content-type", "application/json"),
+                ("retry-after", retry_str.as_str()),
+            ],
+            err_body,
+        )
+            .into_response());
+    }
 
     let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
     info!(
@@ -865,6 +883,7 @@ pub async fn handle_chat_completions(
                 if let Some(g) = lease_guard.as_mut() {
                     g.mark_upstream_accepted();
                 }
+                crate::proxy::toxic_cache::clear_request_503(&toxic_fp);
 
                 // Combine first chunk with remaining stream
                 let combined_stream =
@@ -1039,6 +1058,7 @@ pub async fn handle_chat_completions(
             if let Some(g) = lease_guard.as_mut() {
                 g.mark_upstream_accepted();
             }
+            crate::proxy::toxic_cache::clear_request_503(&toxic_fp);
             let gemini_resp: Value = response
                 .json()
                 .await
@@ -1155,7 +1175,7 @@ pub async fn handle_chat_completions(
         // 确定重试策略
         let strategy = determine_retry_strategy(status_code, &error_text, false);
 
-        // 3. 标记限流状态(用于 UI 显示，503/529 算力拥塞不锁号)
+        // 3. 标记限流状态(用于 UI 显示)
         if status_code == 429 || status_code == 500 || status_code == 404 {
             // [FIX] Use async version with model parameter for fine-grained rate limiting
             let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
@@ -1164,6 +1184,21 @@ pub async fn handle_chat_completions(
                     &email,
                     status_code,
                     _retry_after.as_deref(),
+                    &error_text,
+                    Some(&mapped_model),
+                    peak,
+                )
+                .await;
+        } else if status_code == 503 || status_code == 529 {
+            if let Some(g) = lease_guard.as_mut() {
+                g.complete_on_upstream_overload();
+            }
+            crate::proxy::toxic_cache::record_request_503(&toxic_fp, &error_text);
+            let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+            token_manager
+                .record_account_503_async(
+                    &email,
+                    status_code,
                     &error_text,
                     Some(&mapped_model),
                     peak,
@@ -2071,6 +2106,33 @@ pub async fn handle_completions(
             });
     }
 
+    // [TOXIC CACHE & REQUEST 503 BREAKER] 入口毒丸与 503 频控拦截
+    let body_bytes_for_fp = serde_json::to_vec(&openai_req).unwrap_or_default();
+    let toxic_fp = crate::proxy::toxic_cache::calculate_fingerprint(&openai_req.model, &body_bytes_for_fp);
+    if let Some((toxic_status, toxic_body)) = crate::proxy::toxic_cache::check_toxic(&toxic_fp) {
+        let fp_prefix = if toxic_fp.len() >= 12 { &toxic_fp[..12] } else { &toxic_fp };
+        tracing::warn!("🚫 [Codex] Fast early rejection on toxic request fingerprint: {}", fp_prefix);
+        return (toxic_status, [("content-type", "application/json")], toxic_body).into_response();
+    }
+    if let Some((retry_secs, err_body)) = crate::proxy::toxic_cache::check_request_503_cooldown(&toxic_fp) {
+        let fp_prefix = if toxic_fp.len() >= 12 { &toxic_fp[..12] } else { &toxic_fp };
+        tracing::warn!(
+            "🛑 [Codex] Request-level 503 cooldown active for fingerprint {} (retry_after={}s)",
+            fp_prefix,
+            retry_secs
+        );
+        let retry_str = retry_secs.to_string();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                ("content-type", "application/json"),
+                ("retry-after", retry_str.as_str()),
+            ],
+            err_body,
+        )
+            .into_response();
+    }
+
     // [NEW v4.2.0] Context Management & Reasoning Replay
     let session_id_str = SessionManager::extract_openai_session_id(&openai_req);
 
@@ -2617,6 +2679,7 @@ pub async fn handle_completions(
                     if let Some(g) = lease_guard.as_mut() {
                         g.mark_upstream_accepted();
                     }
+                    crate::proxy::toxic_cache::clear_request_503(&toxic_fp);
 
                     let combined_stream = futures::stream::once(async move {
                         Ok::<Bytes, String>(first_data_chunk.unwrap())
@@ -2790,6 +2853,7 @@ pub async fn handle_completions(
                     if let Some(g) = lease_guard.as_mut() {
                         g.mark_upstream_accepted();
                     }
+                    crate::proxy::toxic_cache::clear_request_503(&toxic_fp);
                     // Collect
                     use crate::proxy::mappers::openai::collector::collect_stream_to_json;
                     match collect_stream_to_json(combined_stream).await {
@@ -2971,6 +3035,7 @@ pub async fn handle_completions(
             if let Some(g) = lease_guard.as_mut() {
                 g.mark_upstream_accepted();
             }
+            crate::proxy::toxic_cache::clear_request_503(&toxic_fp);
             let gemini_resp: Value = match response.json().await {
                 Ok(json) => json,
                 Err(e) => {
@@ -3152,7 +3217,7 @@ pub async fn handle_completions(
             error_text
         );
 
-        // 3. 标记限流状态(用于 UI 显示，503/529 算力拥塞不锁号)
+        // 3. 标记限流状态(用于 UI 显示)
         if status_code == 429 || status_code == 500 || status_code == 404 {
             let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
             token_manager
@@ -3160,6 +3225,21 @@ pub async fn handle_completions(
                     &email,
                     status_code,
                     retry_after.as_deref(),
+                    &error_text,
+                    Some(&mapped_model),
+                    peak,
+                )
+                .await;
+        } else if status_code == 503 || status_code == 529 {
+            if let Some(g) = lease_guard.as_mut() {
+                g.complete_on_upstream_overload();
+            }
+            crate::proxy::toxic_cache::record_request_503(&toxic_fp, &error_text);
+            let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+            token_manager
+                .record_account_503_async(
+                    &email,
+                    status_code,
                     &error_text,
                     Some(&mapped_model),
                     peak,

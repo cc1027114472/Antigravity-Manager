@@ -27,13 +27,37 @@ pub fn derive_uuid_from_seed(seed: &str) -> uuid::Uuid {
     uuid::Uuid::from_bytes(bytes)
 }
 
-/// Generates a 5-segment requestId matching official Antigravity IDE:
+/// Maps a model ID to the official Antigravity IDE `labels.model_enum`
+pub fn resolve_official_model_enum(model: &str) -> &'static str {
+    let lower = model.to_lowercase();
+    if lower.contains("gemini-3.8-flash-low") {
+        "MODEL_PLACEHOLDER_M320"
+    } else if lower.contains("gemini-3.8-flash-medium") {
+        "MODEL_PLACEHOLDER_M319"
+    } else if lower.contains("gemini-3.8-flash") {
+        "MODEL_PLACEHOLDER_M318"
+    } else if lower.contains("gemini-4-argon-low") {
+        "MODEL_PLACEHOLDER_M419"
+    } else if lower.contains("gemini-4-argon-medium") {
+        "MODEL_PLACEHOLDER_M418"
+    } else if lower.contains("gemini-4-argon") {
+        "MODEL_PLACEHOLDER_M417"
+    } else if lower.contains("gemini-3.5-flash") || lower.contains("gemini-2.5-flash-lite") {
+        "MODEL_PLACEHOLDER_M50"
+    } else {
+        "MODEL_PLACEHOLDER_M318"
+    }
+}
+
+/// Generates a 5-segment requestId AND matching `request.labels` object
+/// aligned with official Antigravity IDE captures:
 /// agent/{cascade_uuid}/{timestamp_ms}/{trajectory_uuid}/{step_index}
-pub fn generate_official_request_id(
+pub fn generate_official_request_id_and_labels(
     account_id: Option<&str>,
     session_hint: &str,
     step_index: usize,
-) -> String {
+    final_model: &str,
+) -> (String, serde_json::Value) {
     let ts = chrono::Utc::now().timestamp_millis();
     let acc = account_id.unwrap_or("anon");
     let cascade_seed = format!("cascade:{}:{}", acc, session_hint);
@@ -43,8 +67,42 @@ pub fn generate_official_request_id(
     let cascade_uuid = derive_uuid_from_seed(&cascade_seed);
     let trajectory_uuid = derive_uuid_from_seed(&trajectory_seed);
     let step = step_index.max(1);
+    let last_step = step.saturating_sub(1);
+    let lower = final_model.to_lowercase();
+    let is_claude = lower.contains("claude");
+    let is_non_gemini = !lower.contains("gemini");
+    let model_enum = resolve_official_model_enum(final_model);
 
-    format!("agent/{}/{}/{}/{}", cascade_uuid, ts, trajectory_uuid, step)
+    let request_id = format!("agent/{}/{}/{}/{}", cascade_uuid, ts, trajectory_uuid, step);
+    let labels = serde_json::json!({
+        "cascade_id": cascade_uuid.to_string(),
+        "last_step_index": last_step.to_string(),
+        "model_enum": model_enum,
+        "request_id": format!("{}-{}", trajectory_uuid, last_step),
+        "root_cascade_id": cascade_uuid.to_string(),
+        "trajectory_id": trajectory_uuid.to_string(),
+        "used_claude": if is_claude { "true" } else { "false" },
+        "used_claude_conservative": if is_claude { "true" } else { "false" },
+        "used_non_gemini_model": if is_non_gemini { "true" } else { "false" },
+    });
+
+    (request_id, labels)
+}
+
+/// Generates a 5-segment requestId matching official Antigravity IDE:
+/// agent/{cascade_uuid}/{timestamp_ms}/{trajectory_uuid}/{step_index}
+pub fn generate_official_request_id(
+    account_id: Option<&str>,
+    session_hint: &str,
+    step_index: usize,
+) -> String {
+    let (request_id, _) = generate_official_request_id_and_labels(
+        account_id,
+        session_hint,
+        step_index,
+        "gemini-3.8-flash-high",
+    );
+    request_id
 }
 
 #[cfg(test)]

@@ -138,9 +138,20 @@ impl Default for RequestFootprint {
 
 impl RequestFootprint {
     pub fn new(prompt_tokens: u32, raw_body_len: usize) -> Self {
-        let tier = if raw_body_len > OVERSIZE_BODY_BYTES || prompt_tokens > OVERSIZE_TOKENS {
+        // 当 ContextManager 已精确算出 prompt_tokens (> 0，含 Google 官方 1 张 <=1MB 图片 = 258 tokens 算法) 时，
+        // 严格以 prompt_tokens 为准判定请求量级，避免带截图的对话因 Base64 字节膨胀 (>400KB) 被误判为 Oversized；
+        // 仅当 prompt_tokens == 0（未经过 token 估算的原始透传场景）时才回退到 raw_body_len 字节阈值。
+        let tier = if prompt_tokens > 0 {
+            if prompt_tokens > OVERSIZE_TOKENS {
+                TrafficTier::Oversized
+            } else if prompt_tokens >= MEDIUM_TOKENS {
+                TrafficTier::Medium
+            } else {
+                TrafficTier::Normal
+            }
+        } else if raw_body_len > OVERSIZE_BODY_BYTES {
             TrafficTier::Oversized
-        } else if raw_body_len > MEDIUM_BODY_BYTES || prompt_tokens >= MEDIUM_TOKENS {
+        } else if raw_body_len > MEDIUM_BODY_BYTES {
             TrafficTier::Medium
         } else {
             TrafficTier::Normal
@@ -166,13 +177,25 @@ impl RequestFootprint {
         let tokens = self.prompt_tokens;
         let bytes = self.raw_body_len;
 
-        if tokens >= OVERSIZE_TOKENS || bytes > OVERSIZE_BODY_BYTES {
+        if tokens > 0 {
+            if tokens >= OVERSIZE_TOKENS {
+                OVERSIZE_HEAT_INCREMENT
+            } else if tokens >= HEAVY_TOKENS {
+                HEAVY_HEAT_INCREMENT
+            } else if tokens >= MEDIUM_TOKENS {
+                MEDIUM_HEAT_INCREMENT
+            } else if tokens >= LIGHT_MEDIUM_TOKENS {
+                LIGHT_MEDIUM_HEAT_INCREMENT
+            } else {
+                0.0
+            }
+        } else if bytes > OVERSIZE_BODY_BYTES {
             OVERSIZE_HEAT_INCREMENT
-        } else if tokens >= HEAVY_TOKENS || bytes > 320 * 1024 {
+        } else if bytes > 320 * 1024 {
             HEAVY_HEAT_INCREMENT
-        } else if tokens >= MEDIUM_TOKENS || bytes > MEDIUM_BODY_BYTES {
+        } else if bytes > MEDIUM_BODY_BYTES {
             MEDIUM_HEAT_INCREMENT
-        } else if tokens >= LIGHT_MEDIUM_TOKENS || bytes > 120 * 1024 {
+        } else if bytes > 120 * 1024 {
             LIGHT_MEDIUM_HEAT_INCREMENT
         } else {
             0.0
@@ -307,6 +330,12 @@ pub struct AccountPacerState {
     pub last_daily_window: i64,
     /// 触发疲劳熔断休眠截止时间
     pub fatigue_until: Option<std::time::Instant>,
+    /// 当前连续出现 503/529 的次数（达到 3 次或出现 PER_STUB 时解绑会话并进入软限流冷却 + 路由降权）
+    pub consecutive_503s: u32,
+    /// 近期触发连续 503 熔断的阶梯次数（150s -> 300s）
+    pub overload_trip_count: u32,
+    /// 最近一次出现 503/529 的时间点
+    pub last_503_at: Option<std::time::Instant>,
 }
 
 impl AccountPacerState {
@@ -335,6 +364,9 @@ impl AccountPacerState {
             last_hourly_window: chrono::Utc::now().timestamp() / 3600,
             last_daily_window: chrono::Utc::now().timestamp() / 86400,
             fatigue_until: None,
+            consecutive_503s: 0,
+            overload_trip_count: 0,
+            last_503_at: None,
         }
     }
 }
@@ -404,7 +436,12 @@ impl HumanizedPacer {
         let mut rng = rand::thread_rng();
         match footprint.tier {
             TrafficTier::Normal => {
-                if footprint.prompt_tokens <= 30_000 && footprint.raw_body_len <= 50 * 1024 {
+                let is_light_normal = if footprint.prompt_tokens > 0 {
+                    footprint.prompt_tokens <= 30_000
+                } else {
+                    footprint.raw_body_len <= 50 * 1024
+                };
+                if is_light_normal {
                     rng.gen_range(800..=1500)
                 } else {
                     rng.gen_range(1100..=1800)
@@ -625,6 +662,32 @@ impl HumanizedPacer {
             COLD_POOL_HEAT_THRESHOLD
         };
         current_heat >= threshold
+    }
+
+    /// 检查已绑定的粘性会话（Sticky Session）是否达到主动预解绑热度阈值。
+    /// 与自由池选号门槛 (`is_heat_saturated` 1.0/1.5) 区分：
+    /// 允许已绑定会话在同一账号上稳定执行更多轮次（如 6~8 轮中等上下文或 2 轮 >200KB 大包），
+    /// 在逼近上游风控红线前结合已执行轮次与累积热度主动解绑并切往冷账号，绝不等到 429/403 被动解绑。
+    pub fn is_sticky_heat_saturated(&self, account_id: &str) -> bool {
+        let now = std::time::Instant::now();
+        let Some(entry) = self.account_states.get(account_id) else {
+            return false;
+        };
+        if let Some(nap) = entry.nap_until {
+            if now >= nap {
+                return false;
+            }
+        }
+        let current_heat = Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
+        let turns = entry.turns_since_nap;
+        use chrono::Timelike;
+        let current_minute = chrono::Utc::now().minute();
+        let (min_turns, heat_threshold) = if (5..=15).contains(&current_minute) {
+            (6, 2.0)
+        } else {
+            (8, 2.4)
+        };
+        turns >= min_turns && current_heat >= heat_threshold
     }
 
     /// 推演给定请求进入后账号的合成热度
@@ -1265,6 +1328,25 @@ impl HumanizedPacer {
     }
 
     fn complete_lease(&self, account_id: &str, lease_id: u64, footprint: RequestFootprint) {
+        self.complete_lease_inner(account_id, lease_id, footprint, true);
+    }
+
+    fn complete_lease_preserve_503(
+        &self,
+        account_id: &str,
+        lease_id: u64,
+        footprint: RequestFootprint,
+    ) {
+        self.complete_lease_inner(account_id, lease_id, footprint, false);
+    }
+
+    fn complete_lease_inner(
+        &self,
+        account_id: &str,
+        lease_id: u64,
+        footprint: RequestFootprint,
+        reset_503_streak: bool,
+    ) {
         let now = std::time::Instant::now();
         let cooldown_ms = Self::compute_footprint_cooldown_ms(footprint);
         let until = now + Duration::from_millis(cooldown_ms);
@@ -1275,6 +1357,9 @@ impl HumanizedPacer {
             entry.last_heat_updated_at = now;
             entry.last_response_completed_at = Some(now);
             entry.current_interval_ms = cooldown_ms;
+            if reset_503_streak && entry.consecutive_503s > 0 {
+                entry.consecutive_503s = 0;
+            }
 
             let mut matched_any = false;
             for slot in entry.slots.iter_mut() {
@@ -1298,14 +1383,70 @@ impl HumanizedPacer {
 
             if matched_any {
                 tracing::debug!(
-                    "[HumanizedPacer] Account {} lease #{} completed ({:?}), slot closed for +{}ms cooldown",
+                    "[HumanizedPacer] Account {} lease #{} completed ({:?}, reset_503={}), slot closed for +{}ms cooldown",
                     account_id,
                     lease_id,
                     footprint.tier,
+                    reset_503_streak,
                     cooldown_ms
                 );
             }
         }
+    }
+
+    /// 记录账号收到一次上游 503/529，并检查是否触发「单账号连续 3 次 503（或 PER_STUB 过载）」熔断：
+    /// - 每次 503 累加 `consecutive_503s`，并微加 `+0.3` 热度；
+    /// - 当连续达到 3 次或出现 `OVERLOADED_TOO_MANY_RETRIES_PER_STUB` 时：
+    ///   1. 重置 `consecutive_503s = 0` 并推进阶梯计数 `overload_trip_count`；
+    ///   2. 叠加 `+1.8` 路由降权热度惩罚（保证冷却结束后热度仍 >= 1.5，自动降入末位候选池，优先选其他清凉号）；
+    ///   3. 返回 `(触发时的连续次数, Some(本地限流秒数: 首次 150s / 15m 内复发 300s))`。
+    pub fn record_503_and_check_breaker(
+        &self,
+        account_id: &str,
+        is_stub_overload: bool,
+    ) -> (u32, Option<u64>) {
+        let now = std::time::Instant::now();
+        let mut entry = self
+            .account_states
+            .entry(account_id.to_string())
+            .or_insert_with(|| {
+                AccountPacerState::new_default(account_id, now, DEFAULT_CONCURRENCY_SLOTS)
+            });
+
+        if let Some(last) = entry.last_503_at {
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed > Duration::from_secs(300) {
+                entry.consecutive_503s = 0;
+            }
+            if elapsed > Duration::from_secs(900) {
+                entry.overload_trip_count = 0;
+            }
+        }
+
+        entry.consecutive_503s += 1;
+        entry.last_503_at = Some(now);
+
+        let decayed = Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
+        entry.massive_heat = decayed + 0.3;
+        entry.last_heat_updated_at = now;
+
+        if entry.consecutive_503s >= 3 || is_stub_overload {
+            let streak = entry.consecutive_503s;
+            entry.consecutive_503s = 0;
+            entry.overload_trip_count += 1;
+            let cooldown_secs = if entry.overload_trip_count == 1 {
+                150
+            } else {
+                300
+            };
+            // 路由降权：抬高热度（>= 2.6），确保在 150s 限流期满后剩余热度仍 >= 1.5（COLD_POOL_HEAT_THRESHOLD），
+            // 使该账号在恢复后的 5~8 分钟内处于低权重状态，不会立刻抢占大包请求
+            entry.massive_heat = (entry.massive_heat + 1.5).max(2.6);
+            entry.last_heat_updated_at = now;
+            return (streak, Some(cooldown_secs));
+        }
+
+        (entry.consecutive_503s, None)
     }
 
     fn rollback_lease(
@@ -1461,6 +1602,7 @@ impl HumanizedPacer {
         let decayed = Self::decayed_heat_at(entry.massive_heat, entry.last_heat_updated_at, now);
         entry.massive_heat = decayed;
         entry.last_heat_updated_at = now;
+        entry.consecutive_503s = 0;
         entry.last_response_completed_at = Some(now);
         entry.next_allowed_request_at = next_allowed;
         entry.current_interval_ms = cooldown_ms;
@@ -1470,6 +1612,7 @@ impl HumanizedPacer {
 /// 并发槽位与热度生命周期租约守卫（RAII）：
 /// - 选号通过瞬间即锁定槽位与预占热度；
 /// - 若上游返回 200 OK（`mark_upstream_accepted`），则在流结束或客户端断连（Drop）时自动将槽位转入 `CoolingDown(实际结束时刻 + 计算延迟)`；
+/// - 若上游返回 503/529（`complete_on_upstream_overload`），请求已真实命中上游，保留槽位冷却、60s RPM 计数与预占热度，但不清零连续 503 计数；
 /// - 若未达上游即失败重试（`upstream_accepted == false`），Drop 或 `abort_and_rollback` 时自动退回预占热度并释放槽位。
 pub struct SlotLeaseGuard {
     pacer: std::sync::Arc<HumanizedPacer>,
@@ -1510,7 +1653,7 @@ impl SlotLeaseGuard {
         self.upstream_accepted = true;
     }
 
-    /// 响应正常完成：将槽位从 InFlight 转入 CoolingDown（持续闭合直至计算延迟走完）
+    /// 响应正常完成：将槽位从 InFlight 转入 CoolingDown（持续闭合直至计算延迟走完），并重置连续 503 计数
     pub fn complete(&mut self) {
         if !self.finished {
             self.upstream_accepted = true;
@@ -1521,6 +1664,20 @@ impl SlotLeaseGuard {
             crate::proxy::account_selector::record_warm_interaction(&self.account_id);
             self.pacer
                 .complete_lease(&self.account_id, self.lease_id, self.footprint);
+            self.finished = true;
+        }
+    }
+
+    /// 上游返回 503/529 过载：请求已经真实打到 Google 上游并消耗了 Stub 配额，
+    /// 必须保留槽位冷却、60s RPM 计数与预占热度（绝不可 abort_and_rollback），但不清零连续 503 计数。
+    pub fn complete_on_upstream_overload(&mut self) {
+        if !self.finished {
+            if self.reserved_inflight_tokens > 0 {
+                crate::proxy::account_selector::release_in_flight(&self.account_id, self.reserved_inflight_tokens);
+                self.reserved_inflight_tokens = 0;
+            }
+            self.pacer
+                .complete_lease_preserve_503(&self.account_id, self.lease_id, self.footprint);
             self.finished = true;
         }
     }
@@ -2771,5 +2928,76 @@ mod tests {
             matches!(sixth, Err(LeaseRejectReason::CooldownTooLong { wait_ms }) if wait_ms > 2000),
             "6th request within 60s must be rejected by RPM cap"
         );
+    }
+
+    #[test]
+    fn test_image_base64_body_uses_prompt_tokens_not_raw_bytes() {
+        // 含 2 张 Base64 截图（raw_body_len = 1.5MB > 400KB），但经 ContextManager 按官方 258 tokens/图
+        // 折算后总 prompt_tokens 仅为 12,000 tokens：必须判定为 Normal 且热度增量为 0.0，绝不能误判为 Oversized
+        let fp_with_images = RequestFootprint::new(12_000, 1_500_000);
+        assert_eq!(fp_with_images.tier, TrafficTier::Normal);
+        assert!(!fp_with_images.is_oversized());
+        assert_eq!(fp_with_images.heat_increment(), 0.0);
+
+        // 当 prompt_tokens == 0（未经过 ContextManager 估算）时，仍按 raw_body_len 兜底判定
+        let fp_raw_only = RequestFootprint::new(0, 1_500_000);
+        assert_eq!(fp_raw_only.tier, TrafficTier::Oversized);
+        assert!(fp_raw_only.is_oversized());
+        assert_eq!(fp_raw_only.heat_increment(), OVERSIZE_HEAT_INCREMENT);
+    }
+
+    #[test]
+    fn test_account_503_breaker_and_slot_preservation() {
+        let pacer = std::sync::Arc::new(HumanizedPacer::new_warmed());
+        let acc = "acc_503_test";
+        let fp_med = RequestFootprint::new(55_000, 230 * 1024);
+
+        // 1st 503: complete_on_upstream_overload preserves slot cooldown & heat, streak = 1
+        let (mut g1, _) = pacer.try_acquire_lease(acc, fp_med, 2, 0).unwrap();
+        g1.complete_on_upstream_overload();
+        let (streak1, trip1) = pacer.record_503_and_check_breaker(acc, false);
+        assert_eq!(streak1, 1);
+        assert_eq!(trip1, None);
+        // Slot 0 should be CoolingDown, not rolled back to Free!
+        assert!(matches!(
+            pacer.account_states.get(acc).unwrap().slots[0],
+            SlotPhase::CoolingDown { .. }
+        ));
+        assert!(pacer.get_account_heat(acc) >= MEDIUM_HEAT_INCREMENT + 0.3 - 0.05);
+
+        pacer.test_clear_slot_cooldowns(acc);
+
+        // 2nd 503: streak = 2, still not tripped
+        let (mut g2, _) = pacer.try_acquire_lease(acc, fp_med, 2, 0).unwrap();
+        g2.complete_on_upstream_overload();
+        let (streak2, trip2) = pacer.record_503_and_check_breaker(acc, false);
+        assert_eq!(streak2, 2);
+        assert_eq!(trip2, None);
+
+        pacer.test_clear_slot_cooldowns(acc);
+
+        // 3rd consecutive 503: trips breaker -> 150s cooldown, heat boosted >= 2.6, streak reset to 0
+        let (mut g3, _) = pacer.try_acquire_lease(acc, fp_med, 2, 0).unwrap();
+        g3.complete_on_upstream_overload();
+        let (streak3, trip3) = pacer.record_503_and_check_breaker(acc, false);
+        assert_eq!(streak3, 3);
+        assert_eq!(trip3, Some(150));
+        assert!(pacer.get_account_heat(acc) >= 2.55);
+
+        // Repeat trip within 15m (e.g. via PER_STUB immediate trip): escalates to 300s
+        let (streak4, trip4) = pacer.record_503_and_check_breaker(acc, true);
+        assert_eq!(streak4, 1);
+        assert_eq!(trip4, Some(300));
+
+        // Verify that a normal 200 OK complete() resets consecutive_503s to 0
+        let acc2 = "acc_503_reset";
+        let _ = pacer.record_503_and_check_breaker(acc2, false);
+        let (s, _) = pacer.record_503_and_check_breaker(acc2, false);
+        assert_eq!(s, 2);
+        let (mut g_ok, _) = pacer.try_acquire_lease(acc2, fp_med, 2, 0).unwrap();
+        g_ok.complete();
+        let (s_after_ok, trip_after_ok) = pacer.record_503_and_check_breaker(acc2, false);
+        assert_eq!(s_after_ok, 1);
+        assert_eq!(trip_after_ok, None);
     }
 }

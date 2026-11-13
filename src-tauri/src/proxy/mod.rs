@@ -62,7 +62,10 @@ pub use rate_limit::{
 pub use security::ProxySecurityConfig;
 pub use server::AxumServer;
 pub use signature_cache::SignatureCache;
-pub use toxic_cache::{calculate_fingerprint, check_toxic, record_toxic, ToxicEntry};
+pub use toxic_cache::{
+    calculate_fingerprint, check_request_503_cooldown, check_toxic, clear_request_503,
+    record_request_503, record_toxic, ToxicEntry,
+};
 #[allow(unused_imports)]
 pub use token_manager::{AcquiredToken, TokenAcquireError, TokenManager};
 

@@ -64,12 +64,13 @@ pub fn sanitize_error_for_log(error_text: &str) -> String {
 // Cloud Code v1internal endpoints (fallback order: Daily → Sandbox)
 // 剔除 100% 报 429 的 Prod 生产公共端点，切断导致账号误判限流的通道
 const V1_INTERNAL_BASE_URL_DAILY: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal";
+#[allow(dead_code)]
 const V1_INTERNAL_BASE_URL_SANDBOX: &str =
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal";
 
-pub const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 2] = [
-    V1_INTERNAL_BASE_URL_DAILY,   // 优先级 1: Daily (原生主力端点，毫秒级响应，稳定支持长流式与思维链)
-    V1_INTERNAL_BASE_URL_SANDBOX, // 优先级 2: Sandbox (沙箱备用，极速响应，无缝容灾)
+// 仅使用原生 Daily 端点；禁用 Sandbox 备用端点（实测 503 时回退到 sandbox.googleapis.com 会直接触发 403 TOS_VIOLATION）
+pub const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 1] = [
+    V1_INTERNAL_BASE_URL_DAILY, // 优先级 1: Daily (原生主力端点，毫秒级响应，稳定支持长流式与思维链)
 ];
 
 pub struct UpstreamClient {

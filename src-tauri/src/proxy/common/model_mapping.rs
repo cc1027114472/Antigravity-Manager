@@ -88,8 +88,16 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     m.insert("gemini-2.5-flash", "gemini-2.5-flash");
     m.insert("gemini-3-flash", "gemini-3-flash");
     m.insert("gemini-3-pro-image", "gemini-3-pro-image");
+    m.insert("gemini-3.8-flash-low", "gemini-3.8-flash-low");
+    m.insert("gemini-3.8-flash-medium", "gemini-3.8-flash-medium");
+    m.insert("gemini-3.8-flash-high", "gemini-3.8-flash-high");
     m.insert("gemini-3.8-flash", "gemini-3.8-flash-medium");
     m.insert("gemini-3.8", "gemini-3.8-flash-medium");
+    m.insert("gemini-4-argon-low", "gemini-4-argon-low");
+    m.insert("gemini-4-argon-medium", "gemini-4-argon-medium");
+    m.insert("gemini-4-argon-high", "gemini-4-argon-high");
+    m.insert("gemini-4-argon", "gemini-4-argon-medium");
+    m.insert("gemini-4", "gemini-4-argon-medium");
 
     // [New] Unified Virtual ID for Background Tasks (Title, Summary, etc.)
     // Allows users to override all background tasks via custom_mapping
@@ -343,8 +351,8 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
         return Some("gemini-3-pro-image".to_string());
     }
 
-    // 2. gemini-3-flash (包含所有 flash 变体)
-    if lower.contains("flash") {
+    // 2. gemini-3-flash (包含所有 flash 变体及 gemini-4-argon 变体)
+    if lower.contains("flash") || lower.contains("argon") {
         return Some("gemini-3-flash".to_string());
     }
 
