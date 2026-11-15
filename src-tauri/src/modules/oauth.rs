@@ -738,6 +738,10 @@ pub async fn get_user_info(
 
     let response = client
         .get(USERINFO_URL)
+        .header(
+            rquest::header::USER_AGENT,
+            crate::constants::NATIVE_USERINFO_USER_AGENT.as_str(),
+        )
         .bearer_auth(access_token)
         .send()
         .await

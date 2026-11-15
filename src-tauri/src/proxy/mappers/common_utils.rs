@@ -3,6 +3,41 @@
 
 use serde_json::{json, Value};
 
+/// Default Antigravity system identity prepended when no client Antigravity identity is provided.
+pub const FALLBACK_ANTIGRAVITY_IDENTITY: &str =
+    "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
+    You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
+    **Absolute paths only**\n\
+    **Proactiveness**";
+
+/// Search-specific system identity used when `requestType == "web_search"`.
+pub const FALLBACK_WEB_SEARCH_IDENTITY: &str =
+    "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar.";
+
+/// Select the default identity prompt for a given v1internal `requestType`.
+pub fn default_identity_for_request_type(request_type: &str) -> &'static str {
+    if request_type == "web_search" {
+        FALLBACK_WEB_SEARCH_IDENTITY
+    } else {
+        FALLBACK_ANTIGRAVITY_IDENTITY
+    }
+}
+
+/// Merge non-empty system instruction text chunks into a single string so
+/// `systemInstruction.parts` stays single-part (`len == 1`), matching official captures.
+pub fn merge_system_instruction_chunks<S: AsRef<str>>(chunks: &[S]) -> Option<String> {
+    let non_empty: Vec<&str> = chunks
+        .iter()
+        .map(|s| s.as_ref().trim_matches(|c| c == '\r' || c == '\n'))
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        None
+    } else {
+        Some(non_empty.join("\n\n"))
+    }
+}
+
 /// Base64 sentinel observed in official Antigravity captures (`"skip_thought_signature_validator"`).
 pub const SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str =
     "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=";
@@ -34,7 +69,7 @@ pub fn build_function_response_part(
     let mut fr = serde_json::Map::new();
     fr.insert("name".to_string(), json!(name));
     fr.insert("response".to_string(), json!({ key: response_val }));
-    if let Some(id_str) = id {
+    if let Some(id_str) = id.filter(|s| !s.is_empty()) {
         fr.insert("id".to_string(), json!(id_str));
     }
     json!({ "functionResponse": Value::Object(fr) })
@@ -1254,22 +1289,4 @@ pub fn parse_markdown_images_to_parts(text: &str) -> Vec<Value> {
     }
 
     parts
-}
-
-/// [FIX] Inject explicit tool mapping instructions for Gemini to read SKILL.md
-pub fn enhance_gemini_skills_prompt(text: &str) -> String {
-    let mut enhanced = text.to_string();
-    let warning_note = "\n\n**[CRITICAL INSTRUCTION FOR GEMINI - HOW TO READ SKILL.md]**\nYou do NOT have a direct `view_file` or `read_file` tool.\nTo \"open and read its SKILL.md completely\" as instructed above, you MUST use the `shell_command` tool.\nFor example, run the following command in PowerShell:\n`Get-Content -Raw -Path \"C:\\Users\\...\\SKILL.md\"`\nDo NOT guess other non-existent reading tools. You must use `shell_command`!\n\n";
-
-    // Inject before </skills_instructions> or </skills>
-    if enhanced.contains("</skills_instructions>") {
-        enhanced = enhanced.replace(
-            "</skills_instructions>",
-            &format!("{}</skills_instructions>", warning_note),
-        );
-    } else if enhanced.contains("</skills>") {
-        enhanced = enhanced.replace("</skills>", &format!("{}</skills>", warning_note));
-    }
-
-    enhanced
 }

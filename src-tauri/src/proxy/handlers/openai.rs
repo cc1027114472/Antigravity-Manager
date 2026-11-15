@@ -4218,10 +4218,13 @@ pub async fn handle_images_edits(
                 }
 
                 // 4.2 Construct Request Body (Need project_id)
+                let resolved_model = token_manager
+                    .resolve_dynamic_model_for_account(&account_id, &model_to_use)
+                    .await;
                 let gemini_body = json!({
                     "project": project_id,
                     "requestId": crate::proxy::common::session::generate_official_request_id(Some(account_id.as_str()), "image_edit", 1),
-                    "model": model_to_use,
+                    "model": resolved_model,
                     "userAgent": "antigravity",
                     "requestType": "image_gen",
                     "request": {

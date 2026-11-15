@@ -230,6 +230,10 @@ pub fn get_account_user_agent(account_id: Option<&str>) -> String {
 pub static NATIVE_OAUTH_USER_AGENT: LazyLock<String> =
     LazyLock::new(|| "Go-http-client/2.0".to_string());
 
+/// Native Google UserInfo User-Agent (matches official Go runtime userinfo HTTP/1.1 call)
+pub static NATIVE_USERINFO_USER_AGENT: LazyLock<String> =
+    LazyLock::new(|| "Go-http-client/1.1".to_string());
+
 /// Current resolved Antigravity version (e.g., "4.3.0")
 pub fn get_current_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()

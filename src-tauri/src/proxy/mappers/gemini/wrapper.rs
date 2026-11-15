@@ -38,9 +38,6 @@ pub fn wrap_request_v2(
     // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
     crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
 
-    // [FIX #1522] Inject dummy IDs for Claude models in Gemini protocol
-    let is_target_claude = final_model_name.to_lowercase().contains("claude");
-
     let compression_level = crate::proxy::config::get_global_compression_level();
 
     let mut compression_applied = false;
@@ -229,44 +226,87 @@ pub fn wrap_request_v2(
         .get_mut("contents")
         .and_then(|c| c.as_array_mut())
     {
-        for (i, content) in contents.iter_mut().enumerate() {
-            let mut name_counters: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
+        let mut pending_call_ids: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<String>,
+        > = std::collections::HashMap::new();
+        let mut global_name_counters: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
+        for content in contents.iter_mut() {
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 for part in parts {
                     if let Some(obj) = part.as_object_mut() {
-                        // 1. 处理 functionCall (Assistant 请求调用工具)
+                        // 1. 处理 functionCall (全模型统一确保携带非空 id，对齐抓包 100% 覆盖率)
                         if let Some(fc) = obj.get_mut("functionCall") {
-                            if fc.get("id").is_none() && is_target_claude {
-                                let name =
-                                    fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                                let count = name_counters.entry(name.to_string()).or_insert(0);
+                            let name = fc
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let existing_id = fc
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
+                            let call_id = if let Some(id) = existing_id {
+                                id
+                            } else {
+                                let count = global_name_counters.entry(name.clone()).or_insert(0);
                                 let call_id = format!("call_{}_{}", name, count);
                                 *count += 1;
 
-                                fc.as_object_mut()
-                                    .unwrap()
-                                    .insert("id".to_string(), json!(call_id));
-                                tracing::debug!("[Gemini-Wrap] Request stage: Injected missing call_id '{}' for Claude model", call_id);
-                            }
+                                if let Some(fc_obj) = fc.as_object_mut() {
+                                    fc_obj.insert("id".to_string(), json!(call_id));
+                                }
+                                tracing::debug!(
+                                    "[Gemini-Wrap] Request stage: Injected missing call_id '{}'",
+                                    call_id
+                                );
+                                call_id
+                            };
+                            pending_call_ids.entry(name).or_default().push_back(call_id);
                         }
 
-                        // 2. 处理 functionResponse (User 回复工具结果)
+                        // 2. 处理 functionResponse (匹配最近未响应的同名 functionCall id)
                         if let Some(fr) = obj.get_mut("functionResponse") {
-                            if fr.get("id").is_none() && is_target_claude {
-                                // 启发：如果客户端（如 OpenCode）在响应时没带 ID，说明它收到响应时就没 ID。
-                                // 我们在这里生成的 ID 必须与我们在 inject_ids_to_response 中注入响应的 ID 一致。
-                                let name =
-                                    fr.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                                let count = name_counters.entry(name.to_string()).or_insert(0);
-                                let call_id = format!("call_{}_{}", name, count);
-                                *count += 1;
+                            let name = fr
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let existing_id = fr
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
+                            if let Some(existing) = existing_id {
+                                if let Some(q) = pending_call_ids.get_mut(&name) {
+                                    if let Some(pos) = q.iter().position(|x| x == &existing) {
+                                        q.remove(pos);
+                                    }
+                                }
+                            } else {
+                                let matched_id = pending_call_ids
+                                    .get_mut(&name)
+                                    .and_then(|q| q.pop_front());
+                                let call_id = if let Some(id) = matched_id {
+                                    id
+                                } else {
+                                    let count =
+                                        global_name_counters.entry(name.clone()).or_insert(0);
+                                    let generated = format!("call_{}_{}", name, count);
+                                    *count += 1;
+                                    generated
+                                };
 
-                                fr.as_object_mut()
-                                    .unwrap()
-                                    .insert("id".to_string(), json!(call_id));
-                                tracing::debug!("[Gemini-Wrap] Request stage: Injected synced response_id '{}' for Claude model", call_id);
+                                if let Some(fr_obj) = fr.as_object_mut() {
+                                    fr_obj.insert("id".to_string(), json!(call_id));
+                                }
+                                tracing::debug!(
+                                    "[Gemini-Wrap] Request stage: Injected synced response_id '{}'",
+                                    call_id
+                                );
                             }
                         }
 
@@ -698,68 +738,88 @@ pub fn wrap_request_v2(
             }
         }
     } else {
-        // [NEW] 阶段 7.3: WebSearch 专属身份仿真 (对齐官方 main.go:738)
-        let antigravity_identity = if config.request_type == "web_search" {
-            "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar."
-        } else {
-            "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
-            You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
-            **Absolute paths only**\n\
-            **Proactiveness**"
-        };
+        let antigravity_identity =
+            crate::proxy::mappers::common_utils::default_identity_for_request_type(
+                &config.request_type,
+            );
+        let global_prompt_config = crate::proxy::config::get_global_system_prompt();
+        let global_prompt =
+            if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
+                Some(global_prompt_config.content)
+            } else {
+                None
+            };
 
-        // [HYBRID] 检查是否已有 systemInstruction
         if let Some(system_instruction) = inner_request.get_mut("systemInstruction") {
-            // [NEW] 补全 role: user
             if let Some(obj) = system_instruction.as_object_mut() {
                 if !obj.contains_key("role") {
                     obj.insert("role".to_string(), json!("user"));
                 }
             }
 
-            if let Some(parts) = system_instruction.get_mut("parts") {
-                if let Some(parts_array) = parts.as_array_mut() {
-                    // 检查第一个 part 是否已包含 Antigravity 身份
-                    let has_antigravity = parts_array
-                        .get(0)
-                        .and_then(|p| p.get("text"))
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.contains("You are Antigravity"))
-                        .unwrap_or(false);
+            if let Some(parts_array) = system_instruction
+                .get_mut("parts")
+                .and_then(|p| p.as_array_mut())
+            {
+                let has_antigravity = parts_array
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .any(|s| s.contains("You are Antigravity"));
 
-                    if !has_antigravity {
-                        // 在前面插入 Antigravity 身份
-                        parts_array.insert(0, json!({"text": antigravity_identity}));
-                    }
+                let mut text_chunks: Vec<String> = Vec::new();
+                let mut non_text_parts: Vec<Value> = Vec::new();
+                let mut existing_texts: Vec<String> = Vec::new();
 
-                    // [NEW] 注入全局系统提示词 (紧跟 Antigravity 身份之后，用户指令之前)
-                    let global_prompt_config = crate::proxy::config::get_global_system_prompt();
-                    if global_prompt_config.enabled
-                        && !global_prompt_config.content.trim().is_empty()
-                    {
-                        // 插入位置：Antigravity 身份之后 (index 1)
-                        let insert_pos = if has_antigravity { 1 } else { 1 };
-                        if insert_pos <= parts_array.len() {
-                            parts_array
-                                .insert(insert_pos, json!({"text": global_prompt_config.content}));
-                        } else {
-                            parts_array.push(json!({"text": global_prompt_config.content}));
+                for part in parts_array.iter() {
+                    if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                        if !t.trim().is_empty() {
+                            existing_texts.push(t.to_string());
                         }
+                    } else {
+                        non_text_parts.push(part.clone());
                     }
                 }
+
+                if has_antigravity {
+                    if let Some(first) = existing_texts.first() {
+                        text_chunks.push(first.clone());
+                    }
+                    if let Some(gp) = global_prompt {
+                        text_chunks.push(gp);
+                    }
+                    text_chunks.extend(existing_texts.into_iter().skip(1));
+                } else {
+                    text_chunks.push(antigravity_identity.to_string());
+                    if let Some(gp) = global_prompt {
+                        text_chunks.push(gp);
+                    }
+                    text_chunks.extend(existing_texts);
+                }
+
+                let mut new_parts = Vec::new();
+                if let Some(merged) =
+                    crate::proxy::mappers::common_utils::merge_system_instruction_chunks(
+                        &text_chunks,
+                    )
+                {
+                    new_parts.push(json!({ "text": merged }));
+                }
+                new_parts.extend(non_text_parts);
+                *parts_array = new_parts;
             }
         } else {
-            // 没有 systemInstruction,创建一个新的
-            let mut parts = vec![json!({"text": antigravity_identity})];
-            // [NEW] 注入全局系统提示词
-            let global_prompt_config = crate::proxy::config::get_global_system_prompt();
-            if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
-                parts.push(json!({"text": global_prompt_config.content}));
+            let mut text_chunks = vec![antigravity_identity.to_string()];
+            if let Some(gp) = global_prompt {
+                text_chunks.push(gp);
             }
-            inner_request["systemInstruction"] = json!({
-                "role": "user",
-                "parts": parts
-            });
+            if let Some(merged) =
+                crate::proxy::mappers::common_utils::merge_system_instruction_chunks(&text_chunks)
+            {
+                inner_request["systemInstruction"] = json!({
+                    "role": "user",
+                    "parts": [{ "text": merged }]
+                });
+            }
         }
     }
 
@@ -1421,18 +1481,11 @@ mod tests {
             .unwrap();
         let parts = sys.get("parts").unwrap().as_array().unwrap();
 
-        // Should have 2 parts: Antigravity + User
-        assert_eq!(parts.len(), 2);
-        assert!(parts[0]
-            .get("text")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .contains("You are Antigravity"));
-        assert_eq!(
-            parts[1].get("text").unwrap().as_str().unwrap(),
-            "User custom prompt"
-        );
+        // Single-part systemInstruction containing both Antigravity identity and user instruction
+        assert_eq!(parts.len(), 1);
+        let merged_text = parts[0].get("text").unwrap().as_str().unwrap();
+        assert!(merged_text.starts_with("You are Antigravity"));
+        assert!(merged_text.ends_with("User custom prompt"));
     }
 
     #[test]
@@ -1911,5 +1964,47 @@ mod tests {
             None,
             "Restored should NOT inject enabledCreditTypes"
         );
+    }
+
+    #[test]
+    fn test_gemini_native_backfills_paired_tool_ids() {
+        let body = json!({
+            "model": "gemini-3.8-flash-medium",
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "list_plugin_accounts",
+                                "args": {}
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": "list_plugin_accounts",
+                                "response": { "output": "[]" }
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let wrapped = wrap_request(&body, "test-proj", "gemini-3.8-flash-medium", None, None, None);
+        let contents = wrapped["request"]["contents"].as_array().unwrap();
+        let fc_id = contents[0]["parts"][0]["functionCall"]["id"]
+            .as_str()
+            .expect("functionCall must receive an id for Gemini models");
+        let fr_id = contents[1]["parts"][0]["functionResponse"]["id"]
+            .as_str()
+            .expect("functionResponse must receive a paired id for Gemini models");
+        assert!(!fc_id.is_empty());
+        assert_eq!(fc_id, fr_id);
     }
 }

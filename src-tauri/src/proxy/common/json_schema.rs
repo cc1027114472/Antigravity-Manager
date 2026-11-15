@@ -511,16 +511,8 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                     map.remove(&k);
                 }
 
-                // 6. [SAFETY] 处理空 Object
-                // [FIX] 移除 reason 字段注入逻辑
-                // 之前的实现会为空 Object 注入 reason 字段，导致 Gemini CLI 等工具报 "malformed function call"
-                // 因为模型会生成包含 reason 参数的调用，但工具定义中并没有这个参数
-                // 现在改为：空 Object 保持空的 properties，让 Gemini 模型自行决定是否需要参数
-                if map.get("type").and_then(|t| t.as_str()) == Some("object") {
-                    if !map.contains_key("properties") {
-                        map.insert("properties".to_string(), serde_json::json!({}));
-                    }
-                }
+                // 6. [SAFETY] Empty object schemas in official Antigravity captures emit `{"type": "OBJECT"}`
+                // without an empty `"properties": {}` map or empty `"required": []` array.
 
                 // 7. [SAFETY] Required 字段对齐
                 let valid_prop_keys: Option<std::collections::HashSet<String>> = map
@@ -537,6 +529,14 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                             req_arr.clear();
                         }
                     }
+                }
+                if map
+                    .get("required")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.is_empty())
+                    .unwrap_or(false)
+                {
+                    map.remove("required");
                 }
 
                 if !map.contains_key("type") {
@@ -587,6 +587,15 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
 
                     *type_val =
                         Value::String(selected_type.unwrap_or_else(|| fallback.to_string()));
+                }
+
+                if map
+                    .get("properties")
+                    .and_then(|v| v.as_object())
+                    .map(|o| o.is_empty())
+                    .unwrap_or(false)
+                {
+                    map.remove("properties");
                 }
 
                 if is_effectively_nullable {
@@ -1750,5 +1759,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Accepts: string | object"));
+    }
+
+    #[test]
+    fn test_official_empty_object_and_empty_required_alignment() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {},
+            "required": ["nonexistent"]
+        });
+
+        clean_official_tool_schema(&mut schema);
+
+        assert_eq!(schema, json!({ "type": "OBJECT" }));
     }
 }

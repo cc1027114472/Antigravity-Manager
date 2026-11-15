@@ -477,19 +477,6 @@ pub fn transform_openai_request(
                     });
                     parts.push(thought_part);
                 }
-            } else if actual_include_thinking && role == "model" {
-                // [FIX] 解决 Claude 4.6 Thinking 模型的强制性校验:
-                // "Expected thinking... but found tool_use/text"
-                // 如果是思维模型且缺失 reasoning_content, 则注入占位符
-                tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block for assistant message");
-                let thought_part = json!({
-                    "text": "Applying tool decisions and generating response...",
-                    "thought": true,
-                });
-
-                // [ALIGN] Official captures never attach thoughtSignature to synthetic text thought placeholders (`on_text_thought: 0`).
-
-                parts.push(thought_part);
             }
 
             // Handle content (multimodal or text)
@@ -689,7 +676,7 @@ pub fn transform_openai_request(
 
                 parts.push(crate::proxy::mappers::common_utils::build_function_response_part(
                     final_name,
-                    Some(msg.tool_call_id.as_deref().unwrap_or("")),
+                    msg.tool_call_id.as_deref().filter(|s| !s.is_empty()),
                     json!(content_val),
                     false,
                 ));
@@ -960,7 +947,7 @@ pub fn transform_openai_request(
         let raw_json = serde_json::to_string(original_tools).unwrap_or_default();
         if !raw_json.is_empty() {
             let key = crate::proxy::cache_manager::CacheManager::compute_tools_key(&format!(
-                "apply_patch_input_schema_v2:{raw_json}"
+                "official_tool_schema_v3:{raw_json}"
             ));
             let cm = crate::proxy::cache_manager::global_cache_manager();
             if let Some(cached_json) = cm.lookup_tools(&key) {
@@ -1045,11 +1032,15 @@ pub fn transform_openai_request(
                     if let Some(name) = obj.get("name") {
                         clean_obj.insert("name".to_string(), name.clone());
                     }
-                    if let Some(desc) = obj.get("description") {
-                        clean_obj.insert("description".to_string(), desc.clone());
-                    }
+                    let desc_val = match obj.get("description") {
+                        Some(Value::String(s)) => Value::String(s.clone()),
+                        _ => Value::String(String::new()),
+                    };
+                    clean_obj.insert("description".to_string(), desc_val);
                     if let Some(params) = obj.get("parameters") {
-                        clean_obj.insert("parameters".to_string(), params.clone());
+                        if !params.is_null() {
+                            clean_obj.insert("parameters".to_string(), params.clone());
+                        }
                     }
                     *obj = clean_obj;
                 }
@@ -1075,14 +1066,7 @@ pub fn transform_openai_request(
                     gemini_func.as_object_mut().unwrap().insert(
                         "parameters".to_string(),
                         json!({
-                            "type": "OBJECT",
-                            "properties": {
-                                "content": {
-                                    "type": "STRING",
-                                    "description": "The raw content or patch to be applied"
-                                }
-                            },
-                            "required": ["content"]
+                            "type": "OBJECT"
                         }),
                     );
                 }
@@ -1119,34 +1103,46 @@ pub fn transform_openai_request(
         inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
 
         if let Some(tool_choice) = &request.tool_choice {
-            let mode = if let Some(s) = tool_choice.as_str() {
-                match s {
-                    "none" => "NONE",
-                    "auto" => "AUTO",
-                    "required" => "ANY",
-                    _ => "ANY",
-                }
-            } else {
-                "ANY"
-            };
-            inner_request["toolConfig"] = json!({
-                "functionCallingConfig": { "mode": mode }
-            });
+            let is_auto = tool_choice
+                .as_str()
+                .map(|s| s.eq_ignore_ascii_case("auto"))
+                .unwrap_or_else(|| {
+                    tool_choice
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.eq_ignore_ascii_case("auto"))
+                        .unwrap_or(false)
+                });
+            if !is_auto {
+                let mode = if let Some(s) = tool_choice.as_str() {
+                    match s.to_ascii_lowercase().as_str() {
+                        "none" => "NONE",
+                        "required" | "any" => "ANY",
+                        _ => "ANY",
+                    }
+                } else if tool_choice
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.eq_ignore_ascii_case("none"))
+                    .unwrap_or(false)
+                {
+                    "NONE"
+                } else {
+                    "ANY"
+                };
+                inner_request["toolConfig"] = json!({
+                    "functionCallingConfig": { "mode": mode }
+                });
+            }
         }
     }
 
     // Fallback identity only. Codex system/developer prompts are preserved by
     // context_blocks and must not be overwritten or summarized by the proxy.
-    let fallback_antigravity_identity = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
-    You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
-    **Absolute paths only**\n\
-    **Proactiveness**";
-    let fallback_web_search_identity = "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar.";
-    let fallback_identity = if config.request_type == "web_search" {
-        fallback_web_search_identity
-    } else {
-        fallback_antigravity_identity
-    };
+    let fallback_identity =
+        crate::proxy::mappers::common_utils::default_identity_for_request_type(
+            &config.request_type,
+        );
 
     // Gemini/Antigravity-style section tags, with Codex prompt text preserved.
     // This is classification only: no summarization, no skill rewrites, no
@@ -1159,7 +1155,7 @@ pub fn transform_openai_request(
         } else {
             None
         };
-    let mut structured_system_instruction =
+    let structured_system_instruction =
         super::context_blocks::build_official_style_system_instruction(
             &system_instructions,
             Some(fallback_identity),
@@ -1167,12 +1163,6 @@ pub fn transform_openai_request(
             &config.request_type,
             mapped_model,
             &session_id,
-        );
-
-    // [FIX] Inject explicit tool mapping instructions for Gemini to read SKILL.md
-    structured_system_instruction =
-        crate::proxy::mappers::common_utils::enhance_gemini_skills_prompt(
-            &structured_system_instruction,
         );
 
     inner_request["systemInstruction"] = json!({
@@ -2045,5 +2035,76 @@ mod tests {
                 expected_max_cap
             );
         }
+    }
+
+    #[test]
+    fn test_alignment_openai_zero_arg_tool_auto_choice_no_skills_patch_no_fake_thought() {
+        let req = OpenAIRequest {
+            model: "gemini-3.8-flash-medium".to_string(),
+            messages: vec![
+                OpenAIMessage {
+                    role: "system".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String(
+                        "<skills_instructions><skills></skills></skills_instructions>".to_string(),
+                    )),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("List accounts".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("Done".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+            ],
+            tools: Some(vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "list_plugin_accounts"
+                }
+            })]),
+            tool_choice: Some(json!("auto")),
+            ..Default::default()
+        };
+
+        let (res, _, _, _) =
+            transform_openai_request(&req, "proj", "gemini-3.8-flash-medium", None);
+
+        // 1. tool_choice: "auto" must NOT emit toolConfig
+        assert!(res["request"].get("toolConfig").is_none());
+
+        // 2. Zero-arg tool must emit clean {"type": "OBJECT"} without fake "content" field or null description
+        let decl = &res["request"]["tools"][0]["functionDeclarations"][0];
+        assert_eq!(decl["description"], "");
+        assert_eq!(decl["parameters"], json!({ "type": "OBJECT" }));
+
+        // 3. systemInstruction must not inject hardcoded SKILL.md PowerShell instruction
+        let si_parts = res["request"]["systemInstruction"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(si_parts.len(), 1);
+        let si_text = si_parts[0]["text"].as_str().unwrap();
+        assert!(!si_text.contains("CRITICAL INSTRUCTION FOR GEMINI"));
+
+        // 4. Multi-turn modern thinking model without reasoning_content must not inject synthetic placeholder thought
+        let assistant_parts = res["request"]["contents"][1]["parts"].as_array().unwrap();
+        assert!(!assistant_parts
+            .iter()
+            .any(|p| p.get("thought").and_then(|v| v.as_bool()) == Some(true)));
     }
 }

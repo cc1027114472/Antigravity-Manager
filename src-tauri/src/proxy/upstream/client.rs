@@ -801,7 +801,7 @@ impl UpstreamClient {
             .call_v1_internal(
                 "fetchAvailableModels",
                 access_token,
-                serde_json::json!({}),
+                serde_json::json!({ "project": "aicode-consumers" }),
                 None,
                 account_id,
             )

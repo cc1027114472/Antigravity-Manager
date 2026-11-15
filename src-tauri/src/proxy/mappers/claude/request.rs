@@ -423,20 +423,6 @@ pub fn transform_claude_request_in(
     // 用于存储 tool_use id -> name 映射
     let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
 
-    // 检测是否有 mcp__ 开头的工具
-    let has_mcp_tools = claude_req
-        .tools
-        .as_ref()
-        .map(|tools| {
-            tools.iter().any(|t| {
-                t.name
-                    .as_deref()
-                    .map(|n| n.starts_with("mcp__"))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-
     // [New] 预先构建工具名称到原始 Schema 的映射，用于后续参数类型修正
     let mut tool_name_to_schema = HashMap::new();
     if let Some(tools) = &claude_req.tools {
@@ -446,14 +432,6 @@ pub fn transform_claude_request_in(
             }
         }
     }
-
-    // 1. System Instruction (注入动态身份防护 & MCP XML 协议)
-    let system_instruction = build_system_instruction(
-        &claude_req.system,
-        &claude_req.model,
-        has_mcp_tools,
-        &extra_system_messages,
-    );
 
     //  Map model name (Use standard mapping)
     let mapped_model =
@@ -475,6 +453,14 @@ pub fn transform_claude_request_in(
         claude_req.quality.as_deref(), // [NEW] Pass quality parameter
         None,                          // [NEW] image_size
         None,                          // body
+    );
+
+    // 1. System Instruction (单 part 合并 + web_search 身份对齐)
+    let system_instruction = build_system_instruction(
+        &claude_req.system,
+        &claude_req.model,
+        has_web_search_tool || config.request_type == "web_search",
+        &extra_system_messages,
     );
 
     // [CRITICAL FIX] Disable dummy thought injection for Vertex AI
@@ -858,20 +844,21 @@ fn has_valid_signature_for_function_calls(
     false
 }
 
-/// 构建 System Instruction (支持动态身份映射与 Prompt 隔离)
+/// 构建 System Instruction (单 part 对齐官方抓包格式 + web_search 身份映射)
 fn build_system_instruction(
     system: &Option<SystemPrompt>,
     _model_name: &str,
-    has_mcp_tools: bool,
+    is_web_search: bool,
     extra_system_messages: &[String],
 ) -> Option<Value> {
-    let mut parts = Vec::new();
+    let mut chunks: Vec<String> = Vec::new();
 
-    // [NEW] Antigravity 身份指令 (原始简化版)
-    let antigravity_identity = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
-    You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
-    **Absolute paths only**\n\
-    **Proactiveness**";
+    let antigravity_identity =
+        crate::proxy::mappers::common_utils::default_identity_for_request_type(if is_web_search {
+            "web_search"
+        } else {
+            "agent"
+        });
 
     // [HYBRID] 检查用户是否已提供 Antigravity 身份
     let mut user_has_antigravity = false;
@@ -895,13 +882,13 @@ fn build_system_instruction(
 
     // 如果用户没有提供 Antigravity 身份,则注入
     if !user_has_antigravity {
-        parts.push(json!({"text": antigravity_identity}));
+        chunks.push(antigravity_identity.to_string());
     }
 
     // [NEW] 注入全局系统提示词 (紧跟 Antigravity 身份之后)
     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
     if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
-        parts.push(json!({"text": global_prompt_config.content}));
+        chunks.push(global_prompt_config.content);
     }
 
     // 添加用户的系统提示词
@@ -910,13 +897,13 @@ fn build_system_instruction(
             SystemPrompt::String(text) => {
                 // [MODIFIED] No longer filter "You are an interactive CLI tool"
                 // We pass everything through to ensure Flash/Lite models get full instructions
-                parts.push(json!({"text": text}));
+                chunks.push(text.clone());
             }
             SystemPrompt::Array(blocks) => {
                 for block in blocks {
                     if block.block_type == "text" {
                         // [MODIFIED] No longer filter "You are an interactive CLI tool"
-                        parts.push(json!({"text": block.text}));
+                        chunks.push(block.text.clone());
                     }
                 }
             }
@@ -926,29 +913,16 @@ fn build_system_instruction(
     // 添加提取出来的 role == "system" 消息
     for extra_text in extra_system_messages {
         if !extra_text.trim().is_empty() {
-            parts.push(json!({"text": format!("\n{}", extra_text)}));
+            chunks.push(extra_text.clone());
         }
     }
 
-    // [NEW] MCP XML Bridge: 如果存在 mcp__ 开头的工具，注入专用的调用协议
-    // 这能有效规避部分 MCP 链路在标准的 tool_use 协议下解析不稳的问题
-    if has_mcp_tools {
-        let mcp_xml_prompt = "\n\
-        ==== MCP XML 工具调用协议 (Workaround) ====\n\
-        当你需要调用名称以 `mcp__` 开头的 MCP 工具时：\n\
-        1) 优先尝试 XML 格式调用：输出 `<mcp__tool_name>{\"arg\":\"value\"}</mcp__tool_name>`。\n\
-        2) 必须直接输出 XML 块，无需 markdown 包装，内容为 JSON 格式的入参。\n\
-        3) 这种方式具有更高的连通性和容错性，适用于大型结果返回场景。\n\
-        ===========================================";
-        parts.push(json!({"text": mcp_xml_prompt}));
-    }
-
-    // [REMOVED] Official Antigravity client never appends "--- [SYSTEM_PROMPT_END] ---"
-    let _ = user_has_antigravity;
+    let merged_text =
+        crate::proxy::mappers::common_utils::merge_system_instruction_chunks(&chunks)?;
 
     Some(json!({
         "role": "user",
-        "parts": parts
+        "parts": [{ "text": merged_text }]
     }))
 }
 
@@ -1782,15 +1756,16 @@ fn build_tools(
                 }
 
                 // 3. Client tools require input_schema
-                let mut input_schema = tool.input_schema.clone().unwrap_or(json!({
-                    "type": "object",
-                    "properties": {}
-                }));
+                let mut input_schema = tool.input_schema.clone().unwrap_or_else(|| {
+                    json!({
+                        "type": "object"
+                    })
+                });
                 crate::proxy::common::json_schema::clean_official_tool_schema(&mut input_schema);
 
                 function_declarations.push(json!({
                     "name": name,
-                    "description": tool.description,
+                    "description": tool.description.as_deref().unwrap_or(""),
                     "parameters": input_schema
                 }));
             }
@@ -1945,11 +1920,8 @@ fn build_generation_config(
                 .remove("thinkingBudget");
 
             if config.get("maxOutputTokens").is_none() {
-                let default_max = if is_modern && lower_mapped.contains("claude") {
-                    128000
-                } else {
-                    64000
-                };
+                let default_max =
+                    crate::proxy::model_specs::get_max_output_tokens(mapped_model, token);
                 config["maxOutputTokens"] = json!(default_max);
             }
         } else if should_use_adaptive {
@@ -1959,11 +1931,8 @@ fn build_generation_config(
             );
             thinking_config["thinkingBudget"] = json!(24576);
             if config.get("maxOutputTokens").is_none() {
-                let default_max = if is_modern && lower_mapped.contains("claude") {
-                    128000
-                } else {
-                    64000
-                };
+                let default_max =
+                    crate::proxy::model_specs::get_max_output_tokens(mapped_model, token);
                 config["maxOutputTokens"] = json!(default_max);
             }
         } else {
@@ -2049,10 +2018,9 @@ fn build_generation_config(
         } else if is_adaptive_effective || thinking_config.get("thinkingLevel").is_some() {
             // [FIX] Adaptive / thinkingLevel mode (no budget set in thinkingConfig), apply default maxOutputTokens
             if final_max_tokens.is_none() {
-                let is_claude_5 = model_lower.contains("claude-sonnet-5")
-                    || model_lower.contains("claude-opus-5")
-                    || model_lower.contains("claude-5");
-                final_max_tokens = Some(if is_claude_5 { 128000 } else { 64000 });
+                final_max_tokens = Some(
+                    crate::proxy::model_specs::get_max_output_tokens(mapped_model, token) as i64,
+                );
             }
         }
     } else {
@@ -3328,13 +3296,13 @@ mod tests {
         crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig::default());
 
         let cases = [
-            ("gemini-3.8-flash-medium", "MEDIUM"),
-            ("gemini-4-argon-high", "HIGH"),
-            ("claude-sonnet-5-5-medium", "MEDIUM"),
-            ("claude-opus-5-5-low", "LOW"),
+            ("gemini-3.8-flash-medium", "MEDIUM", 65536),
+            ("gemini-4-argon-high", "HIGH", 65536),
+            ("claude-sonnet-5-5-medium", "MEDIUM", 128000),
+            ("claude-opus-5-5-low", "LOW", 128000),
         ];
 
-        for (model_id, expected_level) in cases {
+        for (model_id, expected_level, expected_max_tokens) in cases {
             let req = ClaudeRequest {
                 model: model_id.to_string(),
                 messages: vec![Message {
@@ -3366,6 +3334,11 @@ mod tests {
             assert_eq!(segments[0], "agent");
 
             let gen_config = &result["request"]["generationConfig"];
+            assert_eq!(
+                gen_config["maxOutputTokens"], expected_max_tokens,
+                "[{}] unexpected maxOutputTokens",
+                model_id
+            );
             let tc = &gen_config["thinkingConfig"];
             assert_eq!(tc["includeThoughts"], true, "[{}]", model_id);
             assert_eq!(tc["thinkingLevel"], expected_level, "[{}]", model_id);
@@ -3375,5 +3348,50 @@ mod tests {
                 model_id
             );
         }
+    }
+
+    #[test]
+    fn test_alignment_claude_single_part_si_no_mcp_xml_and_clean_zero_arg_tool() {
+        let req = ClaudeRequest {
+            model: "gemini-4-argon-high".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("List accounts".to_string()),
+            }],
+            system: Some(SystemPrompt::String("Custom instructions".to_string())),
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__plugin_accounts".to_string()),
+                description: None,
+                input_schema: Some(json!({ "type": "object" })),
+            }]),
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        let result =
+            transform_claude_request_in(&req, "test-proj", false, None, "test_session", None)
+                .unwrap();
+
+        let si_parts = result["request"]["systemInstruction"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(si_parts.len(), 1);
+        let si_text = si_parts[0]["text"].as_str().unwrap();
+        assert!(si_text.contains("You are Antigravity"));
+        assert!(si_text.contains("Custom instructions"));
+        assert!(!si_text.contains("MCP XML"));
+
+        let decl = &result["request"]["tools"][0]["functionDeclarations"][0];
+        assert_eq!(decl["description"], "");
+        assert_eq!(decl["parameters"], json!({ "type": "OBJECT" }));
     }
 }
