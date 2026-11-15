@@ -55,6 +55,19 @@ static RE_WAF_TRIGGER_HEADERS: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
+/// 系统提示词全范围 WAF 高危短语脱敏规则（System 轨：不受头部 4 句扫描窗口限制，仅作用于 `systemInstruction`，绝不触碰用户提问）。
+/// 实测 Google 上游已将 DeepSeek Harness / Mowan-Agent 等客户端末尾的系统环境指纹句纳入 WAF 精确匹配（返回虚假 429），
+/// 此处按表将已知触发句改写为语义等价、零重合词的中性表述，既保留原始语义约束又规避 WAF 误杀。
+static SYSTEM_WAF_PHRASE_RULES: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
+    vec![(
+        Regex::new(
+            r"(?i)\bthe\s+browser\s+provides\s+no\s+implicit\s+dom,\s*route,\s*or\s+screenshot\s+context(\.?)",
+        )
+        .unwrap(),
+        "Frontend runtime state and page snapshots are not automatically attached to messages$1",
+    )]
+});
+
 /// 连续多余空行收拢正则（剥离元数据后若产生 3 个及以上连续换行，收拢为 2 个换行以保持自然段落）
 static RE_MULTI_NEWLINE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
 
@@ -181,6 +194,29 @@ impl PromptSanitizer {
     /// 3. 仅剥离触发 WAF 的客户端计费伪 Header，绝不修改任何会话 ID、XML 标签或 `=== ... ===` 分隔符；
     /// 4. 完整恢复受保护的代码块；
     /// 5. 规范化换行，保留所有多行正文排版。
+    /// 通用代码块隔离包装：提取多行围栏/行内代码块，在回调函数结束后单趟无递归还原。
+    fn with_code_blocks_protected(text: &str, transform: impl FnOnce(&str) -> String) -> String {
+        let mut placeholders: Vec<String> = Vec::new();
+        let protected = RE_CODE_BLOCK.replace_all(text, |caps: &regex::Captures| {
+            let idx = placeholders.len();
+            placeholders.push(caps[0].to_string());
+            format!("__PROMPT_SANITIZER_CODE_BLOCK_{}__", idx)
+        });
+
+        let transformed = transform(&protected);
+
+        RE_CODE_BLOCK_PLACEHOLDER
+            .replace_all(&transformed, |caps: &regex::Captures| {
+                if let Ok(idx) = caps[1].parse::<usize>() {
+                    if let Some(code) = placeholders.get(idx) {
+                        return code.clone();
+                    }
+                }
+                caps[0].to_string()
+            })
+            .into_owned()
+    }
+
     pub fn clean_text(text: &str) -> String {
         // 快速前置检查：若文本不包含高危特征，直接原样返回，零开销
         let lower = text.to_lowercase();
@@ -199,31 +235,36 @@ impl PromptSanitizer {
             return text.to_string();
         }
 
-        // 步骤 1：保护代码块
-        let mut placeholders: Vec<String> = Vec::new();
-        let protected_text = RE_CODE_BLOCK.replace_all(text, |caps: &regex::Captures| {
-            let idx = placeholders.len();
-            placeholders.push(caps[0].to_string());
-            format!("__PROMPT_SANITIZER_CODE_BLOCK_{}__", idx)
+        // 保护代码块并对非代码区域剥离触发 WAF 的高危伪 Header
+        let restored = Self::with_code_blocks_protected(text, |protected_text| {
+            RE_WAF_TRIGGER_HEADERS
+                .replace_all(protected_text, "")
+                .into_owned()
         });
 
-        // 步骤 2：对非代码区域仅剥离触发 WAF 的高危伪 Header
-        let pass1 = RE_WAF_TRIGGER_HEADERS.replace_all(&protected_text, "");
-
-        // 步骤 3：单趟无递归还原受保护的代码块
-        let restored = RE_CODE_BLOCK_PLACEHOLDER.replace_all(&pass1, |caps: &regex::Captures| {
-            if let Ok(idx) = caps[1].parse::<usize>() {
-                if let Some(code) = placeholders.get(idx) {
-                    return code.clone();
-                }
-            }
-            caps[0].to_string()
-        });
-
-        // 步骤 4：连续空行收拢（若因删除单行产生多余换行，保持正常双换行段落结构）
+        // 连续空行收拢（若因删除单行产生多余换行，保持正常双换行段落结构）
         let normalized = RE_MULTI_NEWLINE.replace_all(&restored, "\n\n");
 
         normalized.trim().to_string()
+    }
+
+    /// System 轨全范围高危 WAF 指纹短语脱敏（不受头部 4 句扫描窗口限制）。
+    pub fn sanitize_system_waf_phrases(text: &str) -> String {
+        let lower = text.to_lowercase();
+        let has_suspect = lower.contains("implicit") && lower.contains("screenshot");
+        if !has_suspect {
+            return text.to_string();
+        }
+
+        Self::with_code_blocks_protected(text, |protected| {
+            let mut current = protected.to_string();
+            for (re, replacement) in SYSTEM_WAF_PHRASE_RULES.iter() {
+                if re.is_match(&current) {
+                    current = re.replace_all(&current, *replacement).into_owned();
+                }
+            }
+            current
+        })
     }
 
     /// 计算系统提示词的**头部窗口**：返回从开头起、跨越前 `IDENTITY_SCAN_MAX_SENTENCES` 句的切片。
@@ -284,20 +325,10 @@ impl PromptSanitizer {
             return text.to_string();
         }
 
-        // 步骤 1：保护头部窗口内的代码块，使其免于身份归一的任何影响
-        let mut placeholders: Vec<String> = Vec::new();
-        let protected_head = RE_CODE_BLOCK.replace_all(head, |caps: &regex::Captures| {
-            let idx = placeholders.len();
-            placeholders.push(caps[0].to_string());
-            format!("__PROMPT_SANITIZER_CODE_BLOCK_{}__", idx)
-        });
-
-        // 步骤 2：归一化身份声明句（首句替换为 OFFICIAL_ANTIGRAVITY_IDENTITY，后续冗余身份声明句去重剥离）
-        let mut emitted_identity = false;
-        // 2.1 广谱归属声明归一化
-        let pass1 = RE_IDENTITY_DECLARATION.replace_all(
-            &protected_head,
-            |caps: &regex::Captures| {
+        // 保护头部窗口内的代码块，并在非代码区执行身份归属声明归一化与去重
+        let mut restored = Self::with_code_blocks_protected(head, |protected_head| {
+            let mut emitted_identity = false;
+            let mut replace_identity = |caps: &regex::Captures| {
                 let punct = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 if !emitted_identity {
                     emitted_identity = true;
@@ -308,36 +339,12 @@ impl PromptSanitizer {
                 } else {
                     String::new()
                 }
-            },
-        );
+            };
 
-        // 2.2 知名特定客户端开场白归一化（如 Claude Code CLI 开场白）
-        let pass2 = RE_KNOWN_CLIENT_DECLARATION.replace_all(&pass1, |caps: &regex::Captures| {
-            let punct = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            if !emitted_identity {
-                emitted_identity = true;
-                match punct {
-                    "," | "，" => format!("{},", OFFICIAL_ANTIGRAVITY_IDENTITY),
-                    _ => OFFICIAL_ANTIGRAVITY_IDENTITY.to_string(),
-                }
-            } else {
-                String::new()
-            }
+            let pass1 = RE_IDENTITY_DECLARATION.replace_all(protected_head, &mut replace_identity);
+            let pass2 = RE_KNOWN_CLIENT_DECLARATION.replace_all(&pass1, &mut replace_identity);
+            RE_MULTI_NEWLINE.replace_all(&pass2, "\n\n").into_owned()
         });
-
-        let normalized = RE_MULTI_NEWLINE.replace_all(&pass2, "\n\n").into_owned();
-
-        // 步骤 3：单趟无递归还原受保护的代码块，并拼回头部窗口之后的原文
-        let mut restored = RE_CODE_BLOCK_PLACEHOLDER
-            .replace_all(&normalized, |caps: &regex::Captures| {
-                if let Ok(idx) = caps[1].parse::<usize>() {
-                    if let Some(code) = placeholders.get(idx) {
-                        return code.clone();
-                    }
-                }
-                caps[0].to_string()
-            })
-            .into_owned();
 
         restored.push_str(&text[head.len()..]);
         RE_MULTI_NEWLINE.replace_all(&restored, "\n\n").into_owned()
@@ -423,9 +430,11 @@ impl PromptSanitizer {
                     };
                     // Header 轨（全文本生效）：风控伪 Header 与高危客户端指纹声明
                     let cleaned = Self::clean_text(mapped);
-                    // System 轨（仅系统提示词）：剥离管道分界标记 / 官方身份 + 身份归属声明归一化
+                    // System 轨（仅系统提示词）：剥离管道分界标记 / 官方身份 + 身份归属声明归一化 + 全范围 WAF 指纹短语脱敏
                     let cleaned = if system_scope {
-                        Self::normalize_system_identity(&Self::strip_pipeline_markers(&cleaned))
+                        let system_norm =
+                            Self::normalize_system_identity(&Self::strip_pipeline_markers(&cleaned));
+                        Self::sanitize_system_waf_phrases(&system_norm)
                     } else {
                         cleaned
                     };
@@ -1460,5 +1469,69 @@ mod tests {
             1,
             "OFFICIAL_ANTIGRAVITY_IDENTITY must appear exactly once"
         );
+    }
+
+    #[test]
+    fn test_sanitize_system_waf_phrases_deepseek_harness_tail() {
+        // 实测 DeepSeek Harness / Mowan-Agent Web GUI 段落处于 systemInstruction 末尾（远超前 4 句窗口），
+        // 且原句在经过开头身份归一化后仍会触发 Google WAF 假性 429；必须全范围脱敏，同时保留周围指令与代码块。
+        let body = concat!(
+            "You are an AI agent powered by DeepSeek Harness.\n\n",
+            "Rule 1. Follow instructions.\n",
+            "Rule 2. Keep output accurate.\n",
+            "Rule 3. Verify files before editing.\n",
+            "Rule 4. Use structured summaries.\n\n",
+            "When the user refers to \"this page\" without naming another target, they mean this GUI. ",
+            "The browser provides no implicit DOM, route, or screenshot context. ",
+            "The client-plugin HMR receiver is active."
+        );
+        let mut payload = json!({
+            "request": {
+                "systemInstruction": { "role": "user", "parts": [{ "text": body }] },
+                "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }]
+            }
+        });
+
+        let cleaned_count = PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        assert_eq!(cleaned_count, 1);
+
+        let sanitized = payload["request"]["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(sanitized.starts_with(OFFICIAL_ANTIGRAVITY_IDENTITY));
+        assert!(!sanitized
+            .to_lowercase()
+            .contains("provides no implicit dom, route, or screenshot context"));
+        assert!(sanitized.contains(
+            "When the user refers to \"this page\" without naming another target, they mean this GUI. \
+            Frontend runtime state and page snapshots are not automatically attached to messages. \
+            The client-plugin HMR receiver is active."
+        ));
+
+        // 大小写变体与换行折行变体同样命中脱敏
+        let wrapped = "the browser provides\nno implicit DOM, route, or screenshot context";
+        assert_eq!(
+            PromptSanitizer::sanitize_system_waf_phrases(wrapped),
+            "Frontend runtime state and page snapshots are not automatically attached to messages"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_gemini_payload_system_waf_phrase_preserves_user_and_code() {
+        let phrase = "The browser provides no implicit DOM, route, or screenshot context.";
+        let sys_code = format!("Inspect example:\n```\n{}\n```", phrase);
+        let mut payload = json!({
+            "request": {
+                "systemInstruction": { "role": "user", "parts": [{ "text": sys_code }] },
+                "contents": [{ "role": "user", "parts": [{ "text": format!("Why does `{}` return 429?", phrase) }] }]
+            }
+        });
+
+        let cleaned_count = PromptSanitizer::sanitize_gemini_payload(&mut payload);
+        assert_eq!(cleaned_count, 0);
+        assert!(payload["request"]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(phrase));
     }
 }
