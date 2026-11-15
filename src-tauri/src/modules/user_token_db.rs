@@ -704,6 +704,7 @@ mod tests {
 
     #[test]
     fn test_create_and_query_token() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db(); // Ensure DB is initialized
 
         // Use a random username to avoid collisions in existing DB runs during dev
@@ -730,6 +731,7 @@ mod tests {
 
     #[test]
     fn test_never_expire_token_validation() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         let username = format!("NeverExpireUser_{}", Uuid::new_v4());
         let token_res = create_token(

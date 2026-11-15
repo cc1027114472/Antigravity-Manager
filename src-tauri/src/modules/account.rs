@@ -14,13 +14,58 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
 #[cfg(test)]
+pub(crate) static TEST_DATA_DIR_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+#[cfg(test)]
+pub(crate) struct ScopedTestDataDir {
+    temp_dir: Option<tempfile::TempDir>,
+    path: PathBuf,
+    prev_env: Option<std::ffi::OsString>,
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+impl ScopedTestDataDir {
+    pub(crate) fn new() -> Self {
+        let guard = TEST_DATA_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_env = std::env::var_os("ABV_DATA_DIR");
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp data dir");
+        let path = temp_dir.path().to_path_buf();
+        std::env::set_var("ABV_DATA_DIR", &path);
+        crate::modules::security_db::reset_connection_for_test();
+        Self {
+            temp_dir: Some(temp_dir),
+            path,
+            prev_env,
+            _guard: Some(guard),
+        }
+    }
+
+    pub(crate) fn path(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedTestDataDir {
+    fn drop(&mut self) {
+        // 先清理缓存的 SQLite 连接句柄，再删除临时目录，防止 Windows 文件锁定
+        crate::modules::security_db::reset_connection_for_test();
+        match self.prev_env.take() {
+            Some(prev) => std::env::set_var("ABV_DATA_DIR", prev),
+            None => std::env::remove_var("ABV_DATA_DIR"),
+        }
+        drop(self.temp_dir.take());
+        drop(self._guard.take());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::Mutex as StdMutex;
-
-    // Global mutex to prevent concurrent test execution
-    static TEST_MUTEX: Lazy<StdMutex<()>> = Lazy::new(|| StdMutex::new(()));
 
     struct TestDataDir {
         path: PathBuf,
@@ -85,7 +130,9 @@ mod tests {
 
     #[test]
     fn test_load_account_index_with_bom_prefix() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = TEST_DATA_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // UTF-8 BOM followed by valid JSON
@@ -112,7 +159,9 @@ mod tests {
 
     #[test]
     fn test_load_account_index_with_nul_prefix() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = TEST_DATA_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // NUL byte prefix followed by valid JSON
@@ -139,7 +188,9 @@ mod tests {
 
     #[test]
     fn test_load_account_index_with_garbage_content() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = TEST_DATA_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Non-JSON garbage content - should trigger recovery
@@ -163,7 +214,9 @@ mod tests {
 
     #[test]
     fn test_load_account_index_with_empty_file() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = TEST_DATA_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Empty file
@@ -179,7 +232,9 @@ mod tests {
 
     #[test]
     fn test_load_account_index_with_whitespace_only() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = TEST_DATA_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Whitespace-only file
@@ -195,7 +250,9 @@ mod tests {
 
     #[test]
     fn test_missing_index_with_existing_accounts() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = TEST_DATA_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Create accounts directory with account files but NO accounts.json index
@@ -242,7 +299,9 @@ mod tests {
 
     #[test]
     fn test_save_account_index_roundtrip() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = TEST_DATA_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Build an AccountIndex with 2 accounts
@@ -319,9 +378,7 @@ mod tests {
 
     #[test]
     fn test_set_current_account_id_with_target() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        let dir = TestDataDir::new();
-        std::env::set_var("ABV_DATA_DIR", dir.path());
+        let dir = ScopedTestDataDir::new();
 
         // Create a dummy account index with some accounts
         let now = chrono::Utc::now().timestamp();
@@ -357,14 +414,13 @@ mod tests {
         let index = load_account_index_in_dir(dir.path()).unwrap();
         assert_eq!(index.current_account_id, Some("acc-1".to_string()));
         assert_eq!(index.current_target_ide, None);
-
-        // Clean up environment variable
-        std::env::remove_var("ABV_DATA_DIR");
     }
 
     #[test]
     fn test_backup_created_on_parse_failure() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = TEST_DATA_DIR_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Create a valid account file
@@ -415,9 +471,7 @@ mod tests {
 
     #[test]
     fn test_persist_pending_cu() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-        let dir = TestDataDir::new();
-        std::env::set_var("ABV_DATA_DIR", dir.path());
+        let dir = ScopedTestDataDir::new();
 
         // Create a valid account
         create_account_file(dir.path(), "test-pending-acc", "pending@example.com");
@@ -458,8 +512,6 @@ mod tests {
         let quota2 = account2.estimated_quotas.get("claude").expect("quota entry 2");
         assert_eq!(quota2.pending_cu_5h, None);
         assert_eq!(quota2.pending_cu_weekly, None);
-
-        std::env::remove_var("ABV_DATA_DIR");
     }
 }
 

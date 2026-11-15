@@ -2795,7 +2795,7 @@ mod tests {
     fn test_sync_uses_frontend_display_name_for_unknown_model() {
         let config = serde_json::json!({});
         let models_to_sync = [
-            minput_named("gemini-3.5-flash-low", "Gemini 3.5 Flash (High)"),
+            minput_named("gemini-3.5-flash-custom", "Gemini 3.5 Flash (High)"),
             minput_named("gemini-3-flash-agent", "Gemini 3 Flash Agent"),
         ];
 
@@ -2819,7 +2819,7 @@ mod tests {
         // The display name must be used as-is, preserving parentheses/variant info.
         assert_eq!(
             models
-                .get("gemini-3.5-flash-low")
+                .get("gemini-3.5-flash-custom")
                 .unwrap()
                 .get("name")
                 .unwrap(),
@@ -2837,7 +2837,7 @@ mod tests {
         // And because these are gemini-3.x ids, they should also get series defaults.
         assert!(
             models
-                .get("gemini-3.5-flash-low")
+                .get("gemini-3.5-flash-custom")
                 .unwrap()
                 .get("limit")
                 .is_some(),

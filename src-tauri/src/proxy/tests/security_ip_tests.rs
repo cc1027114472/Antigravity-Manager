@@ -50,6 +50,7 @@ mod security_db_tests {
 
     #[test]
     fn test_db_initialization() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         // 验证数据库初始化不会 panic
         let result = init_db();
         assert!(
@@ -61,6 +62,7 @@ mod security_db_tests {
 
     #[test]
     fn test_db_multiple_initializations() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         // 验证多次初始化不会出错 (幂等性)
         for _ in 0..3 {
             let result = init_db();
@@ -77,6 +79,7 @@ mod security_db_tests {
 
     #[test]
     fn test_blacklist_add_and_check() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -106,6 +109,7 @@ mod security_db_tests {
 
     #[test]
     fn test_blacklist_remove() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -127,6 +131,7 @@ mod security_db_tests {
 
     #[test]
     fn test_blacklist_get_entry_details() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -160,6 +165,7 @@ mod security_db_tests {
 
     #[test]
     fn test_cidr_matching_basic() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -195,6 +201,7 @@ mod security_db_tests {
 
     #[test]
     fn test_cidr_matching_various_masks() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -227,6 +234,7 @@ mod security_db_tests {
 
     #[test]
     fn test_cidr_edge_cases() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -265,6 +273,7 @@ mod security_db_tests {
 
     #[test]
     fn test_blacklist_expiration() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -287,6 +296,7 @@ mod security_db_tests {
 
     #[test]
     fn test_blacklist_not_yet_expired() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -306,6 +316,7 @@ mod security_db_tests {
 
     #[test]
     fn test_permanent_blacklist() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -329,6 +340,7 @@ mod security_db_tests {
 
     #[test]
     fn test_whitelist_add_and_check() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -345,6 +357,7 @@ mod security_db_tests {
 
     #[test]
     fn test_whitelist_cidr() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -367,6 +380,7 @@ mod security_db_tests {
 
     #[test]
     fn test_access_log_save_and_retrieve() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -406,6 +420,7 @@ mod security_db_tests {
 
     #[test]
     fn test_access_log_blocked_filter() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -458,6 +473,7 @@ mod security_db_tests {
 
     #[test]
     fn test_ip_stats() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -512,6 +528,7 @@ mod security_db_tests {
 
     #[test]
     fn test_cleanup_old_logs() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -573,6 +590,7 @@ mod security_db_tests {
     fn test_concurrent_access() {
         use std::thread;
 
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -606,6 +624,7 @@ mod security_db_tests {
 
     #[test]
     fn test_duplicate_blacklist_entry() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -622,6 +641,7 @@ mod security_db_tests {
 
     #[test]
     fn test_empty_ip_pattern() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -636,6 +656,7 @@ mod security_db_tests {
 
     #[test]
     fn test_special_characters_in_reason() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -654,6 +675,7 @@ mod security_db_tests {
 
     #[test]
     fn test_hit_count_increment() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
         cleanup_test_data();
 
@@ -720,6 +742,7 @@ mod performance_benchmarks {
     /// 基准测试：黑名单查找性能
     #[test]
     fn benchmark_blacklist_lookup() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
 
         // 清理并添加 100 个黑名单条目
@@ -760,6 +783,7 @@ mod performance_benchmarks {
     /// 基准测试：CIDR 匹配性能
     #[test]
     fn benchmark_cidr_matching() {
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
         let _ = init_db();
 
         // 清理并添加 CIDR 规则

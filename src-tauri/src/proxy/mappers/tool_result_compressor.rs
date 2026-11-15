@@ -298,8 +298,8 @@ pub fn sanitize_tool_result_blocks(blocks: &mut Vec<Value>) {
         if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
             let remaining = MAX_TOOL_RESULT_CHARS.saturating_sub(used_chars);
             if remaining == 0 {
-                debug!("[ToolCompressor] Reached character limit, stopping");
-                break;
+                debug!("[ToolCompressor] Reached character limit, skipping further text blocks");
+                continue;
             }
 
             let compacted = compact_tool_result_text(text, remaining);
@@ -314,13 +314,9 @@ pub fn sanitize_tool_result_blocks(blocks: &mut Vec<Value>) {
                 compacted.len()
             );
         } else {
-            // 保留其他类型的块 (例如图片), 但受总长度块数限制, 此处不单独截断
+            // 保留其他类型的块 (例如图片)，避免前序超长文本耗尽配额时误丢图片
             cleaned_blocks.push(block.clone());
             used_chars += 100; // 估算非文本块大小
-        }
-
-        if used_chars >= MAX_TOOL_RESULT_CHARS {
-            break;
         }
     }
 
@@ -383,11 +379,11 @@ Please read the file locally."#;
         let mut blocks = vec![
             serde_json::json!({
                 "type": "text",
-                "text": "a".repeat(100_000)
+                "text": "a".repeat(50_000)
             }),
             serde_json::json!({
                 "type": "text",
-                "text": "b".repeat(150_000)
+                "text": "b".repeat(50_000)
             }),
             serde_json::json!({
                 "type": "image",
@@ -405,5 +401,31 @@ Please read the file locally."#;
         // 确认工具结果不再剔除图片
         sanitize_tool_result_blocks(&mut blocks);
         assert_eq!(blocks.len(), 4);
+
+        // 验证超长文本截断后依然保留后续图片块，并丢弃超出配额的文本块
+        let mut oversized_blocks = vec![
+            serde_json::json!({
+                "type": "text",
+                "text": "a".repeat(100_000)
+            }),
+            serde_json::json!({
+                "type": "text",
+                "text": "b".repeat(150_000)
+            }),
+            serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                }
+            }),
+            serde_json::json!({
+                "type": "text",
+                "text": "dropped text after limit"
+            }),
+        ];
+        sanitize_tool_result_blocks(&mut oversized_blocks);
+        assert_eq!(oversized_blocks.len(), 3);
+        assert_eq!(oversized_blocks[2]["type"], "image");
     }
 }

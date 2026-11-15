@@ -8040,25 +8040,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
-    struct TestEnvGuard(&'static str);
-    impl Drop for TestEnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var(self.0);
-        }
-    }
-
     #[tokio::test]
     async fn test_burn_account_quota_micro_requests_accumulate() {
-        let tmp_root = std::env::temp_dir().join(format!(
-            "antigravity-micro-burn-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let _data_dir = crate::modules::account::ScopedTestDataDir::new();
+        let tmp_root = _data_dir.path().to_path_buf();
         let accounts_dir = tmp_root.join("accounts");
         std::fs::create_dir_all(&accounts_dir).unwrap();
-        let _env_guard = {
-            std::env::set_var("ABV_DATA_DIR", &tmp_root);
-            TestEnvGuard("ABV_DATA_DIR")
-        };
         let mut app_cfg = crate::models::AppConfig::new();
         app_cfg.quota_ledger.sprint_capacity_cu = 500.0;
         app_cfg.quota_ledger.marathon_capacity_cu = 1500.0;
@@ -8190,8 +8177,6 @@ mod tests {
             let rem_w = t.pending_cu_weekly.get("claude").copied().unwrap();
             assert!((rem_w - 0.0).abs() < 1e-6, "expected 0.0, got {}", rem_w);
         }
-
-        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
     #[tokio::test]

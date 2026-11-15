@@ -1,9 +1,11 @@
 //! Security Database Module
 //! 安全监控相关的数据库操作
 
+use once_cell::sync::Lazy;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// IP 访问日志
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,9 +72,21 @@ pub fn get_security_db_path() -> Result<PathBuf, String> {
     Ok(data_dir.join("security.db"))
 }
 
-/// 连接数据库
-fn connect_db() -> Result<Connection, String> {
-    let db_path = get_security_db_path()?;
+static SECURITY_DB_CONN: Lazy<Mutex<Option<(PathBuf, Connection)>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// 仅用于测试：释放缓存的数据库连接，避免 Windows 临时目录清理被文件句柄占用阻塞
+#[cfg(test)]
+pub fn reset_connection_for_test() {
+    let mut guard = SECURITY_DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+/// 打开并配置新的数据库连接
+fn open_configured_db(db_path: &PathBuf) -> Result<Connection, String> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 
     // Enable WAL mode for better concurrency
@@ -89,9 +103,29 @@ fn connect_db() -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// 复用与当前 db_path 匹配的连接执行数据库操作（注意不可在闭包内重入调用）
+fn with_conn<T>(f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+    let db_path = get_security_db_path()?;
+    let mut guard = SECURITY_DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+
+    let needs_reopen = match guard.as_ref() {
+        Some((cached_path, _)) => cached_path != &db_path,
+        None => true,
+    };
+
+    if needs_reopen {
+        *guard = None;
+        let conn = open_configured_db(&db_path)?;
+        *guard = Some((db_path, conn));
+    }
+
+    let conn = &guard.as_ref().expect("security db connection initialized").1;
+    f(conn)
+}
+
 /// 初始化安全数据库
 pub fn init_db() -> Result<(), String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
 
     // IP 访问日志表
     conn.execute(
@@ -164,10 +198,17 @@ pub fn init_db() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_blacklist_expires ON ip_blacklist (expires_at)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
     // Migration: Add username column to ip_access_logs
     let _ = conn.execute("ALTER TABLE ip_access_logs ADD COLUMN username TEXT", []);
 
     Ok(())
+    })
 }
 
 // ============================================================================
@@ -176,12 +217,15 @@ pub fn init_db() -> Result<(), String> {
 
 /// 保存 IP 访问日志
 pub fn save_ip_access_log(log: &IpAccessLog) -> Result<(), String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO ip_access_logs (id, client_ip, timestamp, method, path, user_agent, status, duration, api_key_hash, blocked, block_reason, username)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            )
+            .map_err(|e| e.to_string())?;
 
-    conn.execute(
-        "INSERT INTO ip_access_logs (id, client_ip, timestamp, method, path, user_agent, status, duration, api_key_hash, blocked, block_reason, username)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
+        stmt.execute(params![
             log.id,
             log.client_ip,
             log.timestamp,
@@ -194,11 +238,11 @@ pub fn save_ip_access_log(log: &IpAccessLog) -> Result<(), String> {
             log.blocked,
             log.block_reason,
             log.username,
-        ],
-    )
-    .map_err(|e| e.to_string())?;
+        ])
+        .map_err(|e| e.to_string())?;
 
-    Ok(())
+        Ok(())
+    })
 }
 
 /// 获取 IP 访问日志 (分页)
@@ -208,7 +252,7 @@ pub fn get_ip_access_logs(
     ip_filter: Option<&str>,
     blocked_only: bool,
 ) -> Result<Vec<IpAccessLog>, String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
 
     let sql = if blocked_only {
         if let Some(ip) = ip_filter {
@@ -275,11 +319,12 @@ pub fn get_ip_access_logs(
         logs.push(log.map_err(|e| e.to_string())?);
     }
     Ok(logs)
+    })
 }
 
 /// 获取 IP 统计概览
 pub fn get_ip_stats() -> Result<IpStats, String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
 
     let today_start = chrono::Utc::now()
         .date_naive()
@@ -317,11 +362,12 @@ pub fn get_ip_stats() -> Result<IpStats, String> {
         blacklist_count,
         whitelist_count,
     })
+    })
 }
 
 /// 获取 TOP N IP 访问排行
 pub fn get_top_ips(limit: usize, hours: i64) -> Result<Vec<IpRanking>, String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
 
     let since = chrono::Utc::now().timestamp() - (hours * 3600);
 
@@ -350,31 +396,32 @@ pub fn get_top_ips(limit: usize, hours: i64) -> Result<Vec<IpRanking>, String> {
     let mut rankings = Vec::new();
     for r in rankings_iter {
         let mut ranking = r.map_err(|e| e.to_string())?;
-        // 检查是否在黑名单中
-        ranking.is_blocked = is_ip_in_blacklist(&ranking.client_ip)?;
+        // 检查是否在黑名单中（复用当前连接，避免重入锁）
+        ranking.is_blocked = get_blacklist_entry_for_ip_with_conn(conn, &ranking.client_ip)?.is_some();
         rankings.push(ranking);
     }
 
     Ok(rankings)
+    })
 }
 
 /// 清理旧的 IP 访问日志
 pub fn cleanup_old_ip_logs(days: i64) -> Result<usize, String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
+        let cutoff_timestamp = chrono::Utc::now().timestamp() - (days * 24 * 3600);
 
-    let cutoff_timestamp = chrono::Utc::now().timestamp() - (days * 24 * 3600);
+        let deleted = conn
+            .execute(
+                "DELETE FROM ip_access_logs WHERE timestamp < ?1",
+                [cutoff_timestamp],
+            )
+            .map_err(|e| e.to_string())?;
 
-    let deleted = conn
-        .execute(
-            "DELETE FROM ip_access_logs WHERE timestamp < ?1",
-            [cutoff_timestamp],
-        )
-        .map_err(|e| e.to_string())?;
+        // VACUUM to reclaim space
+        conn.execute("VACUUM", []).map_err(|e| e.to_string())?;
 
-    // VACUUM to reclaim space
-    conn.execute("VACUUM", []).map_err(|e| e.to_string())?;
-
-    Ok(deleted)
+        Ok(deleted)
+    })
 }
 
 // ============================================================================
@@ -388,42 +435,44 @@ pub fn add_to_blacklist(
     expires_at: Option<i64>,
     created_by: &str,
 ) -> Result<IpBlacklistEntry, String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
 
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp();
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO ip_blacklist (id, ip_pattern, reason, created_at, expires_at, created_by, hit_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            )
+            .map_err(|e| e.to_string())?;
+        stmt.execute(params![id, ip_pattern, reason, now, expires_at, created_by])
+            .map_err(|e| e.to_string())?;
 
-    conn.execute(
-        "INSERT INTO ip_blacklist (id, ip_pattern, reason, created_at, expires_at, created_by, hit_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-        params![id, ip_pattern, reason, now, expires_at, created_by],
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok(IpBlacklistEntry {
-        id,
-        ip_pattern: ip_pattern.to_string(),
-        reason: reason.map(|s| s.to_string()),
-        created_at: now,
-        expires_at,
-        created_by: created_by.to_string(),
-        hit_count: 0,
+        Ok(IpBlacklistEntry {
+            id,
+            ip_pattern: ip_pattern.to_string(),
+            reason: reason.map(|s| s.to_string()),
+            created_at: now,
+            expires_at,
+            created_by: created_by.to_string(),
+            hit_count: 0,
+        })
     })
 }
 
 /// 从黑名单移除
 pub fn remove_from_blacklist(id: &str) -> Result<(), String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
+        conn.execute("DELETE FROM ip_blacklist WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
 
-    conn.execute("DELETE FROM ip_blacklist WHERE id = ?1", [id])
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+        Ok(())
+    })
 }
 
 /// 获取黑名单列表
 pub fn get_blacklist() -> Result<Vec<IpBlacklistEntry>, String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
 
     let mut stmt = conn
         .prepare(
@@ -452,6 +501,7 @@ pub fn get_blacklist() -> Result<Vec<IpBlacklistEntry>, String> {
         entries.push(e.map_err(|e| e.to_string())?);
     }
     Ok(entries)
+    })
 }
 
 /// 检查 IP 是否在黑名单中
@@ -459,60 +509,95 @@ pub fn is_ip_in_blacklist(ip: &str) -> Result<bool, String> {
     get_blacklist_entry_for_ip(ip).map(|entry| entry.is_some())
 }
 
-/// 获取 IP 对应的黑名单条目（如果存在）
-pub fn get_blacklist_entry_for_ip(ip: &str) -> Result<Option<IpBlacklistEntry>, String> {
-    let conn = connect_db()?;
+/// 在已持有连接上检查并更新 IP 黑名单命中
+fn get_blacklist_entry_for_ip_with_conn(
+    conn: &Connection,
+    ip: &str,
+) -> Result<Option<IpBlacklistEntry>, String> {
     let now = chrono::Utc::now().timestamp();
 
     // 清理过期的黑名单条目
-    let _ = conn.execute(
-        "DELETE FROM ip_blacklist WHERE expires_at IS NOT NULL AND expires_at < ?1",
-        [now],
-    );
+    if let Ok(mut del_stmt) =
+        conn.prepare_cached("DELETE FROM ip_blacklist WHERE expires_at IS NOT NULL AND expires_at < ?1")
+    {
+        let _ = del_stmt.execute([now]);
+    }
 
     // 精确匹配
-    let entry_result = conn.query_row(
-        "SELECT id, ip_pattern, reason, created_at, expires_at, created_by, hit_count
-         FROM ip_blacklist WHERE ip_pattern = ?1",
-        [ip],
-        |row| {
-            Ok(IpBlacklistEntry {
-                id: row.get(0)?,
-                ip_pattern: row.get(1)?,
-                reason: row.get(2)?,
-                created_at: row.get(3)?,
-                expires_at: row.get(4)?,
-                created_by: row.get(5)?,
-                hit_count: row.get(6)?,
-            })
-        },
-    );
+    let mut exact_stmt = conn
+        .prepare_cached(
+            "SELECT id, ip_pattern, reason, created_at, expires_at, created_by, hit_count
+             FROM ip_blacklist WHERE ip_pattern = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let entry_result = exact_stmt.query_row([ip], |row| {
+        Ok(IpBlacklistEntry {
+            id: row.get(0)?,
+            ip_pattern: row.get(1)?,
+            reason: row.get(2)?,
+            created_at: row.get(3)?,
+            expires_at: row.get(4)?,
+            created_by: row.get(5)?,
+            hit_count: row.get(6)?,
+        })
+    });
 
     if let Ok(entry) = entry_result {
         // 增加命中计数
-        let _ = conn.execute(
-            "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE ip_pattern = ?1",
-            [ip],
-        );
+        if let Ok(mut update_stmt) =
+            conn.prepare_cached("UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE ip_pattern = ?1")
+        {
+            let _ = update_stmt.execute([ip]);
+        }
         return Ok(Some(entry));
     }
 
-    // CIDR 匹配
-    let entries = get_blacklist()?;
-    for entry in entries {
-        if entry.ip_pattern.contains('/') {
-            if cidr_match(ip, &entry.ip_pattern) {
-                // 增加命中计数
-                let _ = conn.execute(
-                    "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE id = ?1",
-                    [&entry.id],
-                );
-                return Ok(Some(entry));
+    // CIDR 匹配（仅扫描含 '/' 的 CIDR 规则，避免全表读取及重入连接锁）
+    let matched_cidr = {
+        let mut cidr_stmt = conn
+            .prepare_cached(
+                "SELECT id, ip_pattern, reason, created_at, expires_at, created_by, hit_count
+                 FROM ip_blacklist
+                 WHERE ip_pattern LIKE '%/%'
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = cidr_stmt.query([]).map_err(|e| e.to_string())?;
+        let mut found = None;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let ip_pattern: String = row.get(1).map_err(|e| e.to_string())?;
+            if cidr_match(ip, &ip_pattern) {
+                found = Some(IpBlacklistEntry {
+                    id: row.get(0).map_err(|e| e.to_string())?,
+                    ip_pattern,
+                    reason: row.get(2).map_err(|e| e.to_string())?,
+                    created_at: row.get(3).map_err(|e| e.to_string())?,
+                    expires_at: row.get(4).map_err(|e| e.to_string())?,
+                    created_by: row.get(5).map_err(|e| e.to_string())?,
+                    hit_count: row.get(6).map_err(|e| e.to_string())?,
+                });
+                break;
             }
         }
+        found
+    };
+
+    if let Some(entry) = matched_cidr {
+        // 增加命中计数
+        if let Ok(mut update_stmt) =
+            conn.prepare_cached("UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE id = ?1")
+        {
+            let _ = update_stmt.execute([&entry.id]);
+        }
+        return Ok(Some(entry));
     }
 
     Ok(None)
+}
+
+/// 获取 IP 对应的黑名单条目（如果存在）
+pub fn get_blacklist_entry_for_ip(ip: &str) -> Result<Option<IpBlacklistEntry>, String> {
+    with_conn(|conn| get_blacklist_entry_for_ip_with_conn(conn, ip))
 }
 
 /// 简单的 CIDR 匹配
@@ -556,39 +641,41 @@ pub fn add_to_whitelist(
     ip_pattern: &str,
     description: Option<&str>,
 ) -> Result<IpWhitelistEntry, String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
 
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp();
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO ip_whitelist (id, ip_pattern, description, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(|e| e.to_string())?;
+        stmt.execute(params![id, ip_pattern, description, now])
+            .map_err(|e| e.to_string())?;
 
-    conn.execute(
-        "INSERT INTO ip_whitelist (id, ip_pattern, description, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![id, ip_pattern, description, now],
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok(IpWhitelistEntry {
-        id,
-        ip_pattern: ip_pattern.to_string(),
-        description: description.map(|s| s.to_string()),
-        created_at: now,
+        Ok(IpWhitelistEntry {
+            id,
+            ip_pattern: ip_pattern.to_string(),
+            description: description.map(|s| s.to_string()),
+            created_at: now,
+        })
     })
 }
 
 /// 从白名单移除
 pub fn remove_from_whitelist(id: &str) -> Result<(), String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
+        conn.execute("DELETE FROM ip_whitelist WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
 
-    conn.execute("DELETE FROM ip_whitelist WHERE id = ?1", [id])
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+        Ok(())
+    })
 }
 
 /// 获取白名单列表
 pub fn get_whitelist() -> Result<Vec<IpWhitelistEntry>, String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
 
     let mut stmt = conn
         .prepare(
@@ -614,44 +701,49 @@ pub fn get_whitelist() -> Result<Vec<IpWhitelistEntry>, String> {
         entries.push(e.map_err(|e| e.to_string())?);
     }
     Ok(entries)
+    })
 }
 
 /// 检查 IP 是否在白名单中
 pub fn is_ip_in_whitelist(ip: &str) -> Result<bool, String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
+        // 精确匹配
+        let mut exact_stmt = conn
+            .prepare_cached("SELECT COUNT(*) FROM ip_whitelist WHERE ip_pattern = ?1")
+            .map_err(|e| e.to_string())?;
+        let count: i64 = exact_stmt
+            .query_row([ip], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
 
-    // 精确匹配
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM ip_whitelist WHERE ip_pattern = ?1",
-            [ip],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
+        if count > 0 {
+            return Ok(true);
+        }
 
-    if count > 0 {
-        return Ok(true);
-    }
-
-    // CIDR 匹配
-    let entries = get_whitelist()?;
-    for entry in entries {
-        if entry.ip_pattern.contains('/') {
-            if cidr_match(ip, &entry.ip_pattern) {
+        // CIDR 匹配（仅扫描含 '/' 的 CIDR 规则，避免全表读取及重入连接锁）
+        let mut cidr_stmt = conn
+            .prepare_cached(
+                "SELECT ip_pattern FROM ip_whitelist WHERE ip_pattern LIKE '%/%' ORDER BY created_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = cidr_stmt.query([]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let pattern: String = row.get(0).map_err(|e| e.to_string())?;
+            if cidr_match(ip, &pattern) {
                 return Ok(true);
             }
         }
-    }
 
-    Ok(false)
+        Ok(false)
+    })
 }
 
 /// 清空所有 IP 访问日志
 pub fn clear_ip_access_logs() -> Result<(), String> {
-    let conn = connect_db()?;
-    conn.execute("DELETE FROM ip_access_logs", [])
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    with_conn(|conn| {
+        conn.execute("DELETE FROM ip_access_logs", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
 }
 
 /// 获取 IP 访问日志总数
@@ -659,7 +751,7 @@ pub fn get_ip_access_logs_count(
     ip_filter: Option<&str>,
     blocked_only: bool,
 ) -> Result<u64, String> {
-    let conn = connect_db()?;
+    with_conn(|conn| {
 
     let sql = if blocked_only {
         if let Some(ip) = ip_filter {
@@ -684,4 +776,5 @@ pub fn get_ip_access_logs_count(
         .map_err(|e| e.to_string())?;
 
     Ok(count)
+    })
 }

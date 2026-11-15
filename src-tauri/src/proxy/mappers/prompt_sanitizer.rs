@@ -133,10 +133,10 @@ static RE_IDENTITY_DECLARATION: Lazy<Regex> = Lazy::new(|| {
 /// 知名特定客户端开场白正则（如 Claude Code CLI、OpenCode、Oh-My-Pi 开场白，仅在系统提示词头部窗口内生效）
 static RE_KNOWN_CLIENT_DECLARATION: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
-        r"(?i)\b(?:you\s+are|you're)\s+claude\s+code[\s,，]+(?:anthropic's\s+)?official\s+cli\s+for\s+claude",
+        r"(?i)(?:\b(?:you\s+are|you're)\s+claude\s+code[\s,，]+(?:anthropic's\s+)?official\s+cli\s+for\s+claude",
         r"(?:[\s,，]+running\s+within\s+(?:the\s+)?claude\s+agent\s+sdk)?",
-        r"|(?i)\b(?:you\s+are|you're)\s+opencode[\s,，]+(?:an?\s+)?(?:open\s+source\s+)?(?:ai\s+)?(?:coding\s+)?(?:agent|assistant)",
-        r"|(?i)\b(?:you\s+are|you're)\s+(?:oh[-_\s]my[-_\s]pi|omp)[\s,，]+(?:an?\s+)?(?:interactive\s+)?(?:ai\s+)?(?:coding\s+)?(?:agent|assistant)",
+        r"|\b(?:you\s+are|you're)\s+opencode[\s,，]+(?:an?\s+)?(?:open\s+source\s+)?(?:ai\s+)?(?:coding\s+)?(?:agent|assistant)",
+        r"|\b(?:you\s+are|you're)\s+(?:oh[-_\s]my[-_\s]pi|omp)[\s,，]+(?:an?\s+)?(?:interactive\s+)?(?:ai\s+)?(?:coding\s+)?(?:agent|assistant))",
         r"([.,，。!?！？;；]?)"
     ))
     .unwrap()
@@ -229,6 +229,8 @@ impl PromptSanitizer {
             || lower.contains("cc_prompt_id")
             || lower.contains("cc_turn_origin")
             || lower.contains("cch=")
+            || lower.contains("x-opencode")
+            || lower.contains("x-omp")
             || lower.contains("claude agent sdk");
 
         if !has_suspect {

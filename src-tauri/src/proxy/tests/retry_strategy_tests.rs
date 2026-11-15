@@ -20,10 +20,11 @@ fn test_retry_strategy_404() {
 #[test]
 fn test_retry_strategy_429_no_delay() {
     let strategy = determine_retry_strategy(429, "rate limited", false);
-    match strategy {
-        RetryStrategy::FixedDelay(d) => assert_eq!(d, Duration::from_millis(50)),
-        other => panic!("Expected FixedDelay(50ms) for immediate rotate, got {:?}", other),
-    }
+    assert!(
+        matches!(strategy, RetryStrategy::NoRetry),
+        "Expected NoRetry for 429 (no single-request rotation), got {:?}",
+        strategy
+    );
 }
 
 #[test]
@@ -37,27 +38,19 @@ fn test_retry_strategy_429_long_delay_rotates_immediately() {
         }
     }"#;
     let strategy = determine_retry_strategy(429, error_json, false);
-    match strategy {
-        RetryStrategy::FixedDelay(d) => assert_eq!(d, Duration::from_millis(50)),
-        other => panic!(
-            "Expected FixedDelay(50ms) for long 429 delay (rotate immediately), got {:?}",
-            other
-        ),
-    }
+    assert!(
+        matches!(strategy, RetryStrategy::NoRetry),
+        "Expected NoRetry for 429 with retryDelay (no cascading rotation), got {:?}",
+        strategy
+    );
 }
 
 #[test]
 fn test_retry_strategy_503() {
     let strategy = determine_retry_strategy(503, "", false);
     assert!(
-        matches!(
-            strategy,
-            RetryStrategy::ExponentialBackoff {
-                base_ms: 10000,
-                max_ms: 60000
-            }
-        ),
-        "Expected ExponentialBackoff {{ base_ms: 10000, max_ms: 60000 }}, got {:?}",
+        matches!(strategy, RetryStrategy::NoRetry),
+        "Expected NoRetry for 503 (pass through to client), got {:?}",
         strategy
     );
 }
@@ -66,14 +59,8 @@ fn test_retry_strategy_503() {
 fn test_retry_strategy_529() {
     let strategy = determine_retry_strategy(529, "", false);
     assert!(
-        matches!(
-            strategy,
-            RetryStrategy::ExponentialBackoff {
-                base_ms: 10000,
-                max_ms: 60000
-            }
-        ),
-        "Expected ExponentialBackoff {{ base_ms: 10000, max_ms: 60000 }}, got {:?}",
+        matches!(strategy, RetryStrategy::NoRetry),
+        "Expected NoRetry for 529 (pass through to client), got {:?}",
         strategy
     );
 }
@@ -154,7 +141,7 @@ fn test_retry_strategy_400_no_signature() {
 
 #[test]
 fn test_rotate_account_true_cases() {
-    for status in [429, 401, 403, 404, 500] {
+    for status in [401, 404, 500] {
         assert!(
             should_rotate_account(status, None),
             "Expected should_rotate_account({}) == true",
@@ -165,7 +152,7 @@ fn test_rotate_account_true_cases() {
 
 #[test]
 fn test_rotate_account_false_cases() {
-    for status in [400, 503, 529, 200, 502] {
+    for status in [400, 429, 403, 503, 529, 200, 502] {
         assert!(
             !should_rotate_account(status, None),
             "Expected should_rotate_account({}) == false",
