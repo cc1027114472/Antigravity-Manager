@@ -1010,6 +1010,24 @@ impl ProxyPoolManager {
         tracing::info!("[ProxyPool] Unbound account {}", account_id);
     }
 
+    /// 同步清理内存与配置中的账号代理绑定（供账号删除闭环调用）
+    pub fn remove_account_bindings_sync(&self, account_ids: &[String]) {
+        let mut removed = false;
+        for id in account_ids {
+            if self.account_bindings.remove(id).is_some() {
+                removed = true;
+            }
+        }
+        if !removed {
+            return;
+        }
+        if let Ok(mut cfg) = self.config.try_write() {
+            for id in account_ids {
+                cfg.account_bindings.remove(id);
+            }
+        }
+    }
+
     /// 获取账号当前绑定的代理ID
     pub fn get_account_binding(&self, account_id: &str) -> Option<String> {
         self.account_bindings

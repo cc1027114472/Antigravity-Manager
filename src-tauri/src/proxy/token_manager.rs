@@ -568,6 +568,21 @@ impl TokenManager {
         let entries =
             std::fs::read_dir(&accounts_dir).map_err(|e| format!("读取账号目录失败: {}", e))?;
 
+        // [ANTI-ORPHAN] 读取 accounts.json 索引白名单：
+        // 若索引文件存在且非空，仅加载在索引中注册的账号，彻底忽略历史遗留孤儿 JSON 文件
+        let indexed_ids: Option<std::collections::HashSet<String>> = {
+            let index_path = self.data_dir.join("accounts.json");
+            if index_path.exists() {
+                std::fs::read_to_string(&index_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<crate::models::AccountIndex>(&s).ok())
+                    .filter(|idx| !idx.accounts.is_empty())
+                    .map(|idx| idx.accounts.into_iter().map(|a| a.id).collect())
+            } else {
+                None
+            }
+        };
+
         // 阶段 1：在局部集合中加载新账号，严禁提前清空现有活跃池导致并发 503 宕机
         let mut new_tokens = std::collections::HashMap::new();
 
@@ -577,6 +592,18 @@ impl TokenManager {
 
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
+            }
+
+            if let Some(ref valid_ids) = indexed_ids {
+                if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if !valid_ids.contains(file_stem) {
+                        tracing::debug!(
+                            "[TokenManager] 跳过未在 accounts.json 索引中注册的孤儿账号文件: {:?}",
+                            path
+                        );
+                        continue;
+                    }
+                }
             }
 
             // 尝试加载账号
@@ -620,6 +647,18 @@ impl TokenManager {
 
     /// 重新加载指定账号（用于配额更新后的实时同步）
     pub async fn reload_account(&self, account_id: &str) -> Result<(), String> {
+        let index_path = self.data_dir.join("accounts.json");
+        if index_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&index_path) {
+                if let Ok(idx) = serde_json::from_str::<crate::models::AccountIndex>(&content) {
+                    if !idx.accounts.is_empty() && !idx.accounts.iter().any(|a| a.id == account_id) {
+                        self.remove_account(account_id);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let path = self
             .data_dir
             .join("accounts")

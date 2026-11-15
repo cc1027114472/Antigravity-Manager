@@ -4,16 +4,14 @@ use rquest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-// Quota API endpoints (fallback order: Daily → Sandbox, 剔除必死报 429 的 Prod 端点)
-const QUOTA_API_ENDPOINTS: [&str; 2] = [
+// Quota API endpoints (仅使用官方正式 Daily 端点，禁用易触发 403 风控的 Sandbox 端点与必报 429 的 Prod 端点)
+const QUOTA_API_ENDPOINTS: [&str; 1] = [
     "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
 ];
 
-// Quota Summary API endpoints (weekly + 5h grouped quota, fallback order 同上)
-const QUOTA_SUMMARY_ENDPOINTS: [&str; 2] = [
+// Quota Summary API endpoints (weekly + 5h grouped quota, 仅使用官方正式 Daily 端点)
+const QUOTA_SUMMARY_ENDPOINTS: [&str; 1] = [
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
 ];
 
 /// Critical retry threshold: considered near recovery when quota reaches 95%
@@ -173,7 +171,7 @@ async fn create_long_standard_client(
     create_standard_client(account_id, 60).await
 }
 
-const CLOUD_CODE_BASE_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const CLOUD_CODE_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 
 /// Fetch project ID and subscription tier
 async fn fetch_project_id(

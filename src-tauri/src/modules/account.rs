@@ -1045,6 +1045,27 @@ pub fn upsert_account(
     internal_add_account(&mut index, email, name, token)
 }
 
+/// 清理已删除账号残留的专属代理绑定（同步更新内存池与 gui_config.json，防止产生孤儿代理绑定）
+fn cleanup_deleted_account_bindings(account_ids: &[String]) {
+    if account_ids.is_empty() {
+        return;
+    }
+    if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+        pool.remove_account_bindings_sync(account_ids);
+    }
+    if let Ok(mut app_config) = crate::modules::config::load_app_config() {
+        let mut modified = false;
+        for id in account_ids {
+            if app_config.proxy.proxy_pool.account_bindings.remove(id).is_some() {
+                modified = true;
+            }
+        }
+        if modified {
+            let _ = crate::modules::config::save_app_config(&app_config);
+        }
+    }
+}
+
 /// Delete account
 pub fn delete_account(account_id: &str) -> Result<(), String> {
     let _lock = ACCOUNT_INDEX_LOCK
@@ -1078,6 +1099,9 @@ pub fn delete_account(account_id: &str) -> Result<(), String> {
 
     // [FIX #1477] Trigger TokenManager cache cleanup signal
     crate::proxy::server::trigger_account_delete(account_id);
+
+    // 同步清理代理池绑定，防止残留孤儿绑定
+    cleanup_deleted_account_bindings(&[account_id.to_string()]);
 
     Ok(())
 }
@@ -1115,7 +1139,12 @@ pub fn delete_accounts(account_ids: &[String]) -> Result<(), String> {
         index.current_account_id = index.accounts.first().map(|s| s.id.clone());
     }
 
-    save_account_index(&index)
+    save_account_index(&index)?;
+
+    // 同步清理代理池绑定，防止残留孤儿绑定
+    cleanup_deleted_account_bindings(account_ids);
+
+    Ok(())
 }
 
 /// Reorder account list

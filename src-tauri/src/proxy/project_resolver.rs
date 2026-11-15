@@ -18,8 +18,8 @@ pub async fn fetch_project_id(
         }
     }
 
-    // 使用 Sandbox 环境，避免 Prod 环境的 429 错误
-    let url = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist";
+    // 使用官方正式 Daily 环境，避免 Prod 环境的 429 错误及 Sandbox 环境的 403 风控
+    let url = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 
     let request_body = serde_json::json!({
         "metadata": {
