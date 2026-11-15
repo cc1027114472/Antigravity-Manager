@@ -30,7 +30,21 @@ pub fn derive_uuid_from_seed(seed: &str) -> uuid::Uuid {
 /// Maps a model ID to the official Antigravity IDE `labels.model_enum`
 pub fn resolve_official_model_enum(model: &str) -> &'static str {
     let lower = model.to_lowercase();
-    if lower.contains("gemini-3.8-flash-low") {
+    if lower.contains("claude-opus-5-5-low") {
+        "MODEL_PLACEHOLDER_M400"
+    } else if lower.contains("claude-opus-5-5-medium") {
+        "MODEL_PLACEHOLDER_M401"
+    } else if lower.contains("claude-opus-5") || lower.contains("claude-opus") {
+        "MODEL_PLACEHOLDER_M402"
+    } else if lower.contains("claude-sonnet-5-5-low") {
+        "MODEL_PLACEHOLDER_M403"
+    } else if lower.contains("claude-sonnet-5-5-medium") {
+        "MODEL_PLACEHOLDER_M404"
+    } else if lower.contains("claude-sonnet-5") || lower.contains("claude") {
+        "MODEL_PLACEHOLDER_M405"
+    } else if lower.contains("gemini-3.8-flash-tiered") {
+        "MODEL_PLACEHOLDER_M322"
+    } else if lower.contains("gemini-3.8-flash-low") {
         "MODEL_PLACEHOLDER_M320"
     } else if lower.contains("gemini-3.8-flash-medium") {
         "MODEL_PLACEHOLDER_M319"
@@ -42,8 +56,14 @@ pub fn resolve_official_model_enum(model: &str) -> &'static str {
         "MODEL_PLACEHOLDER_M418"
     } else if lower.contains("gemini-4-argon") {
         "MODEL_PLACEHOLDER_M417"
-    } else if lower.contains("gemini-3.5-flash") || lower.contains("gemini-2.5-flash-lite") {
+    } else if lower.contains("gemini-3.5-flash") {
+        "MODEL_PLACEHOLDER_M198"
+    } else if lower.contains("gemini-3.1-flash-image") || lower.contains("-image") {
+        "MODEL_PLACEHOLDER_M21"
+    } else if lower.contains("gemini-3.1-flash-lite") || lower.contains("gemini-2.5-flash-lite") {
         "MODEL_PLACEHOLDER_M50"
+    } else if lower.contains("gemini-3-flash") {
+        "MODEL_PLACEHOLDER_M18"
     } else {
         "MODEL_PLACEHOLDER_M318"
     }
@@ -74,17 +94,43 @@ pub fn generate_official_request_id_and_labels(
     let model_enum = resolve_official_model_enum(final_model);
 
     let request_id = format!("agent/{}/{}/{}/{}", cascade_uuid, ts, trajectory_uuid, step);
-    let labels = serde_json::json!({
-        "cascade_id": cascade_uuid.to_string(),
-        "last_step_index": last_step.to_string(),
-        "model_enum": model_enum,
-        "request_id": format!("{}-{}", trajectory_uuid, last_step),
-        "root_cascade_id": cascade_uuid.to_string(),
-        "trajectory_id": trajectory_uuid.to_string(),
-        "used_claude": if is_claude { "true" } else { "false" },
-        "used_claude_conservative": if is_claude { "true" } else { "false" },
-        "used_non_gemini_model": if is_non_gemini { "true" } else { "false" },
-    });
+    let mut labels_map = serde_json::Map::new();
+    labels_map.insert("cascade_id".to_string(), serde_json::json!(cascade_uuid.to_string()));
+    if last_step > 0 {
+        let last_exec_seed = format!("exec:{}:{}:{}", acc, session_hint, last_step);
+        let last_exec_uuid = derive_uuid_from_seed(&last_exec_seed);
+        labels_map.insert(
+            "last_execution_id".to_string(),
+            serde_json::json!(last_exec_uuid.to_string()),
+        );
+    }
+    labels_map.insert("last_step_index".to_string(), serde_json::json!(last_step.to_string()));
+    labels_map.insert("model_enum".to_string(), serde_json::json!(model_enum));
+    labels_map.insert(
+        "request_id".to_string(),
+        serde_json::json!(format!("{}-{}", trajectory_uuid, last_step)),
+    );
+    labels_map.insert(
+        "root_cascade_id".to_string(),
+        serde_json::json!(cascade_uuid.to_string()),
+    );
+    labels_map.insert(
+        "trajectory_id".to_string(),
+        serde_json::json!(trajectory_uuid.to_string()),
+    );
+    labels_map.insert(
+        "used_claude".to_string(),
+        serde_json::json!(if is_claude { "true" } else { "false" }),
+    );
+    labels_map.insert(
+        "used_claude_conservative".to_string(),
+        serde_json::json!(if is_claude { "true" } else { "false" }),
+    );
+    labels_map.insert(
+        "used_non_gemini_model".to_string(),
+        serde_json::json!(if is_non_gemini { "true" } else { "false" }),
+    );
+    let labels = serde_json::Value::Object(labels_map);
 
     (request_id, labels)
 }
@@ -126,5 +172,26 @@ mod tests {
         // parts[1] and parts[3] must be valid UUIDs
         assert!(uuid::Uuid::parse_str(parts[1]).is_ok());
         assert!(uuid::Uuid::parse_str(parts[3]).is_ok());
+
+        // Step 1 omits last_execution_id; step > 1 includes last_execution_id and maps Claude 5.5 enum
+        let (_, labels_step1) = generate_official_request_id_and_labels(
+            Some("acc_1"),
+            "sess_abc",
+            1,
+            "claude-sonnet-5-5-high",
+        );
+        assert!(labels_step1.get("last_execution_id").is_none());
+        assert_eq!(labels_step1["model_enum"], "MODEL_PLACEHOLDER_M405");
+        assert_eq!(labels_step1["used_claude"], "true");
+
+        let (_, labels_step2) = generate_official_request_id_and_labels(
+            Some("acc_1"),
+            "sess_abc",
+            2,
+            "gemini-3.5-flash-lite",
+        );
+        assert!(labels_step2.get("last_execution_id").is_some());
+        assert_eq!(labels_step2["model_enum"], "MODEL_PLACEHOLDER_M198");
+        assert_eq!(labels_step2["used_claude"], "false");
     }
 }

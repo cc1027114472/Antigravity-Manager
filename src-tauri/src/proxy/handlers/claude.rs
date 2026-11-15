@@ -1255,32 +1255,8 @@ pub async fn handle_messages(
             "generateContent"
         };
         let query = if actual_stream { Some("alt=sse") } else { None };
-        // [FIX #765/1522] Prepare Robust Beta Headers for Claude models
-        let mut extra_headers = std::collections::HashMap::new();
-        if mapped_model.to_lowercase().contains("claude") {
-            extra_headers.insert(
-                "anthropic-beta".to_string(),
-                "claude-code-20250219".to_string(),
-            );
-            tracing::debug!(
-                "[{}] Added Comprehensive Beta Headers for Claude model",
-                trace_id
-            );
-        }
-
-        // [NEW] Inject Beta Headers from Client Adapter
-        if let Some(adapter) = &client_adapter {
-            let mut temp_headers = HeaderMap::new();
-            adapter.inject_beta_headers(&mut temp_headers);
-            for (k, v) in temp_headers {
-                if let Some(name) = k {
-                    if let Ok(v_str) = v.to_str() {
-                        extra_headers.insert(name.to_string(), v_str.to_string());
-                        tracing::debug!("[{}] Added Adapter Header: {}: {}", trace_id, name, v_str);
-                    }
-                }
-            }
-        }
+        // [FIXED] Official Antigravity client never sends anthropic-beta header to Google v1internal
+        let extra_headers = std::collections::HashMap::new();
 
         // Upstream call configuration continued...
 

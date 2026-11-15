@@ -52,11 +52,17 @@ pub fn get_max_output_tokens(model_id: &str, token: Option<&ProxyToken>) -> u64 
         }
     }
 
-    // 3. 全局兜底 (Claude 模型在 v1internal 上硬上限为 64000)
-    if std_id.to_ascii_lowercase().contains("claude") {
+    // 3. 全局兜底 (Claude 5.5 在 v1internal 上官方发送 128000，旧版 Claude 为 64000，Gemini 为 65536)
+    let lower = std_id.to_ascii_lowercase();
+    if lower.contains("claude-sonnet-5")
+        || lower.contains("claude-opus-5")
+        || lower.contains("claude-5")
+    {
+        128000
+    } else if lower.contains("claude") {
         64000
     } else {
-        65535
+        65536
     }
 }
 

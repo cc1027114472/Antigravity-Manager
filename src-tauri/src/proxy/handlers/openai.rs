@@ -710,18 +710,8 @@ pub async fn handle_chat_completions(
         };
         let query_string = if actual_stream { Some("alt=sse") } else { None };
 
-        // [FIX #1522] Inject Anthropic Beta Headers for Claude models (OpenAI path)
-        let mut extra_headers = std::collections::HashMap::new();
-        if mapped_model.to_lowercase().contains("claude") {
-            extra_headers.insert(
-                "anthropic-beta".to_string(),
-                "claude-code-20250219".to_string(),
-            );
-            tracing::debug!(
-                "[{}] Injected Anthropic beta headers for Claude model (via OpenAI)",
-                trace_id
-            );
-        }
+        // [FIXED] Official Antigravity client never sends anthropic-beta header to Google v1internal
+        let extra_headers = std::collections::HashMap::new();
 
         let call_result = match upstream
             .call_v1_internal_with_headers(
@@ -3693,7 +3683,7 @@ pub async fn handle_images_generations_internal(
 
                 let gemini_body = json!({
                     "project": project_id,
-                    "requestId": format!("agent-{}", uuid::Uuid::new_v4()),
+                    "requestId": crate::proxy::common::session::generate_official_request_id(Some(account_id.as_str()), "image_gen", 1),
                     "model": resolved_model,
                     "userAgent": "antigravity",
                     "requestType": "image_gen",
@@ -3705,13 +3695,7 @@ pub async fn handle_images_generations_internal(
                         "generationConfig": {
                             "candidateCount": 1, // 强制单张
                             "imageConfig": image_config // ✅ 使用完整配置（包含 aspectRatio 和 imageSize）
-                        },
-                        "safetySettings": [
-                            { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF" },
-                            { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF" },
-                            { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF" },
-                            { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF" },
-                        ]
+                        }
                     }
                 });
 
@@ -4236,7 +4220,7 @@ pub async fn handle_images_edits(
                 // 4.2 Construct Request Body (Need project_id)
                 let gemini_body = json!({
                     "project": project_id,
-                    "requestId": format!("img-edit-{}", uuid::Uuid::new_v4()),
+                    "requestId": crate::proxy::common::session::generate_official_request_id(Some(account_id.as_str()), "image_edit", 1),
                     "model": model_to_use,
                     "userAgent": "antigravity",
                     "requestType": "image_gen",
@@ -4249,17 +4233,8 @@ pub async fn handle_images_edits(
                             "candidateCount": 1,
                             "imageConfig": image_config,
                             "maxOutputTokens": 8192,
-                            "stopSequences": [],
-                            "temperature": 1.0,
-                            "topP": 0.95,
-                            "topK": 40
-                        },
-                        "safetySettings": [
-                            { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF" },
-                            { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF" },
-                            { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF" },
-                            { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF" },
-                        ]
+                            "temperature": 1.0
+                        }
                     }
                 });
 

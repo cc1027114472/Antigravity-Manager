@@ -27,15 +27,9 @@ pub fn build_official_style_system_instruction(
 ) -> String {
     let mut sections = ContextSections::default();
 
-    let user_info_str = if request_type == "image_gen" {
-        format!(
-            "Request type: image_gen\nMapped model: {}\nSession ID: {}",
-            mapped_model, session_id
-        )
-    } else {
-        format!("Mapped model: {}\nSession ID: {}", mapped_model, session_id)
-    };
-    sections.user_information.push(user_info_str);
+    let _ = (request_type, mapped_model, session_id);
+    // [FIXED] Do not inject proxy-internal "Mapped model: ...\nSession ID: ..." into <user_information>,
+    // as official Antigravity client never sends those fields and dynamic session_id breaks prefix cache.
 
     if let Some(prompt) = global_prompt.map(str::trim).filter(|s| !s.is_empty()) {
         sections.customizations.push(prompt.to_string());

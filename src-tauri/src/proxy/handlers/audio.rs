@@ -6,7 +6,6 @@ use axum::{
 };
 use serde_json::{json, Value};
 use tracing::{debug, info};
-use uuid::Uuid;
 
 use crate::proxy::{audio::AudioProcessor, server::AppState};
 
@@ -107,7 +106,7 @@ pub async fn handle_audio_transcription(
     // 7. 包装请求为 v1internal 格式
     let wrapped_body = json!({
         "project": project_id,
-        "requestId": format!("audio-{}", Uuid::new_v4()),
+        "requestId": crate::proxy::common::session::generate_official_request_id(Some(account_id.as_str()), "audio", 1),
         "request": gemini_request,
         "model": model,
         "userAgent": "antigravity",

@@ -2394,7 +2394,10 @@ impl TokenManager {
         // 步骤 2: POST /v1internal:fetchUserInfo {"project": effective_project_id}
         // 关键防坑：优先使用账号自身的 project_id 或步骤 1 发现的 project_id，仅在为空时才回退 "aicode-consumers"
         if let Some(ref d_pid) = discovered_project_id {
-            if project_id.is_empty() || project_id == "bamboo-precept-lgxtn" {
+            if project_id.is_empty()
+                || project_id == "bamboo-precept-lgxtn"
+                || project_id == "aicode-consumers"
+            {
                 if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
                     if let Some(mut entry) = tm.tokens.get_mut(account_id) {
                         entry.project_id = Some(d_pid.clone());
@@ -2403,7 +2406,10 @@ impl TokenManager {
                 }
             }
         }
-        let effective_project = if !project_id.is_empty() && project_id != "bamboo-precept-lgxtn" {
+        let effective_project = if !project_id.is_empty()
+            && project_id != "bamboo-precept-lgxtn"
+            && project_id != "aicode-consumers"
+        {
             project_id
         } else if let Some(ref d_pid) = discovered_project_id {
             d_pid.as_str()
@@ -3078,7 +3084,7 @@ impl TokenManager {
                         let _ = self.set_forbidden(&token.account_id, &e).await;
                         return Err(format!("Account forbidden during loadCodeAssist handshake: {}", e));
                     }
-                    "bamboo-precept-lgxtn".to_string()
+                    "aicode-consumers".to_string()
                 }
             }
         };
@@ -4508,7 +4514,7 @@ impl TokenManager {
                                         let _ = self.save_project_id(&token.account_id, &pid).await;
                                         pid
                                     }
-                                    Err(_) => "bamboo-precept-lgxtn".to_string(), // fallback
+                                    Err(_) => "aicode-consumers".to_string(), // fallback
                                 }
                             };
 
@@ -5041,14 +5047,14 @@ impl TokenManager {
                                         let _ = self.save_project_id(&token.account_id, &pid).await;
                                         pid
                                     }
-                                    Err(_) => "bamboo-precept-lgxtn".to_string(),
+                                    Err(_) => "aicode-consumers".to_string(),
                                 }
                             }
                         } else {
-                            "bamboo-precept-lgxtn".to_string()
+                            "aicode-consumers".to_string()
                         }
                     } else {
-                        "bamboo-precept-lgxtn".to_string()
+                        "aicode-consumers".to_string()
                     }
                 } else {
                     // 如果不是第一个，则等待结果 (虽然在 Mutex 模式下不需要 rx，但为了严谨性我们可以保留锁)
@@ -5063,7 +5069,7 @@ impl TokenManager {
                     self.tokens
                         .get(&token.account_id)
                         .and_then(|t| t.project_id.clone())
-                        .unwrap_or_else(|| "bamboo-precept-lgxtn".to_string())
+                        .unwrap_or_else(|| "aicode-consumers".to_string())
                 }
             };
 
@@ -5265,8 +5271,8 @@ impl TokenManager {
         let project_id = token
             .project_id
             .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("bamboo-precept-lgxtn")
+            .filter(|s| !s.is_empty() && *s != "bamboo-precept-lgxtn")
+            .unwrap_or("aicode-consumers")
             .to_string();
 
         // [STRICT PROXY] 检查代理是否健康可用
@@ -6372,7 +6378,7 @@ impl TokenManager {
                     let _ = self.save_project_id(&token.account_id, &pid).await;
                     pid
                 }
-                Err(_) => "bamboo-precept-lgxtn".to_string(),
+                Err(_) => "aicode-consumers".to_string(),
             }
         };
 
@@ -6565,7 +6571,7 @@ impl TokenManager {
             Some(&temp_account_id),
         )
         .await
-        .unwrap_or_else(|_| "bamboo-precept-lgxtn".to_string()); // Fallback
+        .unwrap_or_else(|_| "aicode-consumers".to_string()); // Fallback
 
         // 3. 委托给 modules::account::add_account 处理 (包含文件写入、索引更新、锁)
         let email_clone = email.to_string();

@@ -719,7 +719,7 @@ pub async fn get_valid_token_for_warmup(
         Some(&account.id),
     )
     .await;
-    let final_pid = project_id.unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
+    let final_pid = project_id.unwrap_or_else(|| "aicode-consumers".to_string());
 
     Ok((account.token.access_token, final_pid))
 }

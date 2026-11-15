@@ -52,6 +52,7 @@ impl SafetyThreshold {
 }
 
 /// Build safety settings based on configuration
+#[allow(dead_code)]
 fn build_safety_settings() -> Value {
     let threshold = SafetyThreshold::from_env();
     let threshold_str = threshold.to_gemini_threshold();
@@ -613,13 +614,9 @@ pub fn transform_claude_request_in(
     // 3. Tools
     let tools = build_tools(&claude_req.tools, has_web_search_tool, &mapped_model)?;
 
-    // 5. Safety Settings (configurable via GEMINI_SAFETY_THRESHOLD env var)
-    let safety_settings = build_safety_settings();
-
-    // Build inner request
+    // Build inner request (official client never sends safetySettings)
     let mut inner_request = json!({
         "contents": contents,
-        "safetySettings": safety_settings,
     });
 
     if let Some(sys_inst) = system_instruction {
@@ -702,6 +699,8 @@ pub fn transform_claude_request_in(
 
     let req_type = if config.request_type == "image_gen" {
         "image_gen"
+    } else if config.request_type == "web_search" {
+        "web_search"
     } else {
         "agent"
     };
@@ -943,10 +942,8 @@ fn build_system_instruction(
         parts.push(json!({"text": mcp_xml_prompt}));
     }
 
-    // 如果用户没有提供任何系统提示词,添加结束标记
-    if !user_has_antigravity {
-        parts.push(json!({"text": "\n--- [SYSTEM_PROMPT_END] ---"}));
-    }
+    // [REMOVED] Official Antigravity client never appends "--- [SYSTEM_PROMPT_END] ---"
+    let _ = user_has_antigravity;
 
     Some(json!({
         "role": "user",
@@ -1115,8 +1112,7 @@ fn build_contents(
                                     let mut part = json!({
                                         "text": thinking,
                                         "thought": true,
-                                        "thoughtSignature": sig.clone(),
-                                        "thought_signature": sig
+                                        "thoughtSignature": sig
                                     });
                                     crate::proxy::common::json_schema::clean_json_schema(&mut part);
                                     parts.push(part);
@@ -1133,8 +1129,7 @@ fn build_contents(
                                         let mut part = json!({
                                             "text": thinking,
                                             "thought": true,
-                                            "thoughtSignature": sig.clone(),
-                                            "thought_signature": sig
+                                            "thoughtSignature": sig
                                         });
                                         crate::proxy::common::json_schema::clean_json_schema(
                                             &mut part,
@@ -1332,7 +1327,6 @@ fn build_contents(
                                     };
                                     if should_use_sig {
                                         part["thoughtSignature"] = json!(sig);
-                                        part["thought_signature"] = json!(sig);
                                     }
                                 }
                             }
@@ -1343,8 +1337,6 @@ fn build_contents(
                             if is_thinking_enabled && !is_google_cloud {
                                 tracing::debug!("[Tool-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", id);
                                 part["thoughtSignature"] =
-                                    json!("skip_thought_signature_validator");
-                                part["thought_signature"] =
                                     json!("skip_thought_signature_validator");
                             }
                         }
@@ -1443,7 +1435,6 @@ fn build_contents(
                         // [FIX] Tool Result 也需要回填签名（如果上下文中有）
                         if let Some(sig) = last_thought_signature.as_ref() {
                             part["thoughtSignature"] = json!(sig);
-                            part["thought_signature"] = json!(sig);
                         }
 
                         parts.push(part);
@@ -1960,7 +1951,12 @@ fn build_generation_config(
                 .remove("thinkingBudget");
 
             if config.get("maxOutputTokens").is_none() {
-                config["maxOutputTokens"] = json!(64000);
+                let default_max = if is_modern && lower_mapped.contains("claude") {
+                    128000
+                } else {
+                    64000
+                };
+                config["maxOutputTokens"] = json!(default_max);
             }
         } else if should_use_adaptive {
             tracing::debug!(
@@ -1969,7 +1965,12 @@ fn build_generation_config(
             );
             thinking_config["thinkingBudget"] = json!(24576);
             if config.get("maxOutputTokens").is_none() {
-                config["maxOutputTokens"] = json!(64000);
+                let default_max = if is_modern && lower_mapped.contains("claude") {
+                    128000
+                } else {
+                    64000
+                };
+                config["maxOutputTokens"] = json!(default_max);
             }
         } else {
             // [FIX #2007] Opus 4.6 Thinking Alignment (OpenAI Protocol Recipe)
@@ -2054,7 +2055,10 @@ fn build_generation_config(
         } else if is_adaptive_effective || thinking_config.get("thinkingLevel").is_some() {
             // [FIX] Adaptive / thinkingLevel mode (no budget set in thinkingConfig), apply default maxOutputTokens
             if final_max_tokens.is_none() {
-                final_max_tokens = Some(64000);
+                let is_claude_5 = model_lower.contains("claude-sonnet-5")
+                    || model_lower.contains("claude-opus-5")
+                    || model_lower.contains("claude-5");
+                final_max_tokens = Some(if is_claude_5 { 128000 } else { 64000 });
             }
         }
     } else {
@@ -2065,9 +2069,10 @@ fn build_generation_config(
     }
 
     if let Some(val) = final_max_tokens {
-        // [FIX] Cap maxOutputTokens to 65536 to avoid INVALID_ARGUMENT (Cherry Studio sends 128000)
-        // Gemini models typically support max 8192 or 65536 output tokens. 128k is usually invalid.
-        let safe_limit = 65536;
+        let is_claude_5 = model_lower.contains("claude-sonnet-5")
+            || model_lower.contains("claude-opus-5")
+            || model_lower.contains("claude-5");
+        let safe_limit = if is_claude_5 { 128000 } else { 65536 };
         if val > safe_limit {
             tracing::warn!(
                 "[Generation-Config] Capping maxOutputTokens from {} to {} to prevent 400 Invalid Argument",
@@ -2079,17 +2084,7 @@ fn build_generation_config(
         }
     }
 
-    // [优化] 设置全局停止序列,防止模型幻觉出对话标记
-    // [FIX #2007] Opus 4.6 Thinking Alignment
-    // Successful OpenAI logs show NO stop sequences were sent for Opus 4.6 Thinking.
-    if !(model_lower.contains("claude-opus-4-6-thinking") && is_thinking_enabled) {
-        config["stopSequences"] = json!(["<|user|>", "<|end_of_turn|>", "\n\nHuman:"]);
-    } else {
-        tracing::debug!(
-            "[Opus-Alignment] Skipping stopSequences for Opus 4.6 to match OpenAI protocol"
-        );
-    }
-
+    // [FIXED] Official Antigravity client never sends stopSequences in generationConfig (0/3322 captures).
     config
 }
 

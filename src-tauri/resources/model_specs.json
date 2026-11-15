@@ -35,6 +35,66 @@
             "thinking_budget": 32768,
             "is_thinking": true
         },
+        "claude-sonnet-5-5-high": {
+            "max_output_tokens": 128000,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "claude-sonnet-5-5-medium": {
+            "max_output_tokens": 128000,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "claude-sonnet-5-5-low": {
+            "max_output_tokens": 128000,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "claude-opus-5-5-high": {
+            "max_output_tokens": 128000,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "claude-opus-5-5-medium": {
+            "max_output_tokens": 128000,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "claude-opus-5-5-low": {
+            "max_output_tokens": 128000,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "gemini-3.8-flash-high": {
+            "max_output_tokens": 65536,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "gemini-3.8-flash-medium": {
+            "max_output_tokens": 65536,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "gemini-3.8-flash-low": {
+            "max_output_tokens": 65536,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "gemini-4-argon-high": {
+            "max_output_tokens": 65536,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "gemini-4-argon-medium": {
+            "max_output_tokens": 65536,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
+        "gemini-4-argon-low": {
+            "max_output_tokens": 65536,
+            "thinking_budget": 32768,
+            "is_thinking": true
+        },
         "gpt-oss-120b-medium": {
             "max_output_tokens": 32768,
             "thinking_budget": 0,

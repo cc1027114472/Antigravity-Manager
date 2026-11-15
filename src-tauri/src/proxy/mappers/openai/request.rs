@@ -486,7 +486,6 @@ pub fn transform_openai_request(
                 // 仅 Gemini 支持哨兵值跳过验证
                 if is_gemini_3_thinking {
                     thought_part["thoughtSignature"] = json!("skip_thought_signature_validator");
-                    thought_part["thought_signature"] = json!("skip_thought_signature_validator");
                 }
 
                 parts.push(thought_part);
@@ -623,14 +622,12 @@ pub fn transform_openai_request(
 
                     if let Some(ref sig) = thought_sig {
                         func_call_part["thoughtSignature"] = json!(sig);
-                        func_call_part["thought_signature"] = json!(sig);
                     } else if is_thinking_model || is_gemini_flash_thinking {
                         // [NEW] Handle missing signature for Gemini thinking models
                         // [FIX #1650] Allow sentinel injection for Vertex AI (projects/...) as well
                         // [FIX #2167] Also applies to gemini-3-flash / gemini-3.1-flash
                         tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
                         func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
-                        func_call_part["thought_signature"] = json!("skip_thought_signature_validator");
                     }
 
                     parts.push(func_call_part);
@@ -895,7 +892,12 @@ pub fn transform_openai_request(
     // [FIX] Cap maxOutputTokens to prevent 400 Invalid Argument
     if let Some(val) = gen_config["maxOutputTokens"].as_i64() {
         let model_lower = mapped_model.to_lowercase();
-        let safe_limit = if model_lower.contains("claude") {
+        let safe_limit = if model_lower.contains("claude-sonnet-5")
+            || model_lower.contains("claude-opus-5")
+            || model_lower.contains("claude-5")
+        {
+            128000
+        } else if model_lower.contains("claude") {
             64000
         } else {
             65536
@@ -935,12 +937,6 @@ pub fn transform_openai_request(
     // 先放 contents（后续会被 reordered_request 覆盖到后面）
     inner_request["contents"] = json!(contents);
     inner_request["generationConfig"] = gen_config;
-    inner_request["safetySettings"] = json!([
-        { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF" },
-        { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF" },
-        { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF" },
-        { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF" },
-    ]);
 
     // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
     crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
@@ -1190,7 +1186,7 @@ pub fn transform_openai_request(
         );
 
     inner_request["systemInstruction"] = json!({
-        "role": "system",
+        "role": "user",
         "parts": [{ "text": structured_system_instruction }]
     });
 
@@ -1276,6 +1272,8 @@ pub fn transform_openai_request(
 
     let req_type = if config.request_type == "image_gen" {
         "image_gen"
+    } else if config.request_type == "web_search" {
+        "web_search"
     } else {
         "agent"
     };
@@ -1875,10 +1873,10 @@ mod tests {
         );
 
         let cases = [
-            ("gemini-3.8-flash-medium", "MEDIUM", 65535),
-            ("gemini-4-argon-high", "HIGH", 65535),
-            ("claude-sonnet-5-5-medium", "MEDIUM", 64000),
-            ("claude-opus-5-5-high", "HIGH", 64000),
+            ("gemini-3.8-flash-medium", "MEDIUM", 65536),
+            ("gemini-4-argon-high", "HIGH", 65536),
+            ("claude-sonnet-5-5-medium", "MEDIUM", 128000),
+            ("claude-opus-5-5-high", "HIGH", 128000),
         ];
 
         for (model_id, expected_level, expected_max_cap) in cases {

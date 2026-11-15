@@ -606,7 +606,7 @@ impl PromptSanitizer {
                 req_obj.insert(
                     "systemInstruction".to_string(),
                     json!({
-                        "role": "system",
+                        "role": "user",
                         "parts": [{
                             "text": format!("{}{}", OFFICIAL_ANTIGRAVITY_IDENTITY, context_block)
                         }]

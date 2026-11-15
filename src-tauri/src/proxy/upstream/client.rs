@@ -488,21 +488,8 @@ impl UpstreamClient {
             }
         }
 
-        // [OVERHEAD] 自适应上下文开销平衡：对 3.8 超短请求注入官方环境上下文骨架
-        let model_owned = body.get("model").and_then(Value::as_str).map(|s| s.to_string());
-        if method == "streamGenerateContent" || method == "generateContent" {
-            if let Some(inner) = body.get_mut("request") {
-                crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::adapt_context_overhead(
-                    inner,
-                    model_owned.as_deref(),
-                );
-            } else {
-                crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::adapt_context_overhead(
-                    &mut body,
-                    model_owned.as_deref(),
-                );
-            }
-        }
+        // [REMOVED] Official Antigravity client never injects fabricated <environment_permissions>
+        // or <app_context> tags into systemInstruction (0 occurrences across all 3,024 official captures).
 
         // [DEFENSE] 3.8 网关严格校验：工具链互斥物理收敛（functionDeclarations 存在时物理剥离 googleSearch）
         if let Some(inner) = body.get_mut("request") {

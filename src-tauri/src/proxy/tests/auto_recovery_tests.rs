@@ -154,15 +154,18 @@ fn test_build_probe_payload() {
         Some(0)
     );
 
-    // Session ID starts with "probe_"
-    let session_id = req
-        .get("session_id")
-        .or_else(|| req.get("sessionId"))
-        .and_then(|v| v.as_str())
-        .expect("request must have session_id or sessionId");
+    // Session ID uses standard camelCase sessionId (negative integer string) and never leaks snake_case session_id
     assert!(
-        session_id.starts_with("probe_"),
-        "session_id should start with probe_, got: {}",
+        req.get("session_id").is_none(),
+        "request must not leak non-official snake_case session_id"
+    );
+    let session_id = req
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .expect("request must have official camelCase sessionId");
+    assert!(
+        session_id.parse::<i64>().is_ok(),
+        "sessionId should be a signed 64-bit integer string, got: {}",
         session_id
     );
 }

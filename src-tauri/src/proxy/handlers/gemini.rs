@@ -293,15 +293,8 @@ pub async fn handle_generate(
             "generateContent"
         };
 
-        // [FIX #1522] Inject Anthropic Beta Headers for Claude models
-        let mut extra_headers = std::collections::HashMap::new();
-        if mapped_model.to_lowercase().contains("claude") {
-            extra_headers.insert("anthropic-beta".to_string(), "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14".to_string());
-            tracing::debug!(
-                "[Gemini] Injected Anthropic beta headers for Claude model: {}",
-                mapped_model
-            );
-        }
+        // [FIXED] Official Antigravity client never sends anthropic-beta header to Google v1internal
+        let extra_headers = std::collections::HashMap::new();
 
         let call_result = match upstream
             .call_v1_internal_with_headers(

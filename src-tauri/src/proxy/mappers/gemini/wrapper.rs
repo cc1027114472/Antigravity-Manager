@@ -270,25 +270,22 @@ pub fn wrap_request_v2(
                             }
                         }
 
-                        // 3. 处理 thoughtSignature / thought_signature
+                        // 3. 处理 thoughtSignature (兼容客户端传入 thought_signature，但发往上游只保留官方标准驼峰 thoughtSignature)
                         if obj.contains_key("functionCall") {
                             let sig_opt = obj
                                 .get("thoughtSignature")
                                 .or(obj.get("thought_signature"))
                                 .cloned();
+                            obj.remove("thought_signature");
                             if let Some(sig) = sig_opt {
                                 if obj.get("thoughtSignature").is_none() {
-                                    obj.insert("thoughtSignature".to_string(), sig.clone());
-                                }
-                                if obj.get("thought_signature").is_none() {
-                                    obj.insert("thought_signature".to_string(), sig);
+                                    obj.insert("thoughtSignature".to_string(), sig);
                                 }
                             } else if let Some(s_id) = session_id {
                                 if let Some(sig) = crate::proxy::SignatureCache::global()
                                     .get_session_signature(s_id)
                                 {
                                     obj.insert("thoughtSignature".to_string(), json!(sig));
-                                    obj.insert("thought_signature".to_string(), json!(sig));
                                     tracing::debug!("[Gemini-Wrap] Injected signature (len: {}) for session: {}", sig.len(), s_id);
                                 } else {
                                     // [FIX #2167] Session 缓存为空时对 flash 模型注入哨兵值
@@ -303,12 +300,14 @@ pub fn wrap_request_v2(
                                             "thoughtSignature".to_string(),
                                             json!("skip_thought_signature_validator"),
                                         );
-                                        obj.insert(
-                                            "thought_signature".to_string(),
-                                            json!("skip_thought_signature_validator"),
-                                        );
                                         tracing::debug!("[Gemini-Wrap] [FIX #2167] Injected sentinel signature for flash model (no session cache)");
                                     }
+                                }
+                            }
+                        } else if obj.get("thought_signature").is_some() {
+                            if let Some(sig) = obj.remove("thought_signature") {
+                                if obj.get("thoughtSignature").is_none() {
+                                    obj.insert("thoughtSignature".to_string(), sig);
                                 }
                             }
                         }
@@ -802,25 +801,10 @@ pub fn wrap_request_v2(
             &config.final_model,
         );
 
-    // [NEW] 2. 动态 userAgent 仿真 (支持 jetski)
-    // 根据账号属性或域名判断。Go Worker 中企业/GCP 账号通常使用 jetski 指纹。
-    let is_enterprise = if let Some(t) = token {
-        !t.email.ends_with("@gmail.com") && !t.email.ends_with("@googlemail.com")
-    } else {
-        false
-    };
-
-    // [NEW] 阶段 7.2: 动态 IDEType 指纹对齐
-    let official_ide_type = if is_enterprise {
-        "JETSKI"
-    } else {
-        "ANTIGRAVITY"
-    };
-    let official_user_agent = if is_enterprise {
-        "jetski"
-    } else {
-        "antigravity"
-    };
+    // [FIXED] Official Antigravity client always uses "antigravity" / "ANTIGRAVITY" across all accounts
+    let _ = token;
+    let official_ide_type = "ANTIGRAVITY";
+    let official_user_agent = "antigravity";
 
     // [NEW] 如果是 loadCodeAssist 请求，注入 metadata 字段对齐官方
     if final_model_name == "loadCodeAssist" || inner_request.get("metadata").is_some() {
@@ -885,6 +869,8 @@ pub fn wrap_request_v2(
 
     let req_type = if !is_agent_request {
         "image_gen"
+    } else if config.request_type == "web_search" {
+        "web_search"
     } else {
         "agent"
     };
@@ -970,9 +956,9 @@ mod test_fixes {
             part["thoughtSignature"].as_str(),
             Some("client-sent-signature-value-12345")
         );
-        assert_eq!(
-            part["thought_signature"].as_str(),
-            Some("client-sent-signature-value-12345")
+        assert!(
+            part.get("thought_signature").is_none(),
+            "Outgoing payload must only retain camelCase thoughtSignature"
         );
     }
 }

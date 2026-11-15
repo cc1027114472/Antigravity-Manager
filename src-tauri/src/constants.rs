@@ -201,11 +201,9 @@ pub const VALID_AIDEV_VERSIONS: &[(&str, &str)] = &[
 ];
 
 /// Known valid OS and architecture pairs for Go runtime.
+/// Pinned to windows/amd64 to match official capture fingerprint and prevent cross-OS drift per proxy IP.
 pub const VALID_AIDEV_PLATFORMS: &[(&str, &str)] = &[
     ("windows", "amd64"),
-    ("darwin", "arm64"),
-    ("darwin", "amd64"),
-    ("linux", "amd64"),
 ];
 
 /// Computes a stable, deterministic User-Agent string for an account.

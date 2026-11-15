@@ -68,11 +68,6 @@ pub struct RecoveryTask {
 
 /// Build standard lightweight probe payload targeting gemini-2.5-flash.
 pub fn build_probe_payload(project_id: &str) -> serde_json::Value {
-    let session_id = format!(
-        "probe_{}_{}",
-        chrono::Utc::now().timestamp_millis(),
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
     let base_request = serde_json::json!({
         "model": "gemini-2.5-flash",
         "contents": [{
@@ -84,15 +79,14 @@ pub fn build_probe_payload(project_id: &str) -> serde_json::Value {
         "generationConfig": {
             "maxOutputTokens": 1,
             "temperature": 0
-        },
-        "session_id": session_id
+        }
     });
     crate::proxy::mappers::gemini::wrapper::wrap_request(
         &base_request,
         project_id,
         "gemini-2.5-flash",
+        Some("probe"),
         None,
-        Some(&session_id),
         None,
     )
 }
@@ -203,7 +197,7 @@ impl AutoRecoveryScheduler {
         };
 
         if project_id.is_empty() {
-            project_id = "bamboo-precept-lgxtn".to_string();
+            project_id = "aicode-consumers".to_string();
         }
 
         // 2. Build lightweight probe payload
