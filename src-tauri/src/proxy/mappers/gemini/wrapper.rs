@@ -403,13 +403,8 @@ pub fn wrap_request_v2(
             .as_object_mut()
             .unwrap();
 
-        // [ADDED v4.1.24] Inject topK=40 and topP=1.0 if not present to match official client
-        if !gen_config.contains_key("topK") {
-            gen_config.insert("topK".to_string(), json!(40));
-        }
-        if !gen_config.contains_key("topP") {
-            gen_config.insert("topP".to_string(), json!(1.0));
-        }
+        // [FIXED] Official Antigravity client never sends topK or topP in generationConfig;
+        // do not force-inject topK=40 / topP=1.0 to avoid protocol fingerprint mismatch.
 
         if let Some(thinking_config) = gen_config.get_mut("thinkingConfig") {
             if is_modern_thinking {
@@ -798,12 +793,14 @@ pub fn wrap_request_v2(
         .map(|arr| arr.len())
         .unwrap_or(1);
 
-    // [NEW] 1. 深度对齐 requestId 格式 (官方 5 段式: agent/{cascade_uuid}/{timestamp_ms}/{trajectory_uuid}/{step_index})
-    let official_request_id = crate::proxy::common::session::generate_official_request_id(
-        account_id,
-        sid,
-        step_index,
-    );
+    // [NEW] 1. 深度对齐 requestId 格式与配套 request.labels (官方 5 段式: agent/{cascade_uuid}/{timestamp_ms}/{trajectory_uuid}/{step_index})
+    let (official_request_id, official_labels) =
+        crate::proxy::common::session::generate_official_request_id_and_labels(
+            account_id,
+            sid,
+            step_index,
+            &config.final_model,
+        );
 
     // [NEW] 2. 动态 userAgent 仿真 (支持 jetski)
     // 根据账号属性或域名判断。Go Worker 中企业/GCP 账号通常使用 jetski 指纹。
@@ -886,6 +883,16 @@ pub fn wrap_request_v2(
         }
     }
 
+    let req_type = if !is_agent_request {
+        "image_gen"
+    } else {
+        "agent"
+    };
+
+    if req_type == "agent" && reordered_inner.get("labels").is_none() {
+        reordered_inner["labels"] = official_labels;
+    }
+
     let mut final_request_obj = json!({
         "project": project_id,
         "request": reordered_inner,
@@ -893,14 +900,8 @@ pub fn wrap_request_v2(
         "userAgent": official_user_agent,
         // [CACHE] requestId 移到末尾避免动态值破坏前缀字节一致性
         "requestId": official_request_id,
+        "requestType": req_type,
     });
-
-    let req_type = if !is_agent_request {
-        "image_gen"
-    } else {
-        "agent"
-    };
-    final_request_obj["requestType"] = json!(req_type);
 
     if is_agent_request && enable_g1_credits {
         if let Some(obj) = final_request_obj.as_object_mut() {

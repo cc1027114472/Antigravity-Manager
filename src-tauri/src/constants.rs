@@ -196,8 +196,8 @@ pub static CURRENT_VERSION: LazyLock<String> = LazyLock::new(|| {
 /// Known valid Google language_server build versions and Piper changelist numbers.
 /// Extracted from official binary distributions.
 pub const VALID_AIDEV_VERSIONS: &[(&str, &str)] = &[
+    ("2.31.0", "1017595969"),
     ("2.29.0", "1013060670"),
-    ("2.28.2", "1009437749"),
 ];
 
 /// Known valid OS and architecture pairs for Go runtime.

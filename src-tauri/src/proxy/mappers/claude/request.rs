@@ -1987,19 +1987,15 @@ fn build_generation_config(
         config["thinkingConfig"] = thinking_config;
     }
 
-    // 其他参数
+    // 其他参数（仅在客户端显式传入时透传，对齐官方抓包不默认塞入 topP/topK）
     if let Some(temp) = claude_req.temperature {
         config["temperature"] = json!(temp);
     }
     if let Some(top_p) = claude_req.top_p {
         config["topP"] = json!(top_p);
-    } else {
-        config["topP"] = json!(1.0); // [CHANGED v4.1.24] Default topP=1.0 to match official client
     }
     if let Some(top_k) = claude_req.top_k {
         config["topK"] = json!(top_k);
-    } else {
-        config["topK"] = json!(40); // [ADDED v4.1.24] Default topK=40 to match official client
     }
 
     // web_search 强制 candidateCount=1

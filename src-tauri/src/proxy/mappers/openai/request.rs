@@ -731,13 +731,13 @@ pub fn transform_openai_request(
 
     // 3. 构建请求体
 
-    let mut gen_config = json!({
-        "temperature": request.temperature.unwrap_or(1.0),
-        // [CHANGED v4.1.24] Default topP from 0.95 → 1.0 to match native behavior
-        "topP": request.top_p.unwrap_or(1.0),
-        // [ADDED v4.1.24] topK=40 aligns with official client generationConfig
-        "topK": 40,
-    });
+    let mut gen_config = json!({});
+    if let Some(temp) = request.temperature {
+        gen_config["temperature"] = json!(temp);
+    }
+    if let Some(top_p) = request.top_p {
+        gen_config["topP"] = json!(top_p);
+    }
 
     // [FIX] 移除旧的硬编码限额，改为动态查询 (v4.1.29)
     if let Some(max_tokens) = request.max_tokens {
