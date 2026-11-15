@@ -288,19 +288,22 @@ pub fn wrap_request_v2(
                                     obj.insert("thoughtSignature".to_string(), json!(sig));
                                     tracing::debug!("[Gemini-Wrap] Injected signature (len: {}) for session: {}", sig.len(), s_id);
                                 } else {
-                                    // [FIX #2167] Session 缓存为空时对 flash 模型注入哨兵值
-                                    // Flash 模型如果不提供任何签名，Gemini API 会拒绝 functionCall
-                                    let is_flash =
-                                        final_model_name.to_lowercase().contains("gemini-3-flash")
-                                            || final_model_name
-                                                .to_lowercase()
-                                                .contains("gemini-3.1-flash");
-                                    if is_flash {
+                                    // [FIX #2167] Session 缓存为空时对 Flash 与新代际 Gemini 模型注入 Base64 哨兵值
+                                    // Modern Claude 不注入伪哨兵值
+                                    let lower_model = final_model_name.to_lowercase();
+                                    let is_modern_gemini =
+                                        crate::proxy::mappers::common_utils::is_modern_thinking_level_model(&lower_model)
+                                            && !lower_model.contains("claude");
+                                    let is_flash_or_modern_gemini =
+                                        lower_model.contains("gemini-3-flash")
+                                            || lower_model.contains("gemini-3.1-flash")
+                                            || is_modern_gemini;
+                                    if is_flash_or_modern_gemini {
                                         obj.insert(
                                             "thoughtSignature".to_string(),
-                                            json!("skip_thought_signature_validator"),
+                                            json!(crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR),
                                         );
-                                        tracing::debug!("[Gemini-Wrap] [FIX #2167] Injected sentinel signature for flash model (no session cache)");
+                                        tracing::debug!("[Gemini-Wrap] [FIX #2167] Injected Base64 sentinel signature for flash/modern Gemini model (no session cache)");
                                     }
                                 }
                             }
@@ -614,13 +617,15 @@ pub fn wrap_request_v2(
                                     decl_obj.remove("parametersJsonSchema")
                                 {
                                     let mut params = params_json_schema;
-                                    crate::proxy::common::json_schema::clean_json_schema(
+                                    crate::proxy::common::json_schema::clean_official_tool_schema(
                                         &mut params,
                                     );
                                     decl_obj.insert("parameters".to_string(), params);
                                 } else if let Some(params) = decl_obj.get_mut("parameters") {
                                     // 标准 parameters 字段
-                                    crate::proxy::common::json_schema::clean_json_schema(params);
+                                    crate::proxy::common::json_schema::clean_official_tool_schema(
+                                        params,
+                                    );
                                 }
                             }
                         }
@@ -638,30 +643,12 @@ pub fn wrap_request_v2(
         config.request_type
     );
 
-    // Inject googleSearch tool if needed
+    // Inject googleSearch tool if needed (mutually exclusive with functionDeclarations; uses official enhancedContent payload)
     if config.inject_google_search {
-        // [NEW] 阶段 7.3: 如果是 WebSearch 类型，注入官方特定属性 (maxResultCount: 5)
-        if config.request_type == "web_search" {
-            if let Some(obj) = inner_request.as_object_mut() {
-                let tools_entry = obj.entry("tools").or_insert_with(|| json!([]));
-                if let Some(tools_arr) = tools_entry.as_array_mut() {
-                    tools_arr.push(json!({
-                        "googleSearch": {
-                            "enhancedContent": {
-                                "imageSearch": {
-                                    "maxResultCount": 5
-                                }
-                            }
-                        }
-                    }));
-                }
-            }
-        } else {
-            crate::proxy::mappers::common_utils::inject_google_search_tool(
-                &mut inner_request,
-                Some(&config.final_model),
-            );
-        }
+        crate::proxy::mappers::common_utils::inject_google_search_tool(
+            &mut inner_request,
+            Some(&config.final_model),
+        );
     }
 
     // Inject imageConfig if present (for image generation models)
@@ -888,6 +875,12 @@ pub fn wrap_request_v2(
         "requestId": official_request_id,
         "requestType": req_type,
     });
+
+    if req_type == "web_search" {
+        crate::proxy::mappers::common_utils::apply_web_search_envelope_overrides(
+            &mut final_request_obj,
+        );
+    }
 
     if is_agent_request && enable_g1_credits {
         if let Some(obj) = final_request_obj.as_object_mut() {

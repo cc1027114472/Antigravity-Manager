@@ -6,18 +6,58 @@ use serde_json::{json, Value};
 /// 不被 Gemini 支持但包含重要语义信息的约束字段
 /// 这些字段将在删除前被转化为 description 提示
 const CONSTRAINT_FIELDS: &[(&str, &str)] = &[
-    ("minLength", "minLen"),
     ("maxLength", "maxLen"),
     ("pattern", "pattern"),
-    ("minimum", "min"),
     ("maximum", "max"),
     ("multipleOf", "multipleOf"),
     ("exclusiveMinimum", "exclMin"),
     ("exclusiveMaximum", "exclMax"),
-    ("minItems", "minItems"),
     ("maxItems", "maxItems"),
     ("format", "format"),
 ];
+
+/// Recursively uppercase `"type"` string fields in a cleaned Gemini tool schema
+/// (`"object"` -> `"OBJECT"`, `"string"` -> `"STRING"`, etc.), matching official
+/// Antigravity v1internal `functionDeclarations[].parameters` format.
+pub fn enforce_uppercase_types(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(t)) = map.get_mut("type") {
+                *t = t.to_uppercase();
+            }
+            for (k, v) in map.iter_mut() {
+                if k == "properties" {
+                    if let Some(props_map) = v.as_object_mut() {
+                        for prop_schema in props_map.values_mut() {
+                            enforce_uppercase_types(prop_schema);
+                        }
+                    }
+                } else if k != "enum" && k != "required" {
+                    enforce_uppercase_types(v);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                enforce_uppercase_types(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Clean a JSON Schema for official Antigravity v1internal `functionDeclarations[].parameters`:
+/// preserves `minLength`, `minItems`, and `minimum`, ensures root `"type": "OBJECT"` if absent,
+/// and converts schema `"type"` values to UPPERCASE.
+pub fn clean_official_tool_schema(value: &mut Value) {
+    clean_json_schema(value);
+    if let Some(obj) = value.as_object_mut() {
+        if !obj.contains_key("type") {
+            obj.insert("type".to_string(), serde_json::json!("OBJECT"));
+        }
+    }
+    enforce_uppercase_types(value);
+}
 
 /// 全局工具适配器注册表
 ///
@@ -421,6 +461,9 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                 "items",
                 "enum",
                 "title",
+                "minLength",
+                "minItems",
+                "minimum",
             ];
 
             let has_standard_keyword = map.keys().any(|k| allowed_fields.contains(&k.as_str()));
@@ -962,13 +1005,13 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["location"]["type"], "string");
 
-        // 2. 验证标准字段被移除并转为描述 (Robust Constraint Migration)
-        assert!(schema["properties"]["location"].get("minLength").is_none());
+        // 2. 验证 minLength / minItems / minimum 保留，其余约束转为描述 (Official Schema + Constraint Migration)
+        assert_eq!(schema["properties"]["location"]["minLength"], 1);
         assert!(schema["properties"]["location"].get("format").is_none());
         assert!(schema["properties"]["location"]["description"]
             .as_str()
             .unwrap()
-            .contains("[Constraint: minLen: 1, format: city]"));
+            .contains("[Constraint: format: city]"));
 
         // 3. 验证名为 "pattern" 的属性未被误删
         assert!(schema["properties"].get("pattern").is_some());

@@ -3,6 +3,58 @@
 
 use serde_json::{json, Value};
 
+/// Base64 sentinel observed in official Antigravity captures (`"skip_thought_signature_validator"`).
+pub const SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str =
+    "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=";
+
+/// Model used by official Antigravity for standalone `web_search` requests.
+pub const WEB_SEARCH_MODEL: &str = "gemini-3.5-flash-lite";
+
+/// Build the official `googleSearch` tool declaration observed in captures.
+pub fn build_official_google_search_tool() -> Value {
+    json!({
+        "googleSearch": {
+            "enhancedContent": {
+                "imageSearch": {
+                    "maxResultCount": 5
+                }
+            }
+        }
+    })
+}
+
+/// Build a standardized Gemini `functionResponse` part using official `"output"` / `"error"` keys.
+pub fn build_function_response_part(
+    name: &str,
+    id: Option<&str>,
+    response_val: Value,
+    is_error: bool,
+) -> Value {
+    let key = if is_error { "error" } else { "output" };
+    let mut fr = serde_json::Map::new();
+    fr.insert("name".to_string(), json!(name));
+    fr.insert("response".to_string(), json!({ key: response_val }));
+    if let Some(id_str) = id {
+        fr.insert("id".to_string(), json!(id_str));
+    }
+    json!({ "functionResponse": Value::Object(fr) })
+}
+
+/// Normalize inner & outer v1internal envelope fields for `web_search` requests
+/// to match official Antigravity captures (`generationConfig: {"candidateCount": 1}`,
+/// and no `sessionId`, `labels`, `toolConfig`, or outer `requestId`).
+pub fn apply_web_search_envelope_overrides(outer_body: &mut Value) {
+    if let Some(inner_obj) = outer_body.get_mut("request").and_then(|v| v.as_object_mut()) {
+        inner_obj.insert("generationConfig".to_string(), json!({ "candidateCount": 1 }));
+        inner_obj.remove("sessionId");
+        inner_obj.remove("labels");
+        inner_obj.remove("toolConfig");
+    }
+    if let Some(outer_obj) = outer_body.as_object_mut() {
+        outer_obj.remove("requestId");
+    }
+}
+
 /// Request configuration after grounding resolution
 #[derive(Debug, Clone)]
 pub struct RequestConfig {
@@ -93,7 +145,8 @@ pub fn resolve_request_config(
     // Strip -online suffix from original model if present (to detect networking intent)
     let is_online_suffix = original_model.ends_with("-online");
 
-    // High-quality grounding allowlist (Only for models known to support search and be relatively 'safe')
+    // Gemini search allowlist: Claude/OpenAI/unlisted models do not support native googleSearch
+    // grounding directly and must fall back to WEB_SEARCH_MODEL (gemini-3.5-flash-lite).
     let _is_high_quality_model = mapped_model == "gemini-2.5-flash"
         || mapped_model == "gemini-1.5-pro"
         || mapped_model.starts_with("gemini-1.5-pro-")
@@ -106,13 +159,7 @@ pub fn resolve_request_config(
         || mapped_model.starts_with("gemini-3-flash")
         || mapped_model.starts_with("gemini-3.5-flash")
         || mapped_model.starts_with("gemini-4")
-        || mapped_model.starts_with("agent")
-        || mapped_model.contains("claude-3-5-sonnet")
-        || mapped_model.contains("claude-3-opus")
-        || mapped_model.contains("claude-sonnet")
-        || mapped_model.contains("claude-opus")
-        || mapped_model.contains("claude-4")
-        || mapped_model.contains("claude-5");
+        || mapped_model.starts_with("agent");
 
     // Determine if we should enable networking
     // [FIX] 禁用基于模型的自动联网逻辑，防止图像请求被联网搜索结果覆盖。
@@ -134,13 +181,14 @@ pub fn resolve_request_config(
     };
 
     // [FIX] Check allowlist before forcing downgrade
-    // If networking is enabled but the model doesn't support search, fall back to Flash
+    // If networking is enabled but the model doesn't support search, fall back to official web_search model
     if enable_networking && !_is_high_quality_model {
         tracing::info!(
-            "[Common-Utils] Downgrading {} to gemini-2.5-flash for web search (model not in search allowlist)",
-            final_model
+            "[Common-Utils] Downgrading {} to {} for web search (model not in search allowlist)",
+            final_model,
+            WEB_SEARCH_MODEL
         );
-        final_model = "gemini-2.5-flash".to_string();
+        final_model = WEB_SEARCH_MODEL.to_string();
     }
 
     RequestConfig {
@@ -413,7 +461,7 @@ fn calculate_aspect_ratio_from_size(size: &str) -> &'static str {
 }
 
 /// Inject current googleSearch tool and ensure no duplicate legacy search tools
-pub fn inject_google_search_tool(body: &mut Value, mapped_model: Option<&str>) {
+pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) {
     if let Some(obj) = body.as_object_mut() {
         let tools_entry = obj.entry("tools").or_insert_with(|| json!([]));
         if let Some(tools_arr) = tools_entry.as_array_mut() {
@@ -442,9 +490,7 @@ pub fn inject_google_search_tool(body: &mut Value, mapped_model: Option<&str>) {
             });
 
             // 注入统一的 googleSearch (v1internal 规范)
-            tools_arr.push(json!({
-                "googleSearch": {}
-            }));
+            tools_arr.push(build_official_google_search_tool());
         }
     }
 }
@@ -720,6 +766,136 @@ mod tests {
         );
         assert_eq!(config.request_type, "image_gen");
         assert!(!config.inject_google_search);
+    }
+
+    #[test]
+    fn test_alignment_web_search_model_tool_and_wrapper_and_schema() {
+        // 1. Web search fallback model aligns with official gemini-3.5-flash-lite
+        let ws_config = resolve_request_config(
+            "claude-sonnet-4-6-online",
+            "claude-sonnet-4-6",
+            &None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(ws_config.request_type, "web_search");
+        assert!(ws_config.inject_google_search);
+        assert_eq!(ws_config.final_model, WEB_SEARCH_MODEL);
+
+        // 2. Official googleSearch payload
+        let gs = build_official_google_search_tool();
+        assert_eq!(
+            gs["googleSearch"]["enhancedContent"]["imageSearch"]["maxResultCount"],
+            5
+        );
+
+        // 3. Official functionResponse keys ("output" / "error")
+        let ok_fr = build_function_response_part("ls", Some("id_1"), json!("ok"), false);
+        assert_eq!(ok_fr["functionResponse"]["response"]["output"], "ok");
+        assert!(ok_fr["functionResponse"]["response"].get("result").is_none());
+        let err_fr = build_function_response_part("ls", Some("id_2"), json!("fail"), true);
+        assert_eq!(err_fr["functionResponse"]["response"]["error"], "fail");
+
+        // 4. Official tool schema cleaning: uppercase types + minLength/minItems/minimum preserved
+        let mut schema = json!({
+            "properties": {
+                "query": { "type": "string", "minLength": 2, "maxLength": 100 },
+                "tags": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                "count": { "type": "integer", "minimum": 0 },
+                "type": { "type": "string" }
+            },
+            "required": ["query"]
+        });
+        crate::proxy::common::json_schema::clean_official_tool_schema(&mut schema);
+        assert_eq!(schema["type"], "OBJECT");
+        assert_eq!(schema["properties"]["query"]["type"], "STRING");
+        assert_eq!(schema["properties"]["query"]["minLength"], 2);
+        assert!(schema["properties"]["query"].get("maxLength").is_none());
+        assert_eq!(schema["properties"]["tags"]["type"], "ARRAY");
+        assert_eq!(schema["properties"]["tags"]["minItems"], 1);
+        assert_eq!(schema["properties"]["tags"]["items"]["type"], "STRING");
+        assert_eq!(schema["properties"]["count"]["type"], "INTEGER");
+        assert_eq!(schema["properties"]["count"]["minimum"], 0);
+        // Property named literally "type" must still have its own schema type uppercased
+        assert_eq!(schema["properties"]["type"]["type"], "STRING");
+
+        // 5. Gemini wrapper: Base64 sentinel for missing flash sig + official web_search envelope
+        let gemini_tool_body = json!({
+            "model": "gemini-3-flash",
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [
+                        { "functionCall": { "name": "ping", "args": {} } }
+                    ]
+                }
+            ],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "ping",
+                            "parameters": {
+                                "type": "object",
+                                "properties": { "host": { "type": "string", "minLength": 1 } }
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+        let wrapped_tool = crate::proxy::mappers::gemini::wrapper::wrap_request_v2(
+            &gemini_tool_body,
+            "proj",
+            "gemini-3-flash",
+            Some("acc_1"),
+            Some("sess_wrap_missing_sig"),
+            None,
+            None,
+        );
+        assert_eq!(
+            wrapped_tool["request"]["contents"][0]["parts"][0]["thoughtSignature"],
+            SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+        assert_eq!(
+            wrapped_tool["request"]["tools"][0]["functionDeclarations"][0]["parameters"]["type"],
+            "OBJECT"
+        );
+        assert_eq!(
+            wrapped_tool["request"]["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]
+                ["host"]["minLength"],
+            1
+        );
+
+        let gemini_ws_body = json!({
+            "model": "gemini-2.5-flash-online",
+            "generationConfig": { "temperature": 0.9, "maxOutputTokens": 4096 },
+            "contents": [{ "role": "user", "parts": [{ "text": "search news" }] }]
+        });
+        let wrapped_ws = crate::proxy::mappers::gemini::wrapper::wrap_request_v2(
+            &gemini_ws_body,
+            "proj",
+            "gemini-3-flash",
+            Some("acc_1"),
+            Some("sess_ws"),
+            None,
+            None,
+        );
+        assert_eq!(wrapped_ws["requestType"], "web_search");
+        assert!(wrapped_ws.get("requestId").is_none());
+        assert!(wrapped_ws["request"].get("sessionId").is_none());
+        assert!(wrapped_ws["request"].get("labels").is_none());
+        assert_eq!(
+            wrapped_ws["request"]["generationConfig"],
+            json!({ "candidateCount": 1 })
+        );
+        assert_eq!(
+            wrapped_ws["request"]["tools"][0]["googleSearch"]["enhancedContent"]["imageSearch"]
+                ["maxResultCount"],
+            5
+        );
     }
 
     #[test]

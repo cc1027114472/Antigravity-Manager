@@ -292,8 +292,13 @@ pub fn transform_openai_request(
     let session_thought_sig =
         crate::proxy::SignatureCache::global().get_session_signature(&session_id);
 
-    if is_claude_thinking && has_incompatible_assistant_history && session_thought_sig.is_none() {
-        tracing::warn!("[OpenAI-Thinking] Incompatible assistant history detected for Claude thinking model without session signature. Disabling thinking for this request to avoid 400 error. (sid: {})", session_id);
+    let is_modern_claude = is_modern_thinking && mapped_model_lower.contains("claude");
+    if is_claude_thinking
+        && !is_modern_claude
+        && has_incompatible_assistant_history
+        && session_thought_sig.is_none()
+    {
+        tracing::warn!("[OpenAI-Thinking] Incompatible assistant history detected for legacy Claude thinking model without session signature. Disabling thinking for this request to avoid 400 error. (sid: {})", session_id);
         actual_include_thinking = false;
     }
 
@@ -477,16 +482,12 @@ pub fn transform_openai_request(
                 // "Expected thinking... but found tool_use/text"
                 // 如果是思维模型且缺失 reasoning_content, 则注入占位符
                 tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block for assistant message");
-                let mut thought_part = json!({
+                let thought_part = json!({
                     "text": "Applying tool decisions and generating response...",
                     "thought": true,
                 });
 
-                // [FIX #1575] 占位符永远不能使用真实签名（签名与真实思考内容绑定）
-                // 仅 Gemini 支持哨兵值跳过验证
-                if is_gemini_3_thinking {
-                    thought_part["thoughtSignature"] = json!("skip_thought_signature_validator");
-                }
+                // [ALIGN] Official captures never attach thoughtSignature to synthetic text thought placeholders (`on_text_thought: 0`).
 
                 parts.push(thought_part);
             }
@@ -622,12 +623,16 @@ pub fn transform_openai_request(
 
                     if let Some(ref sig) = thought_sig {
                         func_call_part["thoughtSignature"] = json!(sig);
-                    } else if is_thinking_model || is_gemini_flash_thinking {
-                        // [NEW] Handle missing signature for Gemini thinking models
-                        // [FIX #1650] Allow sentinel injection for Vertex AI (projects/...) as well
-                        // [FIX #2167] Also applies to gemini-3-flash / gemini-3.1-flash
-                        tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
-                        func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+                    } else if !is_modern_claude && (is_thinking_model || is_gemini_flash_thinking) {
+                        // Modern Claude omits thoughtSignature on missing functionCall history;
+                        // Gemini thinking / legacy thinking models use the Base64 sentinel value.
+                        tracing::debug!(
+                            "[OpenAI-Signature] Adding SKIP_THOUGHT_SIGNATURE_VALIDATOR for tool_use: {}",
+                            tc.id
+                        );
+                        func_call_part["thoughtSignature"] = json!(
+                            crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR
+                        );
                     }
 
                     parts.push(func_call_part);
@@ -682,13 +687,12 @@ pub fn transform_openai_request(
                     None => "".to_string()
                 };
 
-                parts.push(json!({
-                    "functionResponse": {
-                       "name": final_name,
-                       "response": { "result": content_val },
-                       "id": msg.tool_call_id.clone().unwrap_or_default()
-                    }
-                }));
+                parts.push(crate::proxy::mappers::common_utils::build_function_response_part(
+                    final_name,
+                    Some(msg.tool_call_id.as_deref().unwrap_or("")),
+                    json!(content_val),
+                    false,
+                ));
 
                 for extra in extra_parts {
                     parts.push(extra);
@@ -1065,20 +1069,8 @@ pub fn transform_openai_request(
                         }),
                     );
                 } else if let Some(params) = gemini_func.get_mut("parameters") {
-                    // [DEEP FIX] 统一调用公共库清洗：展开 $ref 并剔除所有层级的 format/definitions
-                    crate::proxy::common::json_schema::clean_json_schema(params);
-
-                    // Gemini v1internal 要求：
-                    // 1. type 必须是大写 (OBJECT, STRING 等)
-                    // 2. 根对象必须有 "type": "OBJECT"
-                    if let Some(params_obj) = params.as_object_mut() {
-                        if !params_obj.contains_key("type") {
-                            params_obj.insert("type".to_string(), json!("OBJECT"));
-                        }
-                    }
-
-                    // 递归转换 type 为大写 (符合 Protobuf 定义)
-                    enforce_uppercase_types(params);
+                    // [ALIGN] Clean schema (preserving minLength/minItems/minimum) and uppercase types
+                    crate::proxy::common::json_schema::clean_official_tool_schema(params);
                 } else {
                     gemini_func.as_object_mut().unwrap().insert(
                         "parameters".to_string(),
@@ -1126,23 +1118,21 @@ pub fn transform_openai_request(
     if !function_declarations.is_empty() {
         inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
 
-        let mut mode = "VALIDATED";
         if let Some(tool_choice) = &request.tool_choice {
-            if let Some(s) = tool_choice.as_str() {
+            let mode = if let Some(s) = tool_choice.as_str() {
                 match s {
-                    "none" => mode = "NONE",
-                    "auto" => mode = "AUTO",
-                    "required" => mode = "ANY",
-                    _ => mode = "ANY",
+                    "none" => "NONE",
+                    "auto" => "AUTO",
+                    "required" => "ANY",
+                    _ => "ANY",
                 }
             } else {
-                mode = "ANY";
-            }
+                "ANY"
+            };
+            inner_request["toolConfig"] = json!({
+                "functionCallingConfig": { "mode": mode }
+            });
         }
-
-        inner_request["toolConfig"] = json!({
-            "functionCallingConfig": { "mode": mode }
-        });
     }
 
     // Fallback identity only. Codex system/developer prompts are preserved by
@@ -1293,6 +1283,10 @@ pub fn transform_openai_request(
         "requestType": req_type,
     });
 
+    if req_type == "web_search" {
+        crate::proxy::mappers::common_utils::apply_web_search_envelope_overrides(&mut final_body);
+    }
+
     // [CACHE:L3] 使用多层级缓存的 compute_prefix_hash 计算组合哈希
     // Layer 1 + Layer 2 的独立 hash 组合 → Layer 3 key
     let prefix_hash = {
@@ -1332,30 +1326,6 @@ pub fn transform_openai_request(
     }
 
     (final_body, session_id, message_count, prefix_hash)
-}
-
-fn enforce_uppercase_types(value: &mut Value) {
-    if let Value::Object(map) = value {
-        if let Some(type_val) = map.get_mut("type") {
-            if let Value::String(ref mut s) = type_val {
-                *s = s.to_uppercase();
-            }
-        }
-        if let Some(properties) = map.get_mut("properties") {
-            if let Value::Object(ref mut props) = properties {
-                for v in props.values_mut() {
-                    enforce_uppercase_types(v);
-                }
-            }
-        }
-        if let Some(items) = map.get_mut("items") {
-            enforce_uppercase_types(items);
-        }
-    } else if let Value::Array(arr) = value {
-        for item in arr {
-            enforce_uppercase_types(item);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1717,16 +1687,16 @@ mod tests {
             .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
             .expect("Should find functionCall part");
 
-        // Vertex AI requires sentinel
+        // Vertex AI requires sentinel (Base64 format matching official captures)
         assert_eq!(
             tool_part["thoughtSignature"].as_str(),
-            Some("skip_thought_signature_validator")
+            Some(crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR)
         );
     }
 
     #[test]
     fn test_issue_2167_gemini_flash_thinking_signature() {
-        // [FIX #2167] gemini-3-flash / gemini-3.1-flash 在无缓存签名时，functionCall 必须携带 thoughtSignature
+        // [FIX #2167] gemini-3-flash / gemini-3.1-flash 在无缓存签名时，functionCall 必须携带 Base64 thoughtSignature 哨兵
         for model in &["gemini-3-flash", "gemini-3.1-flash"] {
             let req = OpenAIRequest {
                 model: model.to_string(),
@@ -1771,10 +1741,163 @@ mod tests {
 
             assert_eq!(
                 tool_part["thoughtSignature"].as_str(),
-                Some("skip_thought_signature_validator"),
-                "[{model}] gemini-3-flash functionCall must contain thoughtSignature sentinel"
+                Some(crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR),
+                "[{model}] gemini-3-flash functionCall must contain Base64 thoughtSignature sentinel"
             );
         }
+    }
+
+    #[test]
+    fn test_alignment_openai_modern_claude_output_no_validated_and_web_search() {
+        // 1. Modern Claude + tool history + synthetic placeholder + functionResponse + toolConfig absence
+        let req = OpenAIRequest {
+            model: "claude-sonnet-5-5".to_string(),
+            messages: vec![
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("Check weather".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    refusal: None,
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".to_string(),
+                        r#type: "function".to_string(),
+                        function: Some(ToolFunction {
+                            name: "get_weather".to_string(),
+                            arguments: "{\"city\":\"Paris\"}".to_string(),
+                        }),
+                        status: None,
+                        call_id: None,
+                        operation: None,
+                    }]),
+                    tool_call_id: None,
+                    name: None,
+                },
+                OpenAIMessage {
+                    role: "tool".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("20C".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                    name: Some("get_weather".to_string()),
+                },
+            ],
+            tools: Some(vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": { "type": "string", "minLength": 2 }
+                        },
+                        "required": ["city"]
+                    }
+                }
+            })]),
+            tool_choice: None,
+            ..Default::default()
+        };
+
+        let (res, _, _, _) = transform_openai_request(&req, "proj", "claude-sonnet-5-5", None);
+        assert!(res["request"].get("toolConfig").is_none());
+        assert!(res["request"]["generationConfig"]
+            .get("thinkingConfig")
+            .is_some());
+
+        let contents = res["request"]["contents"].as_array().unwrap();
+        let fc_part = contents[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p.get("functionCall").is_some())
+            .unwrap();
+        assert!(fc_part.get("thoughtSignature").is_none());
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["response"]["output"],
+            "20C"
+        );
+        let decl = &res["request"]["tools"][0]["functionDeclarations"][0];
+        assert_eq!(decl["parameters"]["type"], "OBJECT");
+        assert_eq!(decl["parameters"]["properties"]["city"]["minLength"], 2);
+
+        // 2. Placeholder thought block must never carry thoughtSignature even for gemini-3-pro
+        let ph_req = OpenAIRequest {
+            model: "gemini-3-pro".to_string(),
+            messages: vec![OpenAIMessage {
+                role: "assistant".to_string(),
+                refusal: None,
+                content: Some(OpenAIContent::String("answer".to_string())),
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_ph".to_string(),
+                    r#type: "function".to_string(),
+                    function: Some(ToolFunction {
+                        name: "noop".to_string(),
+                        arguments: "{}".to_string(),
+                    }),
+                    status: None,
+                    call_id: None,
+                    operation: None,
+                }]),
+                tool_call_id: None,
+                name: None,
+            }],
+            ..Default::default()
+        };
+        let (ph_res, _, _, _) = transform_openai_request(&ph_req, "proj", "gemini-3-pro", None);
+        for msg in ph_res["request"]["contents"].as_array().unwrap() {
+            for part in msg["parts"].as_array().unwrap() {
+                if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+                    assert!(part.get("thoughtSignature").is_none());
+                }
+            }
+        }
+
+        // 3. Web search alignment via OpenAI
+        let ws_req = OpenAIRequest {
+            model: "gpt-4o-online".to_string(),
+            messages: vec![OpenAIMessage {
+                role: "user".to_string(),
+                refusal: None,
+                content: Some(OpenAIContent::String("search".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: Some(0.5),
+            ..Default::default()
+        };
+        let (ws_res, _, _, _) =
+            transform_openai_request(&ws_req, "proj", "claude-sonnet-4-6", None);
+        assert_eq!(ws_res["requestType"], "web_search");
+        assert_eq!(
+            ws_res["model"],
+            crate::proxy::mappers::common_utils::WEB_SEARCH_MODEL
+        );
+        assert!(ws_res.get("requestId").is_none());
+        assert!(ws_res["request"].get("sessionId").is_none());
+        assert!(ws_res["request"].get("labels").is_none());
+        assert_eq!(
+            ws_res["request"]["generationConfig"],
+            json!({ "candidateCount": 1 })
+        );
+        assert_eq!(
+            ws_res["request"]["tools"][0]["googleSearch"]["enhancedContent"]["imageSearch"]
+                ["maxResultCount"],
+            5
+        );
     }
 
     #[test]

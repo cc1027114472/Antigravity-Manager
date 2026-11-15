@@ -456,9 +456,6 @@ pub fn transform_claude_request_in(
     );
 
     //  Map model name (Use standard mapping)
-    // [IMPROVED] 提取 web search 模型为常量，便于维护
-    const WEB_SEARCH_FALLBACK_MODEL: &str = "gemini-2.5-flash";
-
     let mapped_model =
         crate::proxy::common::model_mapping::map_claude_model_to_gemini(&claude_req.model);
 
@@ -569,11 +566,13 @@ pub fn transform_claude_request_in(
             )
         {
             // [FIX #2167] Flash 与新代际 Gemini 模型无签名时使用哨兵值而不是禁用 thinking
-            // 禁用 thinking 会导致模型失去思考能力，哨兵值可让 Gemini 跳过签名校验
-            let is_flash_model = mapped_model.contains("gemini-3-flash")
-                || mapped_model.contains("gemini-3.1-flash")
-                || (is_modern_thinking && mapped_model.contains("gemini"));
-            if is_flash_model {
+            // Modern Claude (5.x+) 在工具历史无签名时同样保持 thinking 开启且不伪造签名
+            let lower_mapped = mapped_model.to_lowercase();
+            let is_flash_model = lower_mapped.contains("gemini-3-flash")
+                || lower_mapped.contains("gemini-3.1-flash")
+                || (is_modern_thinking && lower_mapped.contains("gemini"));
+            let is_modern_claude = is_modern_thinking && lower_mapped.contains("claude");
+            if is_flash_model || is_modern_claude {
                 tracing::info!(
                     "[Thinking-Mode] [FIX #2167] No signature for flash model function calls. \
                      Will rely on sentinel injection in build_contents."
@@ -593,7 +592,7 @@ pub fn transform_claude_request_in(
     let generation_config = build_generation_config(
         claude_req,
         &mapped_model,
-        has_web_search_tool,
+        has_web_search_tool || config.request_type == "web_search",
         is_thinking_enabled,
         token, // [NEW] 传递 token 用于动态限额
     );
@@ -612,7 +611,11 @@ pub fn transform_claude_request_in(
     )?;
 
     // 3. Tools
-    let tools = build_tools(&claude_req.tools, has_web_search_tool, &mapped_model)?;
+    let tools = build_tools(
+        &claude_req.tools,
+        has_web_search_tool || config.inject_google_search,
+        &mapped_model,
+    )?;
 
     // Build inner request (official client never sends safetySettings)
     let mut inner_request = json!({
@@ -630,12 +633,6 @@ pub fn transform_claude_request_in(
 
     if let Some(tools_val) = tools {
         inner_request["tools"] = tools_val;
-        // 显式设置工具配置模式为 VALIDATED
-        inner_request["toolConfig"] = json!({
-            "functionCallingConfig": {
-                "mode": "VALIDATED"
-            }
-        });
     }
 
     // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
@@ -718,6 +715,10 @@ pub fn transform_claude_request_in(
         "userAgent": "antigravity",
         "requestType": req_type,
     });
+
+    if req_type == "web_search" {
+        crate::proxy::mappers::common_utils::apply_web_search_envelope_overrides(&mut body);
+    }
 
     // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
     // 确保发送给 Antigravity 的请求中不包含任何 cache_control
@@ -1331,13 +1332,22 @@ fn build_contents(
                                 }
                             }
                         } else {
-                            // [NEW] Handle missing signature for Gemini thinking models
-                            // Use skip_thought_signature_validator as a sentinel value
+                            // Modern Claude omits thoughtSignature on missing functionCall history;
+                            // Gemini thinking models use the Base64 sentinel value.
+                            let lower_mapped = mapped_model.to_lowercase();
                             let is_google_cloud = mapped_model.starts_with("projects/");
-                            if is_thinking_enabled && !is_google_cloud {
-                                tracing::debug!("[Tool-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", id);
-                                part["thoughtSignature"] =
-                                    json!("skip_thought_signature_validator");
+                            let is_modern_claude =
+                                crate::proxy::mappers::common_utils::is_modern_thinking_level_model(
+                                    &lower_mapped,
+                                ) && lower_mapped.contains("claude");
+                            if is_thinking_enabled && !is_google_cloud && !is_modern_claude {
+                                tracing::debug!(
+                                    "[Tool-Signature] Adding SKIP_THOUGHT_SIGNATURE_VALIDATOR for tool_use: {}",
+                                    id
+                                );
+                                part["thoughtSignature"] = json!(
+                                    crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR
+                                );
                             }
                         }
                         parts.push(part);
@@ -1424,18 +1434,13 @@ fn build_contents(
                             }
                         }
 
-                        let mut part = json!({
-                            "functionResponse": {
-                                "name": func_name,
-                                "response": {"result": merged_content},
-                                "id": tool_use_id
-                            }
-                        });
-
-                        // [FIX] Tool Result 也需要回填签名（如果上下文中有）
-                        if let Some(sig) = last_thought_signature.as_ref() {
-                            part["thoughtSignature"] = json!(sig);
-                        }
+                        let part =
+                            crate::proxy::mappers::common_utils::build_function_response_part(
+                                &func_name,
+                                Some(&tool_use_id),
+                                json!(merged_content),
+                                is_error.unwrap_or(false),
+                            );
 
                         parts.push(part);
 
@@ -1471,15 +1476,13 @@ fn build_contents(
             for id in missing_ids.iter().rev() {
                 // Insert in reverse order to maintain order at index 0? No, just insert at 0.
                 let name = tool_id_to_name.get(id).cloned().unwrap_or(id.clone());
-                let synthetic_part = json!({
-                    "functionResponse": {
-                        "name": name,
-                        "response": {
-                            "result": "Tool execution interrupted. No result provided."
-                        },
-                        "id": id
-                    }
-                });
+                let synthetic_part =
+                    crate::proxy::mappers::common_utils::build_function_response_part(
+                        &name,
+                        Some(id),
+                        json!("Tool execution interrupted. No result provided."),
+                        true,
+                    );
                 // Prepend to ensure they are present before any text
                 parts.insert(0, synthetic_part);
             }
@@ -1583,15 +1586,12 @@ fn build_google_content(
             .filter(|id| !existing_tool_result_ids.contains(*id)) // [FIX #632] Only inject if ID is truly missing
             .map(|id| {
                 let name = tool_id_to_name.get(id).cloned().unwrap_or(id.clone());
-                json!({
-                    "functionResponse": {
-                        "name": name,
-                        "response": {
-                            "result": "Tool execution interrupted. No result provided."
-                        },
-                        "id": id
-                    }
-                })
+                crate::proxy::mappers::common_utils::build_function_response_part(
+                    &name,
+                    Some(id),
+                    json!("Tool execution interrupted. No result provided."),
+                    true,
+                )
             })
             .collect();
 
@@ -1786,7 +1786,7 @@ fn build_tools(
                     "type": "object",
                     "properties": {}
                 }));
-                crate::proxy::common::json_schema::clean_json_schema(&mut input_schema);
+                crate::proxy::common::json_schema::clean_official_tool_schema(&mut input_schema);
 
                 function_declarations.push(json!({
                     "name": name,
@@ -1798,13 +1798,8 @@ fn build_tools(
 
         let mut tool_list = Vec::new();
 
-        // [优化] Gemini 2.0+ 及 3.0 系列模型通常支持混合工具调用 (Function Calling + Google Search)
-        // 只有针对老旧模型或特定受限环境才需要互斥。
-        let model_lower = mapped_model.to_lowercase();
-        let supports_mixed_tools = model_lower.contains("gemini-2.0")
-            || model_lower.contains("gemini-2.5")
-            || model_lower.contains("gemini-3");
-
+        // Official Antigravity captures enforce mutual exclusion between
+        // functionDeclarations and googleSearch (even on Gemini 2.0/2.5/3.x).
         if !function_declarations.is_empty() {
             let mut func_obj = serde_json::Map::new();
             func_obj.insert(
@@ -1814,31 +1809,24 @@ fn build_tools(
             tool_list.push(json!(func_obj));
 
             if has_google_search {
-                if supports_mixed_tools {
-                    tracing::info!(
-                        "[Claude-Request] Enabling MIXED tool calling for {}: Function Calling + Google Search.",
-                        mapped_model
-                    );
-                    let mut search_obj = serde_json::Map::new();
-                    search_obj.insert("googleSearch".to_string(), json!({}));
-                    tool_list.push(json!(search_obj));
-                } else {
-                    tracing::info!(
-                        "[Claude-Request] Skipping googleSearch injection for {} due to existing function declarations. \
-                         Older Gemini models may not support mixed tool types.",
-                        mapped_model
-                    );
-                }
+                tracing::info!(
+                    "[Claude-Request] Skipping googleSearch injection for {} due to existing function declarations (tool mutual exclusion).",
+                    mapped_model
+                );
             }
         } else if has_google_search {
-            let mut search_obj = serde_json::Map::new();
-            search_obj.insert("googleSearch".to_string(), json!({}));
-            tool_list.push(json!(search_obj));
+            tool_list.push(
+                crate::proxy::mappers::common_utils::build_official_google_search_tool(),
+            );
         }
 
         if !tool_list.is_empty() {
             return Ok(Some(json!(tool_list)));
         }
+    } else if has_web_search {
+        return Ok(Some(json!([
+            crate::proxy::mappers::common_utils::build_official_google_search_tool()
+        ])));
     }
 
     Ok(None)
@@ -1848,10 +1836,16 @@ fn build_tools(
 fn build_generation_config(
     claude_req: &ClaudeRequest,
     mapped_model: &str,
-    _has_web_search: bool,
+    is_web_search: bool,
     is_thinking_enabled: bool,
     token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW]
 ) -> Value {
+    if is_web_search {
+        return json!({
+            "candidateCount": 1
+        });
+    }
+
     let mut config = json!({});
 
     // Thinking 配置
@@ -2261,7 +2255,7 @@ mod tests {
         // Check removed fields
         assert!(schema.get("$schema").is_none());
         assert!(schema.get("additionalProperties").is_none());
-        assert!(schema["properties"]["location"].get("minLength").is_none());
+        assert_eq!(schema["properties"]["location"]["minLength"], 1);
         assert!(schema["properties"]["unit"].get("default").is_none());
         assert!(schema["properties"]["date"].get("format").is_none());
 
@@ -2335,7 +2329,7 @@ mod tests {
         assert_eq!(func_resp["id"], "call_1");
 
         // Verify merged content
-        let resp_text = func_resp["response"]["result"].as_str().unwrap();
+        let resp_text = func_resp["response"]["output"].as_str().unwrap();
         assert!(resp_text.contains("file1.txt"));
         assert!(resp_text.contains("file2.txt"));
         assert!(resp_text.contains("\n"));
@@ -3121,12 +3115,155 @@ mod tests {
             .any(|t| t.get("functionDeclarations").is_some());
 
         assert!(
-            has_google_search,
-            "Gemini 2.0 should support mixed Google Search"
+            !has_google_search,
+            "functionDeclarations and googleSearch should remain mutually exclusive"
         );
         assert!(
             has_functions,
-            "Gemini 2.0 should support mixed function declarations"
+            "Should preserve function declarations when mixed with search"
+        );
+        assert_eq!(
+            tools_arr[0]["functionDeclarations"][0]["parameters"]["type"],
+            "OBJECT"
+        );
+        assert_eq!(
+            tools_arr[0]["functionDeclarations"][0]["parameters"]["properties"]["location"]["type"],
+            "STRING"
+        );
+    }
+
+    #[test]
+    fn test_alignment_claude_modern_thinking_output_error_and_web_search() {
+        // 1. Modern Claude (claude-sonnet-5-5):
+        //    - keeps thinking enabled even when tool_use lacks signature
+        //    - omits thoughtSignature on modern Claude functionCall
+        //    - uses "error" on is_error tool_result and never backfills thoughtSignature
+        //    - omits default toolConfig: VALIDATED
+        //    - uses uppercase schema types & preserves minLength
+        let req = ClaudeRequest {
+            model: "claude-sonnet-5-5".to_string(),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String("Check weather".to_string()),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: MessageContent::Array(vec![ContentBlock::ToolUse {
+                        id: "call_mod_1".to_string(),
+                        name: "get_weather".to_string(),
+                        input: json!({"location": "Tokyo"}),
+                        signature: None,
+                        cache_control: None,
+                    }]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::Array(vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_mod_1".to_string(),
+                        content: json!("Service timeout"),
+                        is_error: Some(true),
+                    }]),
+                },
+            ],
+            system: None,
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("get_weather".to_string()),
+                description: Some("Get weather".to_string()),
+                input_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "location": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["location"]
+                })),
+            }]),
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        let out = transform_claude_request_in(
+            &req,
+            "proj",
+            false,
+            None,
+            "sess_mod_claude",
+            None,
+        )
+        .expect("transform should succeed");
+
+        assert!(out["request"].get("toolConfig").is_none());
+        assert!(out["request"]["generationConfig"]
+            .get("thinkingConfig")
+            .is_some());
+        let contents = out["request"]["contents"].as_array().unwrap();
+        assert!(contents[1]["parts"][0].get("thoughtSignature").is_none());
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["response"]["error"],
+            "Service timeout"
+        );
+        assert!(contents[2]["parts"][0].get("thoughtSignature").is_none());
+        let decl = &out["request"]["tools"][0]["functionDeclarations"][0];
+        assert_eq!(decl["parameters"]["type"], "OBJECT");
+        assert_eq!(decl["parameters"]["properties"]["location"]["minLength"], 1);
+
+        // 2. Web search alignment: model gemini-3.5-flash-lite, minimal generationConfig,
+        //    official googleSearch, no requestId/sessionId/labels
+        let ws_req = ClaudeRequest {
+            model: "claude-sonnet-4-6-online".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("Latest rust release".to_string()),
+            }],
+            system: None,
+            tools: None,
+            stream: false,
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            top_p: None,
+            top_k: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        let ws_out = transform_claude_request_in(
+            &ws_req,
+            "proj",
+            false,
+            None,
+            "sess_ws_claude",
+            None,
+        )
+        .expect("web_search transform should succeed");
+
+        assert_eq!(ws_out["requestType"], "web_search");
+        assert_eq!(
+            ws_out["model"],
+            crate::proxy::mappers::common_utils::WEB_SEARCH_MODEL
+        );
+        assert!(ws_out.get("requestId").is_none());
+        assert!(ws_out["request"].get("sessionId").is_none());
+        assert!(ws_out["request"].get("labels").is_none());
+        assert_eq!(
+            ws_out["request"]["generationConfig"],
+            json!({ "candidateCount": 1 })
+        );
+        assert_eq!(
+            ws_out["request"]["tools"][0]["googleSearch"]["enhancedContent"]["imageSearch"]
+                ["maxResultCount"],
+            5
         );
     }
 
