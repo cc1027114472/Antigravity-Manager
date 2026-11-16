@@ -117,7 +117,7 @@ pub async fn handle_warmup(
                     "ping".to_string(),
                 ),
             }],
-            max_tokens: Some(1),
+            max_tokens: None,
             stream: false,
             system: None,
             temperature: None,
@@ -125,7 +125,7 @@ pub async fn handle_warmup(
             top_k: None,
             tools: None,
             metadata: Some(crate::proxy::mappers::claude::models::Metadata {
-                user_id: Some(session_id),
+                user_id: Some(session_id.clone()),
             }),
             thinking: None,
             output_config: None,
@@ -133,12 +133,18 @@ pub async fn handle_warmup(
             quality: None,
         };
 
+        let acc_opt = if account_id.is_empty() {
+            None
+        } else {
+            Some(account_id.as_str())
+        };
+
         match crate::proxy::mappers::claude::transform_claude_request_in(
             &claude_request,
             &project_id,
             false,
-            None,
-            "warmup",
+            acc_opt,
+            &session_id,
             None, // [NEW] No token for warmup
         ) {
             Ok(transformed) => transformed,
@@ -162,7 +168,6 @@ pub async fn handle_warmup(
                 "contents": [{"role": "user", "parts": [{"text": "Say hi"}]}],
                 "generationConfig": {
                     "maxOutputTokens": 10,
-                    "temperature": 0,
                     "responseModalities": ["TEXT"]
                 }
             })
@@ -170,7 +175,6 @@ pub async fn handle_warmup(
             json!({
                 "contents": [{"role": "user", "parts": [{"text": "Say hi"}]}],
                 "generationConfig": {
-                    "temperature": 0.2,
                     "maxOutputTokens": 128
                 }
             })

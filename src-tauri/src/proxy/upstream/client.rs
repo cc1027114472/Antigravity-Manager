@@ -140,20 +140,9 @@ impl UpstreamClient {
         }
     }
 
-    /// [WARMUP] 官方协议级 TLS / HTTP/2 预热：异步与上游端点建立 TLS 握手并保活长连接
-    /// 零模型推理消耗，不产生空对话探针，消除高频冷启动指纹并降低用户首字延迟 (TTFT)
+    /// [NO-OP] 不再向 `/v1internal` 发送无意义的 `HEAD` 探测请求（抓包确认官方客户端零此类探测，且 REST 根路径恒返 404 噪声）
     pub async fn warmup_endpoints_async(&self) {
-        let client = self.default_client.read().await.clone();
-        tokio::spawn(async move {
-            for endpoint in V1_INTERNAL_BASE_URL_FALLBACKS {
-                let _ = client
-                    .head(endpoint)
-                    .timeout(std::time::Duration::from_secs(5))
-                    .send()
-                    .await;
-            }
-            tracing::info!("Upstream endpoints TLS & HTTP/2 connection pool prewarmed");
-        });
+        tracing::debug!("Skipping HEAD /v1internal warmup probe to match official client traffic");
     }
 
     /// [HOT-RELOAD] Rebuild the default HTTP client using the supplied upstream

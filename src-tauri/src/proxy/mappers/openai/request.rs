@@ -564,7 +564,9 @@ pub fn transform_openai_request(
 
             // Handle tool calls (assistant message)
             if let Some(tool_calls) = &msg.tool_calls {
-                for (_index, tc) in tool_calls.iter().enumerate() {
+                // 官方并行 functionCall 抓包特征：同一 model 轮次内仅首个 functionCall 携带 thoughtSignature
+                let mut attached_fc_sig = false;
+                for tc in tool_calls.iter() {
                     /* 暂时移除：防止 Codex CLI 界面碎片化
                     if index == 0 && parts.is_empty() {
                          if mapped_model.contains("gemini-3") {
@@ -608,18 +610,24 @@ pub fn transform_openai_request(
                     // [New] 递归清理参数中可能存在的非法校验字段
                     crate::proxy::common::json_schema::clean_json_schema(&mut func_call_part);
 
-                    if let Some(ref sig) = thought_sig {
-                        func_call_part["thoughtSignature"] = json!(sig);
-                    } else if !is_modern_claude && (is_thinking_model || is_gemini_flash_thinking) {
-                        // Modern Claude omits thoughtSignature on missing functionCall history;
-                        // Gemini thinking / legacy thinking models use the Base64 sentinel value.
-                        tracing::debug!(
-                            "[OpenAI-Signature] Adding SKIP_THOUGHT_SIGNATURE_VALIDATOR for tool_use: {}",
-                            tc.id
-                        );
-                        func_call_part["thoughtSignature"] = json!(
-                            crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR
-                        );
+                    if !attached_fc_sig {
+                        if let Some(ref sig) = thought_sig {
+                            func_call_part["thoughtSignature"] = json!(sig);
+                            attached_fc_sig = true;
+                        } else if !is_modern_claude
+                            && (is_thinking_model || is_gemini_flash_thinking)
+                        {
+                            // Modern Claude omits thoughtSignature on missing functionCall history;
+                            // Gemini thinking / legacy thinking models use the Base64 sentinel value on first FC.
+                            tracing::debug!(
+                                "[OpenAI-Signature] Adding SKIP_THOUGHT_SIGNATURE_VALIDATOR for tool_use: {}",
+                                tc.id
+                            );
+                            func_call_part["thoughtSignature"] = json!(
+                                crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR
+                            );
+                            attached_fc_sig = true;
+                        }
                     }
 
                     parts.push(func_call_part);
@@ -727,10 +735,12 @@ pub fn transform_openai_request(
         gen_config["topP"] = json!(top_p);
     }
 
-    // [FIX] 移除旧的硬编码限额，改为动态查询 (v4.1.29)
+    // [FIX] 移除旧的硬编码限额，改为动态查询 (v4.1.29)；官方省略默认 maxOutputTokens 的模型保持省略
     if let Some(max_tokens) = request.max_tokens {
         gen_config["maxOutputTokens"] = json!(max_tokens);
-    } else {
+    } else if !crate::proxy::mappers::common_utils::should_omit_default_max_output_tokens(
+        mapped_model,
+    ) {
         // 使用动态优先的规格限额
         let limit = model_specs::get_max_output_tokens(mapped_model, token);
         gen_config["maxOutputTokens"] = json!(limit);
@@ -741,15 +751,7 @@ pub fn transform_openai_request(
         gen_config["candidateCount"] = json!(n);
     }
 
-    if let Some(presence_penalty) = request.presence_penalty {
-        gen_config["presencePenalty"] = json!(presence_penalty);
-    }
-    if let Some(frequency_penalty) = request.frequency_penalty {
-        gen_config["frequencyPenalty"] = json!(frequency_penalty);
-    }
-    if let Some(seed) = request.seed {
-        gen_config["seed"] = json!(seed);
-    }
+    // [FIXED] Official Antigravity client never sends presencePenalty / frequencyPenalty / seed (0/3322 captures).
 
     // 为 thinking 模型注入 thinkingConfig (使用 thinkingBudget 而非 thinkingLevel)
     if actual_include_thinking {
@@ -902,20 +904,7 @@ pub fn transform_openai_request(
         }
     }
 
-    if let Some(stop) = &request.stop {
-        let model_lower = mapped_model.to_lowercase();
-        if !model_lower.contains("claude-opus-4-6-thinking") {
-            if stop.is_string() {
-                gen_config["stopSequences"] = json!([stop]);
-            } else if stop.is_array() {
-                gen_config["stopSequences"] = stop.clone();
-            }
-        } else {
-            tracing::debug!(
-                "[Opus-Alignment] Skipping stopSequences for Opus 4.6 to match OpenAI protocol"
-            );
-        }
-    }
+    // [FIXED] Official Antigravity client never sends stopSequences in generationConfig (0/3322 captures).
 
     if let Some(fmt) = &request.response_format {
         if fmt.r#type == "json_object" {
@@ -947,7 +936,7 @@ pub fn transform_openai_request(
         let raw_json = serde_json::to_string(original_tools).unwrap_or_default();
         if !raw_json.is_empty() {
             let key = crate::proxy::cache_manager::CacheManager::compute_tools_key(&format!(
-                "official_tool_schema_v3:{raw_json}"
+                "official_tool_schema_v4:{raw_json}"
             ));
             let cm = crate::proxy::cache_manager::global_cache_manager();
             if let Some(cached_json) = cm.lookup_tools(&key) {
@@ -1099,7 +1088,22 @@ pub fn transform_openai_request(
 
     // Removed auto-inject since we handle it above now if Codex passes it.
 
-    if !function_declarations.is_empty() {
+    let tool_choice_is_none = request
+        .tool_choice
+        .as_ref()
+        .map(|tc| {
+            tc.as_str()
+                .map(|s| s.eq_ignore_ascii_case("none"))
+                .unwrap_or_else(|| {
+                    tc.get("type")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.eq_ignore_ascii_case("none"))
+                        .unwrap_or(false)
+                })
+        })
+        .unwrap_or(false);
+
+    if !function_declarations.is_empty() && !tool_choice_is_none {
         inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
 
         if let Some(tool_choice) = &request.tool_choice {
@@ -1114,24 +1118,9 @@ pub fn transform_openai_request(
                         .unwrap_or(false)
                 });
             if !is_auto {
-                let mode = if let Some(s) = tool_choice.as_str() {
-                    match s.to_ascii_lowercase().as_str() {
-                        "none" => "NONE",
-                        "required" | "any" => "ANY",
-                        _ => "ANY",
-                    }
-                } else if tool_choice
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.eq_ignore_ascii_case("none"))
-                    .unwrap_or(false)
-                {
-                    "NONE"
-                } else {
-                    "ANY"
-                };
+                // 官方抓包中 toolConfig 仅出现过 functionCallingConfig.mode = "VALIDATED"（0 次 ANY/NONE）
                 inner_request["toolConfig"] = json!({
-                    "functionCallingConfig": { "mode": mode }
+                    "functionCallingConfig": { "mode": "VALIDATED" }
                 });
             }
         }
@@ -2106,5 +2095,123 @@ mod tests {
         assert!(!assistant_parts
             .iter()
             .any(|p| p.get("thought").and_then(|v| v.as_bool()) == Some(true)));
+    }
+
+    #[test]
+    fn test_parallel_fc_single_sig_no_penalty_stop_validated_and_tiered_max_tokens() {
+        let req = OpenAIRequest {
+            model: "gemini-3.8-flash-tiered".to_string(),
+            messages: vec![
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("Run two tools".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    refusal: None,
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![
+                        ToolCall {
+                            id: "call_1".to_string(),
+                            r#type: "function".to_string(),
+                            function: Some(ToolFunction {
+                                name: "t1".to_string(),
+                                arguments: "{}".to_string(),
+                            }),
+                            status: None,
+                            call_id: None,
+                            operation: None,
+                        },
+                        ToolCall {
+                            id: "call_2".to_string(),
+                            r#type: "function".to_string(),
+                            function: Some(ToolFunction {
+                                name: "t2".to_string(),
+                                arguments: "{}".to_string(),
+                            }),
+                            status: None,
+                            call_id: None,
+                            operation: None,
+                        },
+                    ]),
+                    tool_call_id: None,
+                    name: None,
+                },
+                OpenAIMessage {
+                    role: "tool".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("ok1".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                    name: Some("t1".to_string()),
+                },
+                OpenAIMessage {
+                    role: "tool".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("ok2".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_2".to_string()),
+                    name: Some("t2".to_string()),
+                },
+            ],
+            tools: Some(vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "t1",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "a": { "type": "string", "title": "Arg A" } }
+                    }
+                }
+            })]),
+            tool_choice: Some(json!("required")),
+            stop: Some(json!(["END"])),
+            presence_penalty: Some(0.5),
+            frequency_penalty: Some(0.3),
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let (res, _, _, _) =
+            transform_openai_request(&req, "proj", "gemini-3.8-flash-tiered", None);
+        let inner = &res["request"];
+
+        // 1. Only first parallel functionCall gets thoughtSignature
+        let model_parts = inner["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(model_parts.len(), 2);
+        assert_eq!(
+            model_parts[0].get("thoughtSignature").and_then(|v| v.as_str()),
+            Some(crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR)
+        );
+        assert!(model_parts[1].get("thoughtSignature").is_none());
+
+        // 2. Uncaptured generationConfig fields stripped + tiered omits maxOutputTokens
+        let gc = &inner["generationConfig"];
+        assert!(gc.get("stopSequences").is_none());
+        assert!(gc.get("presencePenalty").is_none());
+        assert!(gc.get("frequencyPenalty").is_none());
+        assert!(gc.get("seed").is_none());
+        assert!(gc.get("maxOutputTokens").is_none());
+
+        // 3. Schema removes title, toolConfig uses VALIDATED instead of ANY
+        let decl = &inner["tools"][0]["functionDeclarations"][0];
+        assert!(decl["parameters"]["properties"]["a"].get("title").is_none());
+        assert_eq!(inner["toolConfig"]["functionCallingConfig"]["mode"], "VALIDATED");
+
+        // 4. tool_choice = "none" omits tools & toolConfig without mode="NONE"
+        let mut req_none = req.clone();
+        req_none.tool_choice = Some(json!("none"));
+        let (res_none, _, _, _) =
+            transform_openai_request(&req_none, "proj", "gemini-3.8-flash-tiered", None);
+        assert!(res_none["request"].get("tools").is_none());
+        assert!(res_none["request"].get("toolConfig").is_none());
     }
 }

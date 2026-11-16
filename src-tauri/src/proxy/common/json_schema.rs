@@ -460,7 +460,6 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                 "required",
                 "items",
                 "enum",
-                "title",
                 "minLength",
                 "minItems",
                 "minimum",
@@ -1142,8 +1141,11 @@ mod tests {
         assert_eq!(schema["properties"]["importo"]["type"], "number");
         assert_eq!(schema["properties"]["attivo"]["type"], "boolean");
 
-        // 验证 default 被移除 (白名单之外)
+        // 验证 default 与 title 被移除 (官方抓包 schema 不携带 title)
         assert!(schema["properties"]["testo"].get("default").is_none());
+        assert!(schema["properties"]["testo"].get("title").is_none());
+        assert!(schema["properties"]["importo"].get("title").is_none());
+        assert!(schema["properties"]["attivo"].get("title").is_none());
     }
 
     // [NEW TEST] 验证 oneOf 类型提取

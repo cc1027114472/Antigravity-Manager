@@ -235,6 +235,11 @@ pub fn wrap_request_v2(
 
         for content in contents.iter_mut() {
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                // 官方并行 functionCall 抓包特征：同一 model 轮次中仅首个 functionCall 携带 thoughtSignature
+                let mut turn_has_fc_sig = parts.iter().any(|p| {
+                    p.get("functionCall").is_some()
+                        && (p.get("thoughtSignature").is_some() || p.get("thought_signature").is_some())
+                });
                 for part in parts {
                     if let Some(obj) = part.as_object_mut() {
                         // 1. 处理 functionCall (全模型统一确保携带非空 id，对齐抓包 100% 覆盖率)
@@ -321,29 +326,34 @@ pub fn wrap_request_v2(
                                 if obj.get("thoughtSignature").is_none() {
                                     obj.insert("thoughtSignature".to_string(), sig);
                                 }
-                            } else if let Some(s_id) = session_id {
-                                if let Some(sig) = crate::proxy::SignatureCache::global()
-                                    .get_session_signature(s_id)
-                                {
-                                    obj.insert("thoughtSignature".to_string(), json!(sig));
-                                    tracing::debug!("[Gemini-Wrap] Injected signature (len: {}) for session: {}", sig.len(), s_id);
-                                } else {
-                                    // [FIX #2167] Session 缓存为空时对 Flash 与新代际 Gemini 模型注入 Base64 哨兵值
-                                    // Modern Claude 不注入伪哨兵值
-                                    let lower_model = final_model_name.to_lowercase();
-                                    let is_modern_gemini =
-                                        crate::proxy::mappers::common_utils::is_modern_thinking_level_model(&lower_model)
-                                            && !lower_model.contains("claude");
-                                    let is_flash_or_modern_gemini =
-                                        lower_model.contains("gemini-3-flash")
-                                            || lower_model.contains("gemini-3.1-flash")
-                                            || is_modern_gemini;
-                                    if is_flash_or_modern_gemini {
-                                        obj.insert(
-                                            "thoughtSignature".to_string(),
-                                            json!(crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR),
-                                        );
-                                        tracing::debug!("[Gemini-Wrap] [FIX #2167] Injected Base64 sentinel signature for flash/modern Gemini model (no session cache)");
+                                turn_has_fc_sig = true;
+                            } else if !turn_has_fc_sig {
+                                if let Some(s_id) = session_id {
+                                    if let Some(sig) = crate::proxy::SignatureCache::global()
+                                        .get_session_signature(s_id)
+                                    {
+                                        obj.insert("thoughtSignature".to_string(), json!(sig));
+                                        turn_has_fc_sig = true;
+                                        tracing::debug!("[Gemini-Wrap] Injected signature (len: {}) for session: {}", sig.len(), s_id);
+                                    } else {
+                                        // [FIX #2167] Session 缓存为空时对 Flash 与新代际 Gemini 模型注入 Base64 哨兵值
+                                        // Modern Claude 不注入伪哨兵值
+                                        let lower_model = final_model_name.to_lowercase();
+                                        let is_modern_gemini =
+                                            crate::proxy::mappers::common_utils::is_modern_thinking_level_model(&lower_model)
+                                                && !lower_model.contains("claude");
+                                        let is_flash_or_modern_gemini =
+                                            lower_model.contains("gemini-3-flash")
+                                                || lower_model.contains("gemini-3.1-flash")
+                                                || is_modern_gemini;
+                                        if is_flash_or_modern_gemini {
+                                            obj.insert(
+                                                "thoughtSignature".to_string(),
+                                                json!(crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR),
+                                            );
+                                            turn_has_fc_sig = true;
+                                            tracing::debug!("[Gemini-Wrap] [FIX #2167] Injected Base64 sentinel signature for flash/modern Gemini model (no session cache)");
+                                        }
                                     }
                                 }
                             }
@@ -561,8 +571,14 @@ pub fn wrap_request_v2(
                 .and_then(|v| v.as_u64())
                 .or(req_max_tokens);
 
+            let omit_default_max =
+                crate::proxy::mappers::common_utils::should_omit_default_max_output_tokens(
+                    final_model_name,
+                );
             if is_adaptive {
-                if current_max.map_or(true, |m| m < 131072) {
+                if !(current_max.is_none() && omit_default_max)
+                    && current_max.map_or(true, |m| m < 131072)
+                {
                     gen_config.insert("maxOutputTokens".to_string(), json!(131072));
                 }
             } else if let Some(budget_i64) = budget_opt {
@@ -2006,5 +2022,53 @@ mod tests {
             .expect("functionResponse must receive a paired id for Gemini models");
         assert!(!fc_id.is_empty());
         assert_eq!(fc_id, fr_id);
+    }
+
+    #[test]
+    fn test_parallel_fc_only_first_gets_sig_and_tiered_omits_default_max_tokens() {
+        let body = json!({
+            "model": "gemini-3.8-flash-tiered",
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [
+                        { "functionCall": { "id": "c1", "name": "t1", "args": {} } },
+                        { "functionCall": { "id": "c2", "name": "t2", "args": {} } }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        { "functionResponse": { "id": "c1", "name": "t1", "response": { "output": "ok1" } } },
+                        { "functionResponse": { "id": "c2", "name": "t2", "response": { "output": "ok2" } } }
+                    ]
+                }
+            ]
+        });
+
+        let wrapped = wrap_request(
+            &body,
+            "test-proj",
+            "gemini-3.8-flash-tiered",
+            None,
+            Some("sess-parallel-tiered"),
+            None,
+        );
+        let model_parts = wrapped["request"]["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(
+            model_parts[0].get("thoughtSignature").and_then(|v| v.as_str()),
+            Some(crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR)
+        );
+        assert!(
+            model_parts[1].get("thoughtSignature").is_none(),
+            "second parallel functionCall must not carry duplicate thoughtSignature"
+        );
+
+        let gen_config = &wrapped["request"]["generationConfig"];
+        assert!(gen_config.get("thinkingConfig").is_some());
+        assert!(
+            gen_config.get("maxOutputTokens").is_none(),
+            "gemini-3.8-flash-tiered without explicit maxOutputTokens must omit maxOutputTokens"
+        );
     }
 }

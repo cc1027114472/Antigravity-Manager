@@ -613,7 +613,6 @@ pub fn transform_claude_request_in(
     }
 
     if !generation_config.is_null() {
-        println!("DEBUG: Assigning generation_config: {}", generation_config);
         inner_request["generationConfig"] = generation_config;
     }
 
@@ -967,6 +966,16 @@ fn build_contents(
             }
         }
         MessageContent::Array(blocks) => {
+            // 官方并行 functionCall 抓包特征：同一 assistant 轮次内仅首个无独立签名的 functionCall 回填或注入签名
+            let mut turn_has_fc_sig = blocks.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolUse {
+                        signature: Some(s),
+                        ..
+                    } if s.len() >= MIN_SIGNATURE_LENGTH
+                )
+            });
             for item in blocks {
                 match item {
                     ContentBlock::Text { text } => {
@@ -1197,54 +1206,63 @@ fn build_contents(
                         tool_id_to_name.insert(id.clone(), name.clone());
 
                         // Signature resolution logic
-                        // Priority: Client -> Context -> Session Cache -> Tool Cache -> Global Store (deprecated)
+                        // Priority: Client -> (at most once per turn) Context -> Session Cache -> Tool Cache -> Global Store / Sentinel
                         // [CRITICAL FIX] Do NOT use skip_thought_signature_validator for Vertex AI
                         // Vertex AI rejects this sentinel value, so we only add thoughtSignature if we have a real one
-                        let final_sig = signature.as_ref()
-                            .or(last_thought_signature.as_ref())
-                            .cloned()
-                            .or_else(|| {
-                                // Try session-based signature cache at specific msg_index first (Layer 3)
-                                crate::proxy::SignatureCache::global().get_session_signature_at(session_id, msg_index)
-                                    .map(|s| {
-                                        tracing::info!(
-                                            "[Claude-Request] Recovered signature from SESSION cache at turn {} (session: {}, len: {})",
-                                            msg_index, session_id, s.len()
+                        let final_sig = if let Some(explicit_sig) = signature.as_ref() {
+                            Some(explicit_sig.clone())
+                        } else if turn_has_fc_sig {
+                            None
+                        } else {
+                            last_thought_signature
+                                .as_ref()
+                                .cloned()
+                                .or_else(|| {
+                                    // Try session-based signature cache at specific msg_index first (Layer 3)
+                                    crate::proxy::SignatureCache::global()
+                                        .get_session_signature_at(session_id, msg_index)
+                                        .map(|s| {
+                                            tracing::info!(
+                                                "[Claude-Request] Recovered signature from SESSION cache at turn {} (session: {}, len: {})",
+                                                msg_index, session_id, s.len()
+                                            );
+                                            s
+                                        })
+                                })
+                                .or_else(|| {
+                                    // Fallback to latest session signature
+                                    crate::proxy::SignatureCache::global()
+                                        .get_session_signature(session_id)
+                                        .map(|s| {
+                                            tracing::info!(
+                                                "[Claude-Request] Recovered latest signature from SESSION cache (session: {}, len: {})",
+                                                session_id, s.len()
+                                            );
+                                            s
+                                        })
+                                })
+                                .or_else(|| {
+                                    // Try tool-specific signature cache (Layer 1)
+                                    crate::proxy::SignatureCache::global()
+                                        .get_tool_signature(id)
+                                        .map(|s| {
+                                            tracing::info!("[Claude-Request] Recovered signature from TOOL cache for tool_id: {}", id);
+                                            s
+                                        })
+                                })
+                                .or_else(|| {
+                                    // [DEPRECATED] Global store fallback - kept for backward compatibility
+                                    let global_sig = get_thought_signature();
+                                    if global_sig.is_some() {
+                                        tracing::warn!(
+                                            "[Claude-Request] Using deprecated GLOBAL thought_signature fallback (length: {}). \
+                                             This indicates session cache miss.",
+                                            global_sig.as_ref().unwrap().len()
                                         );
-                                        s
-                                    })
-                            })
-                            .or_else(|| {
-                                // Fallback to latest session signature
-                                crate::proxy::SignatureCache::global().get_session_signature(session_id)
-                                    .map(|s| {
-                                        tracing::info!(
-                                            "[Claude-Request] Recovered latest signature from SESSION cache (session: {}, len: {})",
-                                            session_id, s.len()
-                                        );
-                                        s
-                                    })
-                            })
-                            .or_else(|| {
-                                // Try tool-specific signature cache (Layer 1)
-                                crate::proxy::SignatureCache::global().get_tool_signature(id)
-                                    .map(|s| {
-                                        tracing::info!("[Claude-Request] Recovered signature from TOOL cache for tool_id: {}", id);
-                                        s
-                                    })
-                            })
-                            .or_else(|| {
-                                // [DEPRECATED] Global store fallback - kept for backward compatibility
-                                let global_sig = get_thought_signature();
-                                if global_sig.is_some() {
-                                    tracing::warn!(
-                                        "[Claude-Request] Using deprecated GLOBAL thought_signature fallback (length: {}). \
-                                         This indicates session cache miss.",
-                                        global_sig.as_ref().unwrap().len()
-                                    );
-                                }
-                                global_sig
-                            });
+                                    }
+                                    global_sig
+                                })
+                        };
                         // [FIX #752] Validate signature before using
                         // Only add thoughtSignature if we have a valid and compatible one
                         if let Some(sig) = final_sig {
@@ -1302,12 +1320,13 @@ fn build_contents(
                                     };
                                     if should_use_sig {
                                         part["thoughtSignature"] = json!(sig);
+                                        turn_has_fc_sig = true;
                                     }
                                 }
                             }
-                        } else {
+                        } else if !turn_has_fc_sig {
                             // Modern Claude omits thoughtSignature on missing functionCall history;
-                            // Gemini thinking models use the Base64 sentinel value.
+                            // Gemini thinking models use the Base64 sentinel value on the first FC in turn.
                             let lower_mapped = mapped_model.to_lowercase();
                             let is_google_cloud = mapped_model.starts_with("projects/");
                             let is_modern_claude =
@@ -1322,6 +1341,7 @@ fn build_contents(
                                 part["thoughtSignature"] = json!(
                                     crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR
                                 );
+                                turn_has_fc_sig = true;
                             }
                         }
                         parts.push(part);
@@ -1919,7 +1939,11 @@ fn build_generation_config(
                 .unwrap()
                 .remove("thinkingBudget");
 
-            if config.get("maxOutputTokens").is_none() {
+            if config.get("maxOutputTokens").is_none()
+                && !crate::proxy::mappers::common_utils::should_omit_default_max_output_tokens(
+                    mapped_model,
+                )
+            {
                 let default_max =
                     crate::proxy::model_specs::get_max_output_tokens(mapped_model, token);
                 config["maxOutputTokens"] = json!(default_max);
@@ -1930,7 +1954,11 @@ fn build_generation_config(
                 mapped_model
             );
             thinking_config["thinkingBudget"] = json!(24576);
-            if config.get("maxOutputTokens").is_none() {
+            if config.get("maxOutputTokens").is_none()
+                && !crate::proxy::mappers::common_utils::should_omit_default_max_output_tokens(
+                    mapped_model,
+                )
+            {
                 let default_max =
                     crate::proxy::model_specs::get_max_output_tokens(mapped_model, token);
                 config["maxOutputTokens"] = json!(default_max);
@@ -2017,7 +2045,12 @@ fn build_generation_config(
             }
         } else if is_adaptive_effective || thinking_config.get("thinkingLevel").is_some() {
             // [FIX] Adaptive / thinkingLevel mode (no budget set in thinkingConfig), apply default maxOutputTokens
-            if final_max_tokens.is_none() {
+            // unless this model omits default maxOutputTokens in official captures (e.g. gemini-3.8-flash-tiered / 3.5-flash-lite).
+            if final_max_tokens.is_none()
+                && !crate::proxy::mappers::common_utils::should_omit_default_max_output_tokens(
+                    mapped_model,
+                )
+            {
                 final_max_tokens = Some(
                     crate::proxy::model_specs::get_max_output_tokens(mapped_model, token) as i64,
                 );
@@ -3393,5 +3426,86 @@ mod tests {
         let decl = &result["request"]["tools"][0]["functionDeclarations"][0];
         assert_eq!(decl["description"], "");
         assert_eq!(decl["parameters"], json!({ "type": "OBJECT" }));
+    }
+
+    #[test]
+    fn test_parallel_tool_use_single_sig_and_tiered_omits_default_max_tokens() {
+        let req = ClaudeRequest {
+            model: "gemini-3.8-flash-tiered".to_string(),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String("Run two tools".to_string()),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: MessageContent::Array(vec![
+                        ContentBlock::ToolUse {
+                            id: "call_p1".to_string(),
+                            name: "tool_a".to_string(),
+                            input: json!({}),
+                            signature: None,
+                            cache_control: None,
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call_p2".to_string(),
+                            name: "tool_b".to_string(),
+                            input: json!({}),
+                            signature: None,
+                            cache_control: None,
+                        },
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::Array(vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call_p1".to_string(),
+                            content: json!("r1"),
+                            is_error: Some(false),
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call_p2".to_string(),
+                            content: json!("r2"),
+                            is_error: Some(false),
+                        },
+                    ]),
+                },
+            ],
+            system: None,
+            tools: None,
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        let result =
+            transform_claude_request_in(&req, "test-proj", false, None, "sess_parallel_tiered", None)
+                .expect("transform must succeed");
+
+        let model_parts = result["request"]["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(model_parts.len(), 2);
+        assert_eq!(
+            model_parts[0].get("thoughtSignature").and_then(|v| v.as_str()),
+            Some(crate::proxy::mappers::common_utils::SKIP_THOUGHT_SIGNATURE_VALIDATOR)
+        );
+        assert!(
+            model_parts[1].get("thoughtSignature").is_none(),
+            "second parallel tool_use must not receive duplicate thoughtSignature"
+        );
+
+        let gen_config = &result["request"]["generationConfig"];
+        assert!(gen_config.get("thinkingConfig").is_some());
+        assert!(
+            gen_config.get("maxOutputTokens").is_none(),
+            "gemini-3.8-flash-tiered without max_tokens must omit maxOutputTokens"
+        );
     }
 }

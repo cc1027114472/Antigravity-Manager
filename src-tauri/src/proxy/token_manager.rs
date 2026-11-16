@@ -1888,6 +1888,26 @@ impl TokenManager {
                     "gemini-3-flash".to_string(),
                 ]);
             }
+            "gemini-3.8-flash-low" => {
+                return Some(vec![
+                    "gemini-3.8-flash-low".to_string(),
+                    "gemini-3.8-flash-medium".to_string(),
+                    "gemini-3-flash".to_string(),
+                ]);
+            }
+            "gemini-3.8-flash-medium" => {
+                return Some(vec![
+                    "gemini-3.8-flash-medium".to_string(),
+                    "gemini-3-flash".to_string(),
+                ]);
+            }
+            "gemini-3.8-flash-high" => {
+                return Some(vec![
+                    "gemini-3.8-flash-high".to_string(),
+                    "gemini-3.8-flash-medium".to_string(),
+                    "gemini-3-flash".to_string(),
+                ]);
+            }
             // Claude 5.5 灰度内测模型按账号能力自动回退到全量 4.6
             "claude-sonnet-5-5" | "claude-sonnet-5-5-thinking" => {
                 return Some(vec![

@@ -491,39 +491,68 @@ pub async fn handle_chat_completions(
         debug!("[{}] Client Adapter detected", trace_id);
     }
 
-    // [Variant] Resolve canonical model + variant → real model + real params.
-    // Replace the client's model/thinking/max_tokens with verified real values so the
-    // forwarded request matches the expected upstream format. OpenCode encodes the variant as
-    // thinking.budget_tokens; we infer the tier from its magnitude.
+    // [Variant] Resolve canonical family model + variant → real model + safe params.
+    // Non-variant models preserve client thinking=None/disabled and NEVER strip tools/tool_choice.
     let client_budget = openai_req.thinking.as_ref().and_then(|t| t.budget_tokens);
-    if let Some(spec) =
-        crate::proxy::common::variant_mapping::resolve(&openai_req.model, client_budget)
+    let client_disabled_thinking = openai_req
+        .thinking
+        .as_ref()
+        .and_then(|t| t.thinking_type.as_deref())
+        .map(|s| s.eq_ignore_ascii_case("disabled"))
+        .unwrap_or(false)
+        || openai_req
+            .reasoning_effort
+            .as_deref()
+            .map(|e| e.eq_ignore_ascii_case("none"))
+            .unwrap_or(false);
+
+    if let Some((spec, resolved_tier)) =
+        crate::proxy::common::variant_mapping::resolve_family_variant_with_tier(
+            &openai_req.model,
+            None,
+            client_budget,
+        )
     {
         tracing::info!(
-            "[{}] [Variant] canonical='{}' budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
+            "[{}] [Variant] canonical='{}' budget_hint={:?} -> real_model='{}' tier={:?} maxOut={}",
             trace_id,
             openai_req.model,
             client_budget,
             spec.id,
-            spec.thinking_budget,
+            resolved_tier,
             spec.max_output_tokens
         );
         openai_req.model = spec.id.to_string();
-        if spec.thinking_budget == 0 {
-            // Non-thinking checkpoint model (e.g. gemini-3.1-flash-lite): disable thinking
-            // AND strip tools/tool_choice — per upstream spec §3 checkpoint requests carry
-            // no tools.
-            openai_req.thinking = None;
-            openai_req.tools = None;
-            openai_req.tool_choice = None;
-        } else {
-            openai_req.thinking = Some(crate::proxy::mappers::openai::models::ThinkingConfig {
-                thinking_type: Some("enabled".to_string()),
-                budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
-                effort: None,
-            });
+        if !client_disabled_thinking {
+            if crate::proxy::mappers::common_utils::is_modern_thinking_level_model(spec.id) {
+                openai_req.thinking = Some(crate::proxy::mappers::openai::models::ThinkingConfig {
+                    thinking_type: Some("adaptive".to_string()),
+                    budget_tokens: None,
+                    effort: Some(resolved_tier.as_effort_str().to_string()),
+                });
+            } else {
+                openai_req.thinking = Some(crate::proxy::mappers::openai::models::ThinkingConfig {
+                    thinking_type: Some("enabled".to_string()),
+                    budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
+                    effort: None,
+                });
+            }
         }
-        openai_req.max_tokens = Some(spec.max_output_tokens);
+        openai_req.max_tokens.get_or_insert(spec.max_output_tokens);
+    } else if let Some(spec) =
+        crate::proxy::common::variant_mapping::resolve_non_variant_model(&openai_req.model)
+    {
+        tracing::info!(
+            "[{}] [Variant] non-variant='{}' -> real_model='{}' maxOut={}",
+            trace_id,
+            openai_req.model,
+            spec.id,
+            spec.max_output_tokens
+        );
+        openai_req.model = spec.id.to_string();
+        if !spec.id.to_lowercase().contains("claude") {
+            openai_req.max_tokens.get_or_insert(spec.max_output_tokens);
+        }
     }
 
     let client_tool_names =

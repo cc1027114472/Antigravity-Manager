@@ -16,7 +16,7 @@ pub async fn handle_audio_transcription(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let mut audio_data: Option<Vec<u8>> = None;
     let mut filename: Option<String> = None;
-    let mut model = "gemini-2.0-flash-exp".to_string();
+    let mut model = "gemini-2.5-flash".to_string();
     let mut prompt = "Generate a transcript of the speech.".to_string();
 
     // 1. 解析 multipart/form-data
@@ -79,9 +79,27 @@ pub async fn handle_audio_transcription(
     debug!("使用 Inline Data 方式处理");
     let base64_audio = AudioProcessor::encode_to_base64(&audio_bytes);
 
-    // 5. 构建 Gemini 请求
+    // 5. 获取 Token 和上游客户端
+    let token_manager = state.token_manager;
+    let (access_token, project_id, email, account_id, _wait_ms) = token_manager
+        .get_token("text", false, None, &model)
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+
+    info!("使用账号: {}", email);
+
+    // 6. 构建 Gemini 请求 (对齐官方 contents[].role + labels + sessionId + requestType)
+    let (request_id, official_labels) =
+        crate::proxy::common::session::generate_official_request_id_and_labels(
+            Some(account_id.as_str()),
+            "audio",
+            1,
+            &model,
+        );
+    let session_id = crate::proxy::common::session::derive_session_id(account_id.as_str());
     let gemini_request = json!({
         "contents": [{
+            "role": "user",
             "parts": [
                 {"text": prompt},
                 {
@@ -91,25 +109,19 @@ pub async fn handle_audio_transcription(
                     }
                 }
             ]
-        }]
+        }],
+        "labels": official_labels,
+        "sessionId": session_id,
     });
-
-    // 6. 获取 Token 和上游客户端
-    let token_manager = state.token_manager;
-    let (access_token, project_id, email, account_id, _wait_ms) = token_manager
-        .get_token("text", false, None, &model)
-        .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
-
-    info!("使用账号: {}", email);
 
     // 7. 包装请求为 v1internal 格式
     let wrapped_body = json!({
         "project": project_id,
-        "requestId": crate::proxy::common::session::generate_official_request_id(Some(account_id.as_str()), "audio", 1),
+        "requestId": request_id,
         "request": gemini_request,
         "model": model,
         "userAgent": "antigravity",
+        "requestType": "agent",
     });
 
     // 8. 发送请求到 Gemini

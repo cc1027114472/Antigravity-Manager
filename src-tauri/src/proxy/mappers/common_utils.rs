@@ -252,6 +252,13 @@ pub fn is_modern_thinking_level_model(model: &str) -> bool {
         || m.contains("claude-5")
 }
 
+/// 官方抓包中默认不发送 `maxOutputTokens` 的轻量/分层模型：
+/// 仅在客户端显式指定 `max_tokens` / `maxOutputTokens` 时透传，未指定时保持省略。
+pub fn should_omit_default_max_output_tokens(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("gemini-3.8-flash-tiered") || m.contains("gemini-3.5-flash-lite")
+}
+
 /// 推导官方大写 `thinkingLevel`（`"MINIMAL" | "LOW" | "MEDIUM" | "HIGH"`）
 /// 优先级：显式参数 (`effort` / `thinkingLevel` / `reasoning_effort`) > 模型名后缀 (`-low` / `-medium` / `-high` / `flash-lite` / `-tiered`) > `fallback`
 pub fn resolve_modern_thinking_level(

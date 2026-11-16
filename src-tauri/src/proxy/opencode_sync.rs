@@ -1708,7 +1708,7 @@ mod tests {
         let inputs = [
             minput("gemini-3.1-pro-high"),
             minput("gemini-3.1-pro-low"),
-            minput("gemini-3-flash"),
+            minput("gemini-3.5-flash-high"),
         ];
 
         merge_catalog_models(&mut provider, Some(&inputs));
@@ -2015,7 +2015,10 @@ mod tests {
         let variants = build_variants_object(Some(VariantType::Gemini3Pro))
             .expect("Gemini 3.1 Pro variants must be configured");
 
-        for (name, expected_id) in [("low", "gemini-3.1-pro-low"), ("high", "gemini-pro-agent")] {
+        for (name, expected_id) in [
+            ("low", "gemini-3.1-pro-low"),
+            ("high", "gemini-3.1-pro-preview"),
+        ] {
             let variant = &variants[name];
             let effort = variant["effort"]
                 .as_str()
@@ -2051,9 +2054,9 @@ mod tests {
             .expect("Gemini 3.5 Flash variants must be configured");
 
         for (name, expected_id) in [
-            ("low", "gemini-3.5-flash-extra-low"),
-            ("medium", "gemini-3.5-flash-low"),
-            ("high", "gemini-3-flash-agent"),
+            ("low", "gemini-3.8-flash-low"),
+            ("medium", "gemini-3.8-flash-medium"),
+            ("high", "gemini-3.8-flash-high"),
         ] {
             let variant = &variants[name];
             let effort = variant["effort"]
@@ -3123,9 +3126,9 @@ mod canonical_family_tests {
                         "gemini-3.5-flash-high".to_string(),
                         "gemini-3.5-flash-medium".to_string(),
                         "gemini-3.5-flash-low".to_string(),
-                        "gemini-3-flash".to_string(),
-                        "gemini-3.5-flash-extra-low".to_string(),
-                        "gemini-3-flash-agent".to_string(),
+                        "gemini-3.8-flash-low".to_string(),
+                        "gemini-3.8-flash-medium".to_string(),
+                        "gemini-3.8-flash-high".to_string(),
                     ],
                 },
                 CanonicalFamilyDto {
@@ -3136,7 +3139,7 @@ mod canonical_family_tests {
                         "gemini-3.1-pro-high".to_string(),
                         "gemini-pro".to_string(),
                         "gemini-3.1-pro-low".to_string(),
-                        "gemini-pro-agent".to_string(),
+                        "gemini-3.1-pro-preview".to_string(),
                     ],
                 },
             ]

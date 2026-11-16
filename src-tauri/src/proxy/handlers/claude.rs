@@ -269,7 +269,11 @@ mod variant_tests {
 
         apply_variant(&mut request, effort, Some(10_000)).expect("Gemini 3.5 Flash must resolve");
 
-        assert_eq!(request.model, "gemini-3.5-flash-extra-low");
+        assert_eq!(request.model, "gemini-3.8-flash-low");
+        assert_eq!(
+            request.thinking.as_ref().and_then(|t| t.effort.as_deref()),
+            Some("low")
+        );
         assert!(request.output_config.is_none());
         assert!(serde_json::to_value(request)
             .expect("resolved request must serialize")
@@ -289,15 +293,15 @@ mod variant_tests {
 
         apply_variant(&mut request, effort, Some(1_000)).expect("Gemini 3.1 Pro must resolve");
 
-        assert_eq!(request.model, "gemini-pro-agent");
+        assert_eq!(request.model, "gemini-3.1-pro-preview");
     }
 
     #[test]
-    fn invalid_effort_falls_back_to_budget_tokens_for_gemini_3_model() {
-        // Given a Gemini 3 model ("gemini-3-flash") with an unrecognized
+    fn invalid_effort_falls_back_to_budget_tokens_for_gemini_3_5_flash_model() {
+        // Given a canonical Gemini family ("gemini-3.5-flash") with an unrecognized
         // effort value ("max"), tier_from_effort returns None, so
         // apply_variant falls back to budget-based tier inference.
-        let mut request = request_with_effort("gemini-3-flash", "max", 4_000);
+        let mut request = request_with_effort("gemini-3.5-flash", "max", 4_000);
         let effort = crate::proxy::common::variant_mapping::tier_from_effort(
             request
                 .output_config
@@ -305,22 +309,44 @@ mod variant_tests {
                 .and_then(|config| config.effort.as_deref()),
         );
 
-        // tier_from_effort(Some("max")) → None (invalid value)
         assert_eq!(effort, None);
 
-        // With effort=None and budget=4_000, infer_tier → Medium →
-        // resolve_with_tier("gemini-3-flash", None, Some(4_000)) →
-        // SPEC_35_FLASH_LOW → physical id "gemini-3.5-flash-low"
         apply_variant(&mut request, effort, Some(4_000))
-            .expect("gemini-3-flash must resolve even without valid effort");
+            .expect("gemini-3.5-flash must resolve even without valid effort");
 
-        assert_eq!(request.model, "gemini-3.5-flash-low");
+        assert_eq!(request.model, "gemini-3.8-flash-medium");
         assert!(request.output_config.is_none());
-        // SPEC_35_FLASH_LOW has thinking_budget=4_000, preserve_client_budget=false
         assert_eq!(
-            request.thinking.as_ref().and_then(|t| t.budget_tokens),
-            Some(4_000)
+            request.thinking.as_ref().and_then(|t| t.effort.as_deref()),
+            Some("medium")
         );
+    }
+
+    #[test]
+    fn apply_variant_never_strips_tools_and_preserves_claude_non_thinking() {
+        // gemini-3.1-flash-lite must keep client tools intact
+        let mut lite_req: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model": "gemini-3.1-flash-lite",
+            "messages": [{"role": "user", "content": "check"}],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}]
+        }))
+        .unwrap();
+        apply_variant(&mut lite_req, None, None);
+        assert_eq!(lite_req.model, "gemini-3.1-flash-lite");
+        assert_eq!(lite_req.tools.as_ref().map(|t| t.len()), Some(1));
+
+        // claude-sonnet-4-6 without thinking must keep thinking=None and tools intact
+        let mut claude_req: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4096,
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}]
+        }))
+        .unwrap();
+        apply_variant(&mut claude_req, None, None);
+        assert!(claude_req.thinking.is_none());
+        assert_eq!(claude_req.max_tokens, Some(4096));
+        assert_eq!(claude_req.tools.as_ref().map(|t| t.len()), Some(1));
     }
 
     #[test]
@@ -359,26 +385,56 @@ fn apply_variant(
     effort_tier: Option<crate::proxy::common::variant_mapping::VariantTier>,
     client_budget: Option<u32>,
 ) -> Option<crate::proxy::common::variant_mapping::RealModelSpec> {
-    let spec = crate::proxy::common::variant_mapping::resolve_with_tier(
-        &request.model,
-        effort_tier,
-        client_budget,
-    )?;
+    let client_disabled_thinking = request
+        .thinking
+        .as_ref()
+        .map(|t| t.type_ == "disabled")
+        .unwrap_or(false);
 
+    if let Some((spec, resolved_tier)) =
+        crate::proxy::common::variant_mapping::resolve_family_variant_with_tier(
+            &request.model,
+            effort_tier,
+            client_budget,
+        )
+    {
+        request.model = spec.id.to_string();
+        if !client_disabled_thinking {
+            if crate::proxy::mappers::common_utils::is_modern_thinking_level_model(spec.id) {
+                request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+                    type_: "adaptive".to_string(),
+                    budget_tokens: None,
+                    effort: Some(resolved_tier.as_effort_str().to_string()),
+                });
+            } else {
+                request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+                    type_: "enabled".to_string(),
+                    budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
+                    effort: None,
+                });
+            }
+        }
+        request.output_config = None;
+        request.max_tokens.get_or_insert(spec.max_output_tokens);
+        return Some(spec);
+    }
+
+    let spec = crate::proxy::common::variant_mapping::resolve_non_variant_model(&request.model)?;
+    // 非变体模型（claude-sonnet-4-6 / claude-opus-4-6 / gemini-3.1-flash-lite 等）：
+    // 绝不清空客户端 tools，不强行改写客户端 thinking=None/disabled，也不强覆 max_tokens / output_config。
     request.model = spec.id.to_string();
     if spec.thinking_budget == 0 {
-        request.thinking = None;
-        request.tools = None;
-    } else {
-        request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
-            type_: "enabled".to_string(),
-            budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
-            effort: None,
-        });
+        request.max_tokens.get_or_insert(spec.max_output_tokens);
+    } else if !spec.id.to_lowercase().contains("claude") {
+        if !client_disabled_thinking && request.thinking.is_some() {
+            if let Some(thinking) = request.thinking.as_mut() {
+                if thinking.budget_tokens.is_none() {
+                    thinking.budget_tokens = Some(spec.effective_thinking_budget(client_budget));
+                }
+            }
+        }
+        request.max_tokens.get_or_insert(spec.max_output_tokens);
     }
-    request.output_config = None;
-    request.max_tokens = Some(spec.max_output_tokens);
-
     Some(spec)
 }
 
