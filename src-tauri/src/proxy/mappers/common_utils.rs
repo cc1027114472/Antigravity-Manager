@@ -60,7 +60,44 @@ pub fn build_official_google_search_tool() -> Value {
     })
 }
 
-/// Build a standardized Gemini `functionResponse` part using official `"output"` / `"error"` keys.
+/// Normalize any JSON value to a UTF-8 string matching official `functionResponse.response.{output,error}` captures.
+pub fn stringify_function_response_value(val: &Value) -> String {
+    match val {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// Normalize a Gemini `functionResponse` payload (`response` object) in-place:
+/// - Legacy `"result"` key is migrated to `"output"` if `"output"` is absent
+/// - Non-string values (`dict`, `array`, `number`, `bool`, `null`) are stringified so
+///   upstream always receives `response.{output,error}` as strings (matching 314,134/314,134 captures)
+/// - Missing/empty `response` object defaults to `{"output": ""}`
+pub fn normalize_function_response_object(resp_val: &mut Value) {
+    if let Value::Object(obj) = resp_val {
+        if let Some(result_val) = obj.remove("result") {
+            if !obj.contains_key("output") {
+                obj.insert("output".to_string(), result_val);
+            }
+        }
+        if obj.is_empty() {
+            obj.insert("output".to_string(), Value::String(String::new()));
+            return;
+        }
+        for (_k, v) in obj.iter_mut() {
+            if !v.is_string() {
+                *v = Value::String(stringify_function_response_value(v));
+            }
+        }
+    } else {
+        let s = stringify_function_response_value(resp_val);
+        *resp_val = json!({ "output": s });
+    }
+}
+
+/// Build a standardized Gemini `functionResponse` part using official `"output"` / `"error"` keys
+/// with guaranteed UTF-8 string values (matching 314,134/314,134 captured upstream payloads).
 pub fn build_function_response_part(
     name: &str,
     id: Option<&str>,
@@ -68,9 +105,10 @@ pub fn build_function_response_part(
     is_error: bool,
 ) -> Value {
     let key = if is_error { "error" } else { "output" };
+    let val_str = stringify_function_response_value(&response_val);
     let mut fr = serde_json::Map::new();
     fr.insert("name".to_string(), json!(name));
-    fr.insert("response".to_string(), json!({ key: response_val }));
+    fr.insert("response".to_string(), json!({ key: val_str }));
     if let Some(id_str) = id.filter(|s| !s.is_empty()) {
         fr.insert("id".to_string(), json!(id_str));
     }
@@ -246,7 +284,8 @@ pub fn is_modern_thinking_level_model(model: &str) -> bool {
     if m.contains("-image") {
         return false;
     }
-    m.contains("gemini-3.5")
+    m.contains("gemini-3.1-flash-lite")
+        || m.contains("gemini-3.5")
         || m.contains("gemini-3.8")
         || m.contains("gemini-4")
         || m.contains("claude-sonnet-5")
@@ -835,12 +874,35 @@ mod tests {
             5
         );
 
-        // 3. Official functionResponse keys ("output" / "error")
+        // 3. Official functionResponse keys ("output" / "error") & guaranteed string values
         let ok_fr = build_function_response_part("ls", Some("id_1"), json!("ok"), false);
         assert_eq!(ok_fr["functionResponse"]["response"]["output"], "ok");
         assert!(ok_fr["functionResponse"]["response"].get("result").is_none());
-        let err_fr = build_function_response_part("ls", Some("id_2"), json!("fail"), true);
-        assert_eq!(err_fr["functionResponse"]["response"]["error"], "fail");
+        let obj_fr = build_function_response_part(
+            "ls",
+            Some("id_obj"),
+            json!({"files": ["a.rs"], "count": 1}),
+            false,
+        );
+        assert!(obj_fr["functionResponse"]["response"]["output"].is_string());
+        assert_eq!(
+            obj_fr["functionResponse"]["response"]["output"],
+            r#"{"files":["a.rs"],"count":1}"#
+        );
+        let null_fr = build_function_response_part("ls", Some("id_null"), Value::Null, false);
+        assert_eq!(null_fr["functionResponse"]["response"]["output"], "");
+        let err_fr = build_function_response_part("ls", Some("id_2"), json!(404), true);
+        assert_eq!(err_fr["functionResponse"]["response"]["error"], "404");
+
+        let mut legacy_resp = json!({ "result": { "ok": true } });
+        normalize_function_response_object(&mut legacy_resp);
+        assert_eq!(legacy_resp, json!({ "output": r#"{"ok":true}"# }));
+
+        assert!(is_modern_thinking_level_model("gemini-3.1-flash-lite"));
+        assert_eq!(
+            resolve_modern_thinking_level("gemini-3.1-flash-lite", None, "MEDIUM"),
+            "LOW"
+        );
 
         // 4. Official tool schema cleaning: uppercase types + minLength/minItems/minimum preserved
         let mut schema = json!({

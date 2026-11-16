@@ -484,7 +484,7 @@ pub async fn fetch_quota_with_cache(
                         if let Some(quota_info) = info.quota_info {
                             let percentage = quota_info
                                 .remaining_fraction
-                                .map(|f| (f * 100.0) as i32)
+                                .map(crate::modules::quota_ledger::fraction_to_pct)
                                 .unwrap_or(0);
 
                             let reset_time = quota_info.reset_time.clone().unwrap_or_default();
@@ -1085,5 +1085,13 @@ mod tests {
             build_quota_project_payload(Some("custom-proj-123")),
             json!({ "project": "custom-proj-123" })
         );
+    }
+
+    #[test]
+    fn test_fraction_to_pct_rounds_instead_of_truncating() {
+        assert_eq!(crate::modules::quota_ledger::fraction_to_pct(0.9466701), 95);
+        assert_eq!(crate::modules::quota_ledger::fraction_to_pct(0.996), 100);
+        assert_eq!(crate::modules::quota_ledger::fraction_to_pct(0.004), 0);
+        assert_eq!(crate::modules::quota_ledger::fraction_to_pct(0.24319573), 24);
     }
 }

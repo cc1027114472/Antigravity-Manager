@@ -1984,6 +1984,7 @@ mod tests {
         );
 
         let cases = [
+            ("gemini-3.1-flash-lite", "LOW", 65535),
             ("gemini-3.8-flash-medium", "MEDIUM", 65536),
             ("gemini-4-argon-high", "HIGH", 65536),
             ("claude-sonnet-5-5-medium", "MEDIUM", 128000),

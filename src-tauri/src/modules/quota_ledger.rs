@@ -302,24 +302,45 @@ pub fn extract_dual_window_online_map(quota: &QuotaData) -> HashMap<String, Onli
 
     // Fallback if quota_groups was absent
     if map.is_empty() {
-        for model in &quota.models {
-            let Some(billing) = normalize_to_billing_group(&model.name) else {
-                continue;
-            };
-            let ts = parse_rfc3339_timestamp(&model.reset_time);
-            let entry = map.entry(billing).or_insert(OnlineDualWindowBucket {
-                pct_5h: model.percentage,
-                pct_weekly: model.percentage,
-                reset_5h: ts,
-                reset_weekly: None,
-            });
-            if model.percentage < entry.pct_5h {
-                entry.pct_5h = model.percentage;
-                entry.pct_weekly = model.percentage;
-            }
-        }
+        map = fallback_model_billing_groups(&quota.models);
     }
 
+    map
+}
+
+/// Fallback: aggregate `fetchAvailableModels` entries by billing group (min = conservative).
+/// Isolates `gemini-4-argon-*` from the shared Flash/Pro `gemini` bucket whenever any
+/// non-Argon Gemini model is present on the account.
+fn fallback_model_billing_groups(
+    models: &[crate::models::quota::ModelQuota],
+) -> HashMap<String, OnlineDualWindowBucket> {
+    let mut map: HashMap<String, OnlineDualWindowBucket> = HashMap::new();
+    let has_non_argon_gemini = models.iter().any(|m| {
+        !m.name.to_lowercase().contains("argon")
+            && normalize_to_billing_group(&m.name).as_deref() == Some(BILLING_GEMINI)
+    });
+
+    for model in models {
+        let lower = model.name.to_lowercase();
+        let Some(billing) = normalize_to_billing_group(&model.name) else {
+            continue;
+        };
+        if has_non_argon_gemini && billing == BILLING_GEMINI && lower.contains("argon") {
+            continue;
+        }
+        let ts = parse_rfc3339_timestamp(&model.reset_time);
+        let entry = map.entry(billing).or_insert(OnlineDualWindowBucket {
+            pct_5h: model.percentage,
+            pct_weekly: model.percentage,
+            reset_5h: ts,
+            reset_weekly: None,
+        });
+        if model.percentage < entry.pct_5h {
+            entry.pct_5h = model.percentage;
+            entry.pct_weekly = model.percentage;
+            entry.reset_5h = ts;
+        }
+    }
     map
 }
 
@@ -350,7 +371,7 @@ pub fn calibrate_account_dual_window(account: &mut Account, quota: &QuotaData) {
     }
 }
 
-fn fraction_to_pct(fraction: f64) -> i32 {
+pub(crate) fn fraction_to_pct(fraction: f64) -> i32 {
     ((fraction * 100.0).round() as i32).clamp(0, 100)
 }
 
@@ -371,18 +392,10 @@ pub fn online_percentage_map_from_quota(quota: &QuotaData) -> HashMap<String, i3
         }
     }
 
-    // Fallback: aggregate fetchAvailableModels by billing group (min = conservative)
-    let mut group_min: HashMap<String, i32> = HashMap::new();
-    for model in &quota.models {
-        let Some(billing) = normalize_to_billing_group(&model.name) else {
-            continue;
-        };
-        let entry = group_min.entry(billing).or_insert(model.percentage);
-        if model.percentage < *entry {
-            *entry = model.percentage;
-        }
-    }
-    group_min
+    fallback_model_billing_groups(&quota.models)
+        .into_iter()
+        .map(|(billing, bucket)| (billing, bucket.pct_5h))
+        .collect()
 }
 
 /// Percentages used for protection/selection when ledger may be on/off.
@@ -1106,5 +1119,39 @@ mod tests {
         let gemini_dual = dual.get("gemini").expect("gemini dual bucket");
         assert_eq!(gemini_dual.pct_5h, 95);
         assert_eq!(gemini_dual.pct_weekly, 92);
+    }
+
+    #[test]
+    fn fallback_models_isolate_exhausted_argon_from_shared_gemini_bucket() {
+        let mk_model = |name: &str, percentage: i32, reset_time: &str| {
+            crate::models::quota::ModelQuota {
+                name: name.into(),
+                percentage,
+                reset_time: reset_time.into(),
+                display_name: None,
+                supports_images: None,
+                supports_thinking: None,
+                thinking_budget: None,
+                recommended: None,
+                max_tokens: None,
+                max_output_tokens: None,
+                supported_mime_types: None,
+            }
+        };
+        let mut quota = QuotaData::default();
+        quota.models = vec![
+            mk_model("gemini-3.8-flash-medium", 95, "2026-11-04T20:24:19Z"),
+            mk_model("gemini-4-argon-medium", 0, "2026-11-10T15:17:45Z"),
+            mk_model("claude-sonnet-4-6", 88, "2026-11-04T20:49:42Z"),
+        ];
+
+        let pct_map = online_percentage_map_from_quota(&quota);
+        assert_eq!(pct_map.get("gemini"), Some(&95));
+        assert_eq!(pct_map.get("claude"), Some(&88));
+
+        let dual = extract_dual_window_online_map(&quota);
+        let gemini_dual = dual.get("gemini").expect("gemini dual bucket");
+        assert_eq!(gemini_dual.pct_5h, 95);
+        assert_eq!(gemini_dual.pct_weekly, 95);
     }
 }

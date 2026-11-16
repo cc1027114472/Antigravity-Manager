@@ -1809,20 +1809,68 @@ impl TokenManager {
         min_pct
     }
 
-    fn get_available_models_from_json(account_path: &PathBuf) -> Option<HashSet<String>> {
+    fn get_available_models_with_quota_from_json(
+        account_path: &PathBuf,
+    ) -> Option<std::collections::HashMap<String, Option<i32>>> {
         let content = std::fs::read_to_string(account_path).ok()?;
         let account: serde_json::Value = serde_json::from_str(&content).ok()?;
         let models = account.get("quota")?.get("models")?.as_array()?;
-        let mut result = HashSet::new();
+        let argon_bucket_exhausted = account
+            .get("quota")
+            .and_then(|q| q.get("quota_groups"))
+            .and_then(|g| g.as_array())
+            .map_or(false, |groups| {
+                groups.iter().any(|group| {
+                    let dn = group
+                        .get("displayName")
+                        .or_else(|| group.get("display_name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    group
+                        .get("buckets")
+                        .and_then(|b| b.as_array())
+                        .map_or(false, |buckets| {
+                            buckets.iter().any(|bucket| {
+                                let bid = bucket
+                                    .get("bucketId")
+                                    .or_else(|| bucket.get("bucket_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_lowercase();
+                                let rem = bucket
+                                    .get("remainingFraction")
+                                    .or_else(|| bucket.get("remaining_fraction"))
+                                    .and_then(|v| v.as_f64());
+                                (dn.contains("argon") || bid.contains("argon"))
+                                    && rem.map_or(false, |f| f <= 0.0)
+                            })
+                        })
+                })
+            });
+
+        let mut result = std::collections::HashMap::new();
         for model in models {
             if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
                 let normalized = name.trim().to_lowercase();
                 if !normalized.is_empty() {
-                    result.insert(normalized);
+                    let mut pct = model
+                        .get("percentage")
+                        .and_then(|v| v.as_i64())
+                        .map(|p| p as i32);
+                    if argon_bucket_exhausted && normalized.contains("argon") {
+                        pct = Some(0);
+                    }
+                    result.insert(normalized, pct);
                 }
             }
         }
         Some(result)
+    }
+
+    fn get_available_models_from_json(account_path: &PathBuf) -> Option<HashSet<String>> {
+        Self::get_available_models_with_quota_from_json(account_path)
+            .map(|m| m.into_keys().collect())
     }
 
     fn build_dynamic_model_candidates(model_name: &str) -> Option<Vec<String>> {
@@ -1978,23 +2026,34 @@ impl TokenManager {
             None => return mapped_model.to_string(),
         };
 
-        let available_models = match Self::get_available_models_from_json(&account_path) {
+        let available_models = match Self::get_available_models_with_quota_from_json(&account_path)
+        {
             Some(models) if !models.is_empty() => models,
             _ => return mapped_model.to_string(),
         };
 
+        let mut first_present: Option<String> = None;
         for candidate in candidates {
-            if available_models.contains(&candidate) {
-                if candidate != mapped_model.to_lowercase() {
-                    tracing::info!(
-                        "[Dynamic-Model-Rewrite] account={} {} -> {}",
-                        account_id,
-                        mapped_model,
-                        candidate
-                    );
+            if let Some(pct) = available_models.get(&candidate) {
+                if first_present.is_none() {
+                    first_present = Some(candidate.clone());
                 }
-                return candidate;
+                if pct.map_or(true, |p| p > 0) {
+                    if candidate != mapped_model.to_lowercase() {
+                        tracing::info!(
+                            "[Dynamic-Model-Rewrite] account={} {} -> {}",
+                            account_id,
+                            mapped_model,
+                            candidate
+                        );
+                    }
+                    return candidate;
+                }
             }
+        }
+
+        if let Some(fallback) = first_present {
+            return fallback;
         }
 
         mapped_model.to_string()
@@ -8776,6 +8835,73 @@ mod tests {
             .resolve_dynamic_model_for_account("acc_standard_flash", "gemini-4-argon-high")
             .await;
         assert_eq!(resolved_high, "gemini-3.8-flash-high");
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_gemini_4_argon_exhausted_falls_back_to_healthy_flash() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-argon-zero-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, models: serde_json::Value| {
+            let path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": format!("{}@test.com", id),
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": "test-project"
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "quota": {
+                    "models": models
+                },
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        write_account(
+            "acc_argon_zero",
+            serde_json::json!([
+                { "name": "gemini-4-argon-medium", "percentage": 0 },
+                { "name": "gemini-3.8-flash-medium", "percentage": 95 }
+            ]),
+        );
+        write_account(
+            "acc_all_zero",
+            serde_json::json!([
+                { "name": "gemini-4-argon-medium", "percentage": 0 },
+                { "name": "gemini-3.8-flash-medium", "percentage": 0 }
+            ]),
+        );
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        assert_eq!(
+            manager
+                .resolve_dynamic_model_for_account("acc_argon_zero", "gemini-4-argon-medium")
+                .await,
+            "gemini-3.8-flash-medium"
+        );
+        assert_eq!(
+            manager
+                .resolve_dynamic_model_for_account("acc_all_zero", "gemini-4-argon-medium")
+                .await,
+            "gemini-4-argon-medium"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_root);
     }

@@ -26,7 +26,7 @@
             "is_thinking": true
         },
         "gemini-3.1-flash-lite": {
-            "max_output_tokens": 16384,
+            "max_output_tokens": 65535,
             "thinking_budget": 0,
             "is_thinking": true
         },
@@ -127,8 +127,8 @@
         },
         "gpt-oss-120b-medium": {
             "max_output_tokens": 32768,
-            "thinking_budget": 0,
-            "is_thinking": false
+            "thinking_budget": 8192,
+            "is_thinking": true
         }
     },
     "aliases": {

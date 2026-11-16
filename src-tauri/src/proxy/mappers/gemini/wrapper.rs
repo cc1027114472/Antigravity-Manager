@@ -313,6 +313,14 @@ pub fn wrap_request_v2(
                                     call_id
                                 );
                             }
+                            if let Some(fr_obj) = fr.as_object_mut() {
+                                let resp_val = fr_obj
+                                    .entry("response")
+                                    .or_insert_with(|| json!({ "output": "" }));
+                                crate::proxy::mappers::common_utils::normalize_function_response_object(
+                                    resp_val,
+                                );
+                            }
                         }
 
                         // 3. 处理 thoughtSignature (兼容客户端传入 thought_signature，但发往上游只保留官方标准驼峰 thoughtSignature)
@@ -1909,6 +1917,7 @@ mod tests {
         );
 
         let cases = [
+            ("gemini-3.1-flash-lite", "LOW"),
             ("gemini-3.5-flash-lite", "LOW"),
             ("gemini-3.8-flash-medium", "MEDIUM"),
             ("gemini-4-argon-high", "HIGH"),
@@ -2087,6 +2096,48 @@ mod tests {
         assert!(
             gen_config.get("maxOutputTokens").is_none(),
             "gemini-3.8-flash-tiered without explicit maxOutputTokens must omit maxOutputTokens"
+        );
+    }
+
+    #[test]
+    fn test_native_function_response_normalized_to_output_string() {
+        let body = json!({
+            "model": "gemini-3.1-flash-lite",
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [
+                        { "functionCall": { "name": "run_cmd", "args": { "cmd": "ls" } } }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": "run_cmd",
+                                "response": { "result": { "exit_code": 0, "stdout": "ok" } }
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let wrapped = wrap_request(&body, "test-proj", "gemini-3.1-flash-lite", None, Some("sess-fr"), None);
+        let resp = &wrapped["request"]["contents"][1]["parts"][0]["functionResponse"]["response"];
+        assert!(resp.get("result").is_none(), "legacy result key must be migrated");
+        assert_eq!(
+            resp.get("output").and_then(|v| v.as_str()),
+            Some(r#"{"exit_code":0,"stdout":"ok"}"#)
+        );
+        assert_eq!(
+            wrapped["request"]["generationConfig"]["thinkingConfig"],
+            json!({ "includeThoughts": true, "thinkingLevel": "LOW" })
+        );
+        assert_eq!(
+            wrapped["request"]["generationConfig"]["maxOutputTokens"],
+            json!(65535)
         );
     }
 }

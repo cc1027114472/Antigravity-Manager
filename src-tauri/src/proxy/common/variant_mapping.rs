@@ -229,8 +229,8 @@ const SPEC_31_PRO_PREVIEW: RealModelSpec = RealModelSpec {
 const SPEC_31_FLASH_LITE: RealModelSpec = RealModelSpec {
     id: "gemini-3.1-flash-lite",
     thinking_budget: 0,
-    max_output_tokens: 16384,
-    include_thoughts: false,
+    max_output_tokens: 65535,
+    include_thoughts: true,
     preserve_client_budget: false,
 };
 const SPEC_CLAUDE_SONNET_46: RealModelSpec = RealModelSpec {
@@ -446,7 +446,8 @@ mod tests {
         let s = resolve("gemini-3.1-flash-lite", None).unwrap();
         assert_eq!(s.id, "gemini-3.1-flash-lite");
         assert_eq!(s.thinking_budget, 0);
-        assert!(!s.include_thoughts);
+        assert_eq!(s.max_output_tokens, 65535);
+        assert!(s.include_thoughts);
 
         let s = resolve("claude-sonnet-4-6", None).unwrap();
         assert_eq!(s.id, "claude-sonnet-4-6");
@@ -693,9 +694,9 @@ mod tests {
 
     #[test]
     fn baseline_resolve_non_variant_models() {
-        check("gemini-3.1-flash-lite", None, "gemini-3.1-flash-lite", 0, 16384);
-        check("gemini-3.1-flash-lite", Some(0), "gemini-3.1-flash-lite", 0, 16384);
-        check("gemini-3.1-flash-lite", Some(7000), "gemini-3.1-flash-lite", 0, 16384);
+        check("gemini-3.1-flash-lite", None, "gemini-3.1-flash-lite", 0, 65535);
+        check("gemini-3.1-flash-lite", Some(0), "gemini-3.1-flash-lite", 0, 65535);
+        check("gemini-3.1-flash-lite", Some(7000), "gemini-3.1-flash-lite", 0, 65535);
 
         // ── Claude family ──────────────────────────────────────────────
         check("claude-sonnet-4-6", None, "claude-sonnet-4-6", 1024, 64000);
