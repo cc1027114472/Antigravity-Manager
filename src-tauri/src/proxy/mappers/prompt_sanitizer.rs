@@ -310,6 +310,42 @@ impl PromptSanitizer {
     /// 后续冗余身份句剥离去重，防止产生双倍重复身份声明触发上游 WAF 429）；若原文以逗号续写功能指令，
     /// 则保留逗号，续写内容逐字不动。代码块（``` 与行内 `）内的身份文本 100% 豁免，头部窗口之后的原文逐字保留。
     pub fn normalize_system_identity(text: &str) -> String {
+        if let Some((prefix, trimmed_rest)) = Self::split_leading_antigravity_identity(text) {
+            if trimmed_rest.is_empty() {
+                return text.to_string();
+            }
+            let normalized_rest = Self::normalize_identity_head(trimmed_rest, true);
+            if normalized_rest == trimmed_rest {
+                return text.to_string();
+            }
+            let rest_clean = normalized_rest.trim_start_matches(['\r', '\n', ' ']);
+            if rest_clean.is_empty() {
+                return prefix.to_string();
+            }
+            return format!("{prefix}\n\n{rest_clean}");
+        }
+
+        Self::normalize_identity_head(text, false)
+    }
+
+    /// 若文本以官方 `<identity>...</identity>` 块开头，返回 `(规范块切片, 去除前导空行后的剩余文本)`。
+    fn split_leading_antigravity_identity(text: &str) -> Option<(&str, &str)> {
+        let trimmed = text.trim_start();
+        if !trimmed.starts_with("<identity>") {
+            return None;
+        }
+        let close_tag = "</identity>";
+        let end_idx = trimmed.find(close_tag)?;
+        let inner = &trimmed["<identity>".len()..end_idx];
+        if !inner.contains("You are Antigravity") {
+            return None;
+        }
+        let block = &trimmed[..end_idx + close_tag.len()];
+        let rest = trimmed[end_idx + close_tag.len()..].trim_start_matches(['\r', '\n', ' ', '\t']);
+        Some((block, rest))
+    }
+
+    fn normalize_identity_head(text: &str, already_has_identity: bool) -> String {
         // 快速前置检查：无任何归属类或已知客户端特征词则零开销返回
         let lower = text.to_lowercase();
         if !IDENTITY_FAST_MARKERS
@@ -328,8 +364,8 @@ impl PromptSanitizer {
         }
 
         // 保护头部窗口内的代码块，并在非代码区执行身份归属声明归一化与去重
-        let mut restored = Self::with_code_blocks_protected(head, |protected_head| {
-            let mut emitted_identity = false;
+        let restored_head = Self::with_code_blocks_protected(head, |protected_head| {
+            let mut emitted_identity = already_has_identity;
             let mut replace_identity = |caps: &regex::Captures| {
                 let punct = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 if !emitted_identity {
@@ -348,6 +384,7 @@ impl PromptSanitizer {
             RE_MULTI_NEWLINE.replace_all(&pass2, "\n\n").into_owned()
         });
 
+        let mut restored = restored_head;
         restored.push_str(&text[head.len()..]);
         RE_MULTI_NEWLINE.replace_all(&restored, "\n\n").into_owned()
     }
@@ -376,19 +413,47 @@ impl PromptSanitizer {
         t.starts_with(BILLING_METADATA_PREFIX) && !t.contains('\n') && !t.contains('\r')
     }
 
-    /// 剥离管道自身的提示词分界标记与官方身份文本（原适配层 `clean_system_prompt_text`）。
-    /// 注意：不含 `clean_text` —— Header 轨已在 `sanitize_parts_core` 中统一执行，避免重复。
+    /// 剥离管道自身的提示词分界标记与混入的未包装官方身份文本（原适配层 `clean_system_prompt_text`）。
+    /// 注意：不含 `clean_text` —— Header 轨已在 `sanitize_parts_core` 中统一执行，避免重复；
+    /// 保留首个完整的 `FALLBACK_ANTIGRAVITY_IDENTITY`（`<identity>...</identity>`）兜底头，杜绝被掏空为空壳。
     pub fn strip_pipeline_markers(text: &str) -> String {
+        const PIPELINE_IDENTITY_PLACEHOLDER: &str = "__PROMPT_SANITIZER_PIPELINE_IDENTITY__";
+
         let mut s = text.to_string();
+        let mut modified = false;
+
         for marker in SYSTEM_PROMPT_END_MARKERS {
             if s.contains(marker) {
                 s = s.replace(marker, "");
+                modified = true;
             }
         }
+
+        let fallback_identity = crate::proxy::mappers::common_utils::FALLBACK_ANTIGRAVITY_IDENTITY;
+        let mut has_canonical_wrapper = false;
+        if s.contains(fallback_identity) {
+            has_canonical_wrapper = true;
+            s = s.replacen(fallback_identity, PIPELINE_IDENTITY_PLACEHOLDER, 1);
+            if s.contains(fallback_identity) {
+                s = s.replace(fallback_identity, "");
+                modified = true;
+            }
+        }
+
         if s.contains(SELF_IDENTITY_BLOCK) {
             s = s.replace(SELF_IDENTITY_BLOCK, "");
+            modified = true;
         }
-        s.trim().to_string()
+
+        if has_canonical_wrapper {
+            s = s.replace(PIPELINE_IDENTITY_PLACEHOLDER, fallback_identity);
+        }
+
+        if !modified {
+            return text.to_string();
+        }
+
+        RE_MULTI_NEWLINE.replace_all(&s, "\n\n").trim().to_string()
     }
 
     fn sanitize_parts_core(parts: &mut Vec<Value>, system_scope: bool) -> usize {
@@ -1535,5 +1600,74 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(phrase));
+    }
+
+    #[test]
+    fn test_fallback_identity_preserved_across_wrap_and_sanitize_pipeline() {
+        let fallback = crate::proxy::mappers::common_utils::FALLBACK_ANTIGRAVITY_IDENTITY;
+        assert_eq!(
+            fallback,
+            format!("<identity>\n{SELF_IDENTITY_BLOCK}\n</identity>"),
+            "FALLBACK_ANTIGRAVITY_IDENTITY and SELF_IDENTITY_BLOCK must share canonical body"
+        );
+
+        // 1. Bare Gemini ping wrapped and sanitized must preserve full <identity>...</identity>, never "<identity>\n\n</identity>"
+        let bare_req = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }]
+        });
+        let mut wrapped_bare = crate::proxy::mappers::gemini::wrapper::wrap_request(
+            &bare_req,
+            "test-proj",
+            "gemini-3.8-flash-high",
+            None,
+            None,
+            None,
+        );
+        PromptSanitizer::sanitize_gemini_payload(&mut wrapped_bare);
+        let bare_si = wrapped_bare["request"]["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(bare_si, fallback);
+        assert!(!bare_si.contains("<identity>\n\n</identity>"));
+
+        // 2. Duplicate wrapped identity or bare SELF_IDENTITY_BLOCK mixed into prompt gets deduplicated, keeping canonical header intact
+        let mixed = format!("{fallback}\n\n{fallback}\n\n{SELF_IDENTITY_BLOCK}\n\nRule 1: stay accurate.");
+        assert_eq!(
+            PromptSanitizer::strip_pipeline_markers(&mixed),
+            format!("{fallback}\n\nRule 1: stay accurate.")
+        );
+
+        // 3. Third-party agent system prompt wrapped with FALLBACK_ANTIGRAVITY_IDENTITY must keep <identity> intact
+        //    AND strip trailing DeepSeek Harness attribution lines cleanly without leaking or duplicating identity.
+        let agent_req = json!({
+            "systemInstruction": {
+                "parts": [{
+                    "text": concat!(
+                        "You are an AI agent powered by DeepSeek Harness.\n\n",
+                        "You are a coding agent powered by the gemini-3.8-flash-medium model.\n\n",
+                        "## Progress\n- Keep concise."
+                    )
+                }]
+            },
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
+        });
+        let mut wrapped_agent = crate::proxy::mappers::gemini::wrapper::wrap_request(
+            &agent_req,
+            "test-proj",
+            "gemini-3.8-flash-medium",
+            None,
+            None,
+            None,
+        );
+        PromptSanitizer::sanitize_gemini_payload(&mut wrapped_agent);
+        let agent_si = wrapped_agent["request"]["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            agent_si,
+            format!("{fallback}\n\n## Progress\n- Keep concise.")
+        );
+        assert!(!agent_si.contains("<identity>\n\n</identity>"));
+        assert!(!agent_si.to_lowercase().contains("deepseek harness"));
     }
 }

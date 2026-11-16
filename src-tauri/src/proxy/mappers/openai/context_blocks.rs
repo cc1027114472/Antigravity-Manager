@@ -209,9 +209,22 @@ fn looks_like_customization(text: &str) -> bool {
         || text.contains("customization")
 }
 
+fn unwrap_matching_outer_tag<'a>(content: &'a str, tag: &str) -> &'a str {
+    let trimmed = content.trim();
+    let open_tag = format!("<{}>", tag);
+    let close_tag = format!("</{}>", tag);
+    if trimmed.starts_with(&open_tag) && trimmed.ends_with(&close_tag) {
+        let inner = &trimmed[open_tag.len()..trimmed.len() - close_tag.len()];
+        if !inner.contains(&close_tag) {
+            return inner.trim();
+        }
+    }
+    trimmed
+}
+
 fn append_section(out: &mut String, tag: &str, content: &str) {
     let content = strip_codex_step_markers(content);
-    let content = content.trim();
+    let content = unwrap_matching_outer_tag(&content, tag);
     if content.is_empty() {
         return;
     }
@@ -273,4 +286,25 @@ fn collapse_blank_lines(text: &str) -> String {
         out.push('\n');
     }
     out.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_official_style_system_instruction;
+    use crate::proxy::mappers::common_utils::FALLBACK_ANTIGRAVITY_IDENTITY;
+
+    #[test]
+    fn test_fallback_identity_is_not_double_wrapped_in_identity_tags() {
+        let rendered = build_official_style_system_instruction(
+            &[],
+            Some(FALLBACK_ANTIGRAVITY_IDENTITY),
+            None,
+            "agent",
+            "gemini-3.8-flash-high",
+            "sid-test",
+        );
+        assert_eq!(rendered, FALLBACK_ANTIGRAVITY_IDENTITY);
+        assert_eq!(rendered.matches("<identity>").count(), 1);
+        assert_eq!(rendered.matches("</identity>").count(), 1);
+    }
 }
