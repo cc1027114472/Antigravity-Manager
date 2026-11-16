@@ -373,8 +373,6 @@ pub async fn handle_generate(
             // 6. 响应处理
             if is_stream {
                 use axum::body::Body;
-                use axum::response::Response;
-                use bytes::{Bytes, BytesMut};
                 use futures::StreamExt;
 
                 let meta = json!({
@@ -394,224 +392,48 @@ pub async fn handle_generate(
                     "upstream_response",
                     meta,
                 );
-                let mut buffer = BytesMut::new();
-                let s_id = session_id.clone(); // Clone for stream closure
+                let s_id = session_id.clone();
 
-                // [FIX #859] Implement peek logic for Gemini stream to prevent 0-token 200 OK
-                let mut first_chunk = None;
-                let mut retry_gemini = false;
-
-                // [NEW] 实施双阶段超时：第一阶段为 FirstChunkTimeout (300s / 5min)
-                // 这精准对齐了官方 Worker 在模型冷启动（Initialization）阶段的极度耐心
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
-                    response_stream.next(),
-                )
-                .await
-                {
-                    Ok(Some(Ok(bytes))) => {
-                        if bytes.is_empty() {
-                            tracing::warn!("[Gemini] Empty first chunk received, retrying...");
-                            retry_gemini = true;
-                        } else {
-                            first_chunk = Some(bytes);
-                        }
-                    }
-                    Ok(Some(Err(e))) => {
-                        tracing::warn!("[Gemini] Stream error during peek: {}, retrying...", e);
-                        last_error = format!("Stream error: {}", e);
-                        retry_gemini = true;
-                    }
-                    Ok(None) => {
-                        tracing::warn!("[Gemini] Stream ended immediately, retrying...");
-                        last_error = "Empty response".to_string();
-                        retry_gemini = true;
-                    }
-                    Err(_) => {
-                        tracing::warn!("[Gemini] First chunk timeout after 300s, retrying...");
-                        last_error = "First chunk timeout".to_string();
-                        retry_gemini = true;
-                    }
-                }
-
-                if retry_gemini {
-                    continue;
-                }
-                if let Some(g) = lease_guard.as_mut() {
-                    g.mark_upstream_accepted();
-                }
-                crate::proxy::toxic_cache::clear_request_503(&toxic_fp);
-
-                let s_id_for_stream = s_id.clone();
-                let model_name_for_stream = mapped_model.clone();
-                let stream = async_stream::stream! {
-                    let mut first_data = first_chunk;
-                    let mut meta_sent = false;
-
-                    loop {
-                        // [NEW] 阶段 6.2: 补全 __cloudCodeMeta 响应元数据透传
-                        // 官方 Worker 会将 TraceID 作为 SSE 流的第 0 个数据包下发
-                        if !meta_sent {
-                            if let Some(tid) = &cloud_code_trace_id {
-                                let meta_pkg = serde_json::json!({
-                                    "__cloudCodeMeta": {
-                                        "traceId": tid
-                                    }
-                                });
-                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&meta_pkg).unwrap())));
+                if !client_wants_stream {
+                    // 非流式请求（内部强转流）：必须在重试循环内完成整条流的收集与完整性校验，
+                    // 绝不在收到首包时就提前宣告成功；缺失输出/缺失 finishReason/流中途出错统一走换号重试。
+                    let timed_stream = stream_with_idle_timeout(
+                        response_stream,
+                        std::time::Duration::from_secs(300),
+                    );
+                    match crate::proxy::mappers::gemini::collector::collect_stream_to_json(
+                        Box::pin(timed_stream),
+                        &s_id,
+                    )
+                    .await
+                    {
+                        Ok(mut gemini_resp) => {
+                            let has_finish_reason = gemini_resp
+                                .pointer("/candidates/0/finishReason")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .map_or(false, |s| !s.is_empty());
+                            if !has_finish_reason {
+                                tracing::warn!(
+                                    "[{}] Non-stream collected Gemini response missing finishReason on account {}, retrying...",
+                                    session_id,
+                                    email
+                                );
+                                last_error =
+                                    "Upstream Gemini stream ended without a finishReason".to_string();
+                                last_status = StatusCode::BAD_GATEWAY;
+                                force_rotate = true;
+                                continue;
                             }
-                            meta_sent = true;
-                        }
 
-                        let item = if let Some(fd) = first_data.take() {
-                            Some(Ok(fd))
-                        } else {
-                            // [NEW] 第二阶段为 StreamIdleTimeout (300s / 5min)
-                            match tokio::time::timeout(std::time::Duration::from_secs(300), response_stream.next()).await {
-                                Ok(next_item) => next_item,
-                                Err(_) => {
-                                    error!("[Gemini-SSE] Idle timeout after 300s, terminating stream");
-                                    None
-                                }
+                            if let Some(g) = lease_guard.as_mut() {
+                                g.mark_upstream_accepted();
                             }
-                        };
-
-                        let bytes = match item {
-                            Some(Ok(b)) => b,
-                            Some(Err(e)) => {
-                                error!("[Gemini-SSE] Stream error: {}", e);
-                                let error_json = serde_json::json!({
-                                    "id": &s_id_for_stream,
-                                    "object": "chat.completion.chunk",
-                                    "model": &model_name_for_stream,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {
-                                                "content": format!("\n[Stream Error] {}", e)
-                                            },
-                                            "finish_reason": "error"
-                                        }
-                                    ]
-                                });
-                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_json).unwrap_or_default())));
-                                yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
-                                break;
-                            }
-                            None => break,
-                        };
-
-                        debug!("[Gemini-SSE] Received chunk: {} bytes", bytes.len());
-                        buffer.extend_from_slice(&bytes);
-                        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                            let line_raw = buffer.split_to(pos + 1);
-                            if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                let line = line_str.trim();
-                                if line.is_empty() { continue; }
-
-                                if line.starts_with("data: ") {
-                                    let json_part = line.trim_start_matches("data: ").trim();
-                                    if json_part == "[DONE]" {
-                                        yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
-                                        continue;
-                                    }
-
-                                    match serde_json::from_str::<Value>(json_part) {
-                                        Ok(mut json) => {
-                                            // [FIX #765] Extract thoughtSignature from stream
-                                            let inner_val = if json.get("response").is_some() {
-                                                json.get("response")
-                                            } else {
-                                                Some(&json)
-                                            };
-
-                                            if let Some(resp) = inner_val {
-                                                if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
-                                                    for cand in candidates {
-                                                        if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
-                                                            for part in parts {
-                                                                if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
-                                                                    crate::proxy::SignatureCache::global()
-                                                                        .cache_session_signature(&s_id_for_stream, sig.to_string(), 1);
-                                                                    debug!("[Gemini-SSE] Cached signature (len: {}) for session: {}", sig.len(), s_id_for_stream);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            // [FIX #1522] Inject Tool ID into Stream Response
-                                            crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(&mut json, &model_name_for_stream);
-
-                                            // Unwrap v1internal response wrapper
-                                            if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
-                                                let new_line = format!("data: {}\n\n", serde_json::to_string(&inner).unwrap_or_default());
-                                                yield Ok::<Bytes, String>(Bytes::from(new_line));
-                                            } else {
-                                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&json).unwrap_or_default())));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            debug!("[Gemini-SSE] JSON parse error: {}, passing raw line", e);
-                                            yield Ok::<Bytes, String>(Bytes::from(format!("{}\n\n", line)));
-                                        }
-                                    }
-                                } else {
-                                    // Non-data lines (comments, etc.)
-                                    yield Ok::<Bytes, String>(Bytes::from(format!("{}\n\n", line)));
-                                }
-                            } else {
-                                // Non-UTF8 data? Just pass it through or skip
-                                debug!("[Gemini-SSE] Non-UTF8 line encountered");
-                                yield Ok::<Bytes, String>(line_raw.freeze());
-                            }
-                        }
-                    }
-                };
-
-                if client_wants_stream {
-                    let peak =
-                        crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
-                    let mut builder = axum::response::Response::builder()
-                        .header("Content-Type", "text/event-stream")
-                        .header("Cache-Control", "no-cache")
-                        .header("Connection", "keep-alive")
-                        .header("X-Accel-Buffering", "no")
-                        .header("X-Account-Email", &email)
-                        .header("X-Account-Id", &account_id)
-                        .header("X-Mapped-Model", &mapped_model)
-                        .header(crate::proxy::account_inflight::HEADER_RESPONSE_SOURCE, crate::proxy::account_inflight::SOURCE_REMOTE);
-                    if let Some(p) = peak {
-                        builder = builder.header("X-In-Flight-Peak", p.to_string());
-                    }
-                    let lease_arc =
-                        std::sync::Arc::new(std::sync::Mutex::new(lease_guard.take()));
-                    let lease_clone = lease_arc.clone();
-                    let inflight_arc =
-                        std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
-                    let inflight_clone = inflight_arc.clone();
-                    let stream_with_pacer = async_stream::stream! {
-                        let _guard_hold = inflight_clone;
-                        let _lease_hold = lease_clone;
-                        let mut inner = Box::pin(stream);
-                        while let Some(item) = inner.next().await {
-                            yield item;
-                        }
-                        if let Ok(mut g) = _lease_hold.lock() {
-                            if let Some(mut guard) = g.take() {
-                                guard.complete();
-                            }
-                        }
-                        drop(_guard_hold);
-                    };
-                    let body = axum::body::Body::from_stream(stream_with_pacer);
-                    return Ok(builder.body(body).unwrap().into_response());
-                } else {
-                    // Collect to JSON
-                    use crate::proxy::mappers::gemini::collector::collect_stream_to_json;
-                    match collect_stream_to_json(Box::pin(stream), &s_id).await {
-                        Ok(gemini_resp) => {
+                            crate::proxy::toxic_cache::clear_request_503(&toxic_fp);
+                            crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(
+                                &mut gemini_resp,
+                                &mapped_model,
+                            );
                             if let Some(mut guard) = lease_guard.take() {
                                 guard.complete();
                             }
@@ -629,23 +451,105 @@ pub async fn handle_generate(
                                 Some(mapped_model.as_str()),
                                 peak,
                             );
-                            return Ok((
-                                StatusCode::OK,
-                                headers,
-                                Json(unwrapped),
-                            )
-                                .into_response());
+                            return Ok((StatusCode::OK, headers, Json(unwrapped)).into_response());
                         }
                         Err(e) => {
-                            error!("Stream collection error: {}", e);
-                            return Ok((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Stream collection error: {}", e),
-                            )
-                                .into_response());
+                            tracing::warn!(
+                                "[{}] Non-stream Gemini collection failed on account {}: {}, retrying...",
+                                session_id,
+                                email,
+                                e
+                            );
+                            last_error = e;
+                            last_status = StatusCode::BAD_GATEWAY;
+                            force_rotate = true;
+                            continue;
                         }
                     }
                 }
+
+                // 流式请求（streamGenerateContent）：
+                // Peek 阶段按 SSE 完整行解析（跳过心跳、对纯思考加 1500ms 短观察窗防瞬断），
+                // 若瞬时出现“只有思考/空响应/无 finishReason”或流内错误帧，在发 HTTP 200 前截停重试。
+                let peek_outcome = match peek_gemini_stream_start(
+                    &mut response_stream,
+                    &s_id,
+                    &mapped_model,
+                    std::time::Duration::from_secs(300),
+                    std::time::Duration::from_millis(1500),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(fail) => {
+                        tracing::warn!(
+                            "[Gemini] Peek rejected stream on account {}: {}, retrying...",
+                            email,
+                            fail.message
+                        );
+                        last_error = fail.message;
+                        last_status = fail.status;
+                        force_rotate = true;
+                        continue;
+                    }
+                };
+
+                if let Some(g) = lease_guard.as_mut() {
+                    g.mark_upstream_accepted();
+                }
+                crate::proxy::toxic_cache::clear_request_503(&toxic_fp);
+
+                let stream_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stream = build_gemini_sse_relay_stream(
+                    response_stream,
+                    peek_outcome,
+                    cloud_code_trace_id.clone(),
+                    std::time::Duration::from_secs(300),
+                    stream_failed.clone(),
+                );
+
+                let peak = crate::proxy::account_inflight::sample_peak(&mut inflight_guard);
+                let mut builder = axum::response::Response::builder()
+                    .header("Content-Type", "text/event-stream")
+                    .header("Cache-Control", "no-cache")
+                    .header("Connection", "keep-alive")
+                    .header("X-Accel-Buffering", "no")
+                    .header("X-Account-Email", &email)
+                    .header("X-Account-Id", &account_id)
+                    .header("X-Mapped-Model", &mapped_model)
+                    .header(
+                        crate::proxy::account_inflight::HEADER_RESPONSE_SOURCE,
+                        crate::proxy::account_inflight::SOURCE_REMOTE,
+                    );
+                if let Some(p) = peak {
+                    builder = builder.header("X-In-Flight-Peak", p.to_string());
+                }
+                let lease_arc = std::sync::Arc::new(std::sync::Mutex::new(lease_guard.take()));
+                let lease_clone = lease_arc.clone();
+                let inflight_arc =
+                    std::sync::Arc::new(std::sync::Mutex::new(inflight_guard.take()));
+                let inflight_clone = inflight_arc.clone();
+                let stream_failed_for_lease = stream_failed.clone();
+                let stream_with_pacer = async_stream::stream! {
+                    let _guard_hold = inflight_clone;
+                    let _lease_hold = lease_clone;
+                    let mut inner = Box::pin(stream);
+                    while let Some(item) = inner.next().await {
+                        yield item;
+                    }
+                    if let Ok(mut g) = _lease_hold.lock() {
+                        if let Some(mut guard) = g.take() {
+                            if stream_failed_for_lease.load(std::sync::atomic::Ordering::Acquire) {
+                                guard.complete_on_upstream_overload();
+                            } else {
+                                guard.complete();
+                            }
+                        }
+                    }
+                    drop(_guard_hold);
+                };
+                let body = Body::from_stream(stream_with_pacer);
+                return Ok(builder.body(body).unwrap().into_response());
             }
 
             if let Some(g) = lease_guard.as_mut() {
@@ -1024,4 +928,624 @@ pub async fn handle_count_tokens(
         })?;
 
     Ok(Json(json!({"totalTokens": 0})))
+}
+
+#[derive(Default)]
+struct GeminiSseRelayState {
+    saw_data_event: bool,
+    saw_output: bool,
+    saw_thought: bool,
+    finish_reason: Option<String>,
+    saw_error: bool,
+    error_message: Option<String>,
+}
+
+struct GeminiSseParser {
+    utf8_buf: crate::proxy::mappers::Utf8ChunkBuffer,
+    line_buf: String,
+    session_id: String,
+    model_name: String,
+    state: GeminiSseRelayState,
+}
+
+impl GeminiSseParser {
+    fn new(session_id: String, model_name: String) -> Self {
+        Self {
+            utf8_buf: crate::proxy::mappers::Utf8ChunkBuffer::new(),
+            line_buf: String::new(),
+            session_id,
+            model_name,
+            state: GeminiSseRelayState::default(),
+        }
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> Vec<bytes::Bytes> {
+        let text = self.utf8_buf.push(bytes);
+        self.line_buf.push_str(&text);
+        self.drain_complete_lines()
+    }
+
+    fn flush(&mut self) -> Vec<bytes::Bytes> {
+        if let Some(tail) = self.utf8_buf.flush_lossy() {
+            self.line_buf.push_str(&tail);
+        }
+        let mut frames = self.drain_complete_lines();
+        if !self.line_buf.is_empty() {
+            let tail = std::mem::take(&mut self.line_buf);
+            if let Some(frame) = self.process_line(&tail) {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
+    fn drain_complete_lines(&mut self) -> Vec<bytes::Bytes> {
+        let mut frames = Vec::new();
+        while let Some(pos) = self.line_buf.find('\n') {
+            let line: String = self.line_buf.drain(..=pos).collect();
+            if let Some(frame) = self.process_line(&line) {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
+    fn process_line(&mut self, raw_line: &str) -> Option<bytes::Bytes> {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            return None;
+        }
+
+        if let Some(json_part) = line.strip_prefix("data:").map(str::trim) {
+            if json_part == "[DONE]" {
+                return Some(bytes::Bytes::from("data: [DONE]\n\n"));
+            }
+
+            match serde_json::from_str::<Value>(json_part) {
+                Ok(mut json) => {
+                    self.state.saw_data_event = true;
+                    {
+                        let inner_val = json.get("response").unwrap_or(&json);
+                        if let Some(err_obj) = inner_val.get("error") {
+                            self.state.saw_error = true;
+                            self.state.error_message = Some(
+                                err_obj
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| err_obj.to_string()),
+                            );
+                        }
+                        if let Some(candidates) =
+                            inner_val.get("candidates").and_then(Value::as_array)
+                        {
+                            for cand in candidates {
+                                if let Some(fr) = cand
+                                    .get("finishReason")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    self.state.finish_reason = Some(fr.to_string());
+                                }
+                                if let Some(parts) = cand
+                                    .get("content")
+                                    .and_then(|c| c.get("parts"))
+                                    .and_then(Value::as_array)
+                                {
+                                    for part in parts {
+                                        if let Some(sig) =
+                                            part.get("thoughtSignature").and_then(Value::as_str)
+                                        {
+                                            crate::proxy::SignatureCache::global()
+                                                .cache_session_signature(
+                                                    &self.session_id,
+                                                    sig.to_string(),
+                                                    1,
+                                                );
+                                            debug!(
+                                                "[Gemini-SSE] Cached signature (len: {}) for session: {}",
+                                                sig.len(),
+                                                self.session_id
+                                            );
+                                        }
+                                        if part
+                                            .get("thought")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false)
+                                        {
+                                            self.state.saw_thought = true;
+                                        }
+                                        if crate::proxy::mappers::gemini::collector::is_meaningful_output_part(part) {
+                                            self.state.saw_output = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(
+                        &mut json,
+                        &self.model_name,
+                    );
+
+                    if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
+                        let new_line = format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(&inner).unwrap_or_default()
+                        );
+                        Some(bytes::Bytes::from(new_line))
+                    } else {
+                        Some(bytes::Bytes::from(format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(&json).unwrap_or_default()
+                        )))
+                    }
+                }
+                Err(e) => {
+                    debug!("[Gemini-SSE] JSON parse error: {}, passing raw line", e);
+                    Some(bytes::Bytes::from(format!("{line}\n\n")))
+                }
+            }
+        } else {
+            Some(bytes::Bytes::from(format!("{line}\n\n")))
+        }
+    }
+
+    fn has_terminal_incomplete_error(&self) -> Option<&'static str> {
+        if self.state.saw_error {
+            return None;
+        }
+        if self.state.finish_reason.is_none() {
+            if self.state.saw_thought && !self.state.saw_output {
+                return Some(
+                    "Upstream Gemini stream ended with thinking only and no output or finishReason",
+                );
+            }
+            if !self.state.saw_output {
+                return Some("Upstream Gemini stream ended empty without finishReason");
+            }
+            return Some("Upstream Gemini stream ended unexpectedly without finishReason");
+        }
+        if self.state.finish_reason.as_deref() == Some("STOP") && !self.state.saw_output {
+            return Some("Upstream Gemini stream ended with STOP but produced no output content");
+        }
+        None
+    }
+}
+
+struct GeminiPeekOutcome {
+    parser: GeminiSseParser,
+    prebuffered_frames: Vec<bytes::Bytes>,
+    stream_ended: bool,
+}
+
+#[derive(Debug)]
+struct GeminiPeekFailure {
+    status: StatusCode,
+    message: String,
+}
+
+fn build_gemini_sse_error_bytes(code: u16, status: &str, message: &str) -> bytes::Bytes {
+    let payload = json!({
+        "error": {
+            "code": code,
+            "message": message,
+            "status": status
+        }
+    });
+    bytes::Bytes::from(format!(
+        "data: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_default()
+    ))
+}
+
+fn stream_with_idle_timeout<S, E>(
+    mut stream: S,
+    chunk_timeout: std::time::Duration,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, String>> + Send + 'static
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    use futures::StreamExt;
+    async_stream::stream! {
+        loop {
+            match tokio::time::timeout(chunk_timeout, stream.next()).await {
+                Ok(Some(Ok(bytes))) => yield Ok(bytes),
+                Ok(Some(Err(e))) => {
+                    yield Err(format!("Stream error: {}", e));
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    yield Err(format!("Upstream stream idle timeout after {}s", chunk_timeout.as_secs()));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn peek_gemini_stream_start<S, E>(
+    stream: &mut S,
+    session_id: &str,
+    model_name: &str,
+    first_chunk_timeout: std::time::Duration,
+    thinking_grace_window: std::time::Duration,
+) -> Result<GeminiPeekOutcome, GeminiPeekFailure>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt;
+
+    let mut parser = GeminiSseParser::new(session_id.to_string(), model_name.to_string());
+    let mut prebuffered_frames: Vec<bytes::Bytes> = Vec::new();
+    let mut grace_deadline: Option<tokio::time::Instant> = None;
+
+    loop {
+        let next_res = if let Some(deadline) = grace_deadline {
+            tokio::time::timeout_at(deadline, stream.next()).await
+        } else {
+            tokio::time::timeout(first_chunk_timeout, stream.next()).await
+        };
+
+        match next_res {
+            Ok(Some(Ok(bytes))) => {
+                if bytes.is_empty() {
+                    continue;
+                }
+                prebuffered_frames.extend(parser.push_bytes(&bytes));
+
+                if parser.state.saw_error {
+                    return Err(GeminiPeekFailure {
+                        status: StatusCode::BAD_GATEWAY,
+                        message: parser
+                            .state
+                            .error_message
+                            .unwrap_or_else(|| "Upstream error event during peek".to_string()),
+                    });
+                }
+
+                if parser.state.saw_output {
+                    return Ok(GeminiPeekOutcome {
+                        parser,
+                        prebuffered_frames,
+                        stream_ended: false,
+                    });
+                }
+
+                if let Some(ref fr) = parser.state.finish_reason {
+                    if fr != "STOP" {
+                        return Ok(GeminiPeekOutcome {
+                            parser,
+                            prebuffered_frames,
+                            stream_ended: false,
+                        });
+                    }
+                }
+
+                if parser.state.saw_data_event && grace_deadline.is_none() {
+                    grace_deadline = Some(tokio::time::Instant::now() + thinking_grace_window);
+                }
+            }
+            Ok(Some(Err(e))) => {
+                return Err(GeminiPeekFailure {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: format!("Stream error during peek: {}", e),
+                });
+            }
+            Ok(None) => {
+                prebuffered_frames.extend(parser.flush());
+                if parser.state.saw_error {
+                    return Err(GeminiPeekFailure {
+                        status: StatusCode::BAD_GATEWAY,
+                        message: parser
+                            .state
+                            .error_message
+                            .unwrap_or_else(|| "Upstream error event during peek".to_string()),
+                    });
+                }
+                if let Some(msg) = parser.has_terminal_incomplete_error() {
+                    return Err(GeminiPeekFailure {
+                        status: StatusCode::BAD_GATEWAY,
+                        message: msg.to_string(),
+                    });
+                }
+                return Ok(GeminiPeekOutcome {
+                    parser,
+                    prebuffered_frames,
+                    stream_ended: true,
+                });
+            }
+            Err(_) => {
+                if !parser.state.saw_data_event {
+                    return Err(GeminiPeekFailure {
+                        status: StatusCode::GATEWAY_TIMEOUT,
+                        message: format!(
+                            "First chunk timeout after {}s",
+                            first_chunk_timeout.as_secs()
+                        ),
+                    });
+                }
+                // Grace window elapsed while upstream is still streaming preliminary/thinking events:
+                // release buffered frames immediately to protect client TTFB.
+                return Ok(GeminiPeekOutcome {
+                    parser,
+                    prebuffered_frames,
+                    stream_ended: false,
+                });
+            }
+        }
+    }
+}
+
+fn build_gemini_sse_relay_stream<S, E>(
+    mut response_stream: S,
+    peek_outcome: GeminiPeekOutcome,
+    cloud_code_trace_id: Option<String>,
+    idle_timeout: std::time::Duration,
+    stream_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, String>> + Send + 'static
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    use futures::StreamExt;
+    use std::sync::atomic::Ordering;
+
+    async_stream::stream! {
+        let mut parser = peek_outcome.parser;
+        let prebuffered_frames = peek_outcome.prebuffered_frames;
+        let stream_ended_in_peek = peek_outcome.stream_ended;
+
+        if let Some(tid) = &cloud_code_trace_id {
+            let meta_pkg = json!({
+                "__cloudCodeMeta": {
+                    "traceId": tid
+                }
+            });
+            yield Ok::<bytes::Bytes, String>(bytes::Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&meta_pkg).unwrap_or_default()
+            )));
+        }
+
+        for frame in prebuffered_frames {
+            yield Ok::<bytes::Bytes, String>(frame);
+        }
+
+        if stream_ended_in_peek {
+            return;
+        }
+
+        loop {
+            match tokio::time::timeout(idle_timeout, response_stream.next()).await {
+                Ok(Some(Ok(bytes))) => {
+                    debug!("[Gemini-SSE] Received chunk: {} bytes", bytes.len());
+                    for frame in parser.push_bytes(&bytes) {
+                        yield Ok::<bytes::Bytes, String>(frame);
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    let msg = format!("[Stream Error] {}", e);
+                    error!("[Gemini-SSE] Stream error: {}", e);
+                    stream_failed.store(true, Ordering::Release);
+                    yield Ok::<bytes::Bytes, String>(build_gemini_sse_error_bytes(
+                        502,
+                        "BAD_GATEWAY",
+                        &msg,
+                    ));
+                    break;
+                }
+                Ok(None) => {
+                    for frame in parser.flush() {
+                        yield Ok::<bytes::Bytes, String>(frame);
+                    }
+                    if parser.state.saw_error {
+                        stream_failed.store(true, Ordering::Release);
+                    } else if let Some(msg) = parser.has_terminal_incomplete_error() {
+                        tracing::warn!("[Gemini-SSE] {}", msg);
+                        stream_failed.store(true, Ordering::Release);
+                        yield Ok::<bytes::Bytes, String>(build_gemini_sse_error_bytes(
+                            502,
+                            "INTERNAL",
+                            msg,
+                        ));
+                    }
+                    break;
+                }
+                Err(_) => {
+                    let msg = format!(
+                        "Upstream stream idle timeout after {}s",
+                        idle_timeout.as_secs()
+                    );
+                    error!("[Gemini-SSE] {}", msg);
+                    stream_failed.store(true, Ordering::Release);
+                    yield Ok::<bytes::Bytes, String>(build_gemini_sse_error_bytes(
+                        504,
+                        "DEADLINE_EXCEEDED",
+                        &msg,
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::{stream, StreamExt};
+    use std::io;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_peek_rejects_thought_only_immediate_eof_and_heartbeats() {
+        // 1. Thought-only + usageMetadata + immediate EOF -> rejected before HTTP 200
+        let thought_only = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"pondering\",\"thought\":true}]}}]}}\n\n",
+            "data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":0}}}\n\n",
+        );
+        let mut s1 = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(thought_only))]);
+        let err1 = peek_gemini_stream_start(
+            &mut s1,
+            "s1",
+            "gemini-3.8-flash-high",
+            Duration::from_secs(300),
+            Duration::from_millis(50),
+        )
+        .await
+        .err()
+        .expect("thought-only stream without finishReason must be rejected in peek");
+        assert!(err1.message.contains("thinking only"));
+
+        // 2. Heartbeat comment only + EOF -> rejected
+        let mut s2 = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(": ping\n\n"))]);
+        assert!(peek_gemini_stream_start(
+            &mut s2,
+            "s2",
+            "gemini-3.8-flash-high",
+            Duration::from_secs(300),
+            Duration::from_millis(50),
+        )
+        .await
+        .is_err());
+
+        // 3. Embedded error frame during peek -> rejected
+        let mut s3 = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(
+            "data: {\"error\":{\"code\":503,\"message\":\"overloaded\"}}\n\n",
+        ))]);
+        let err3 = peek_gemini_stream_start(
+            &mut s3,
+            "s3",
+            "gemini-3.8-flash-high",
+            Duration::from_secs(300),
+            Duration::from_millis(50),
+        )
+        .await
+        .err()
+        .expect("embedded error frame must reject peek");
+        assert!(err3.message.contains("overloaded"));
+    }
+
+    #[tokio::test]
+    async fn test_peek_releases_slow_thinking_after_grace_window_without_blocking_ttfb() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(4);
+        tx.send(Ok(Bytes::from(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"step 1\",\"thought\":true}]}}]}}\n\n",
+        )))
+        .await
+        .unwrap();
+
+        let mut s = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let outcome = peek_gemini_stream_start(
+            &mut s,
+            "s-slow-think",
+            "gemini-3.8-flash-high",
+            Duration::from_secs(300),
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("slow thinking should proceed cleanly after grace window");
+        assert!(!outcome.stream_ended);
+        assert_eq!(outcome.prebuffered_frames.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_relay_emits_gemini_error_json_never_openai_chunk_on_mid_stream_failures() {
+        // 1. Mid-stream IO error -> native Gemini error JSON, no OpenAI choices/chat.completion.chunk, no [DONE]
+        let s_err = stream::iter(vec![
+            Ok::<Bytes, io::Error>(Bytes::from(
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}}\n\n",
+            )),
+            Err(io::Error::new(io::ErrorKind::ConnectionReset, "tcp reset")),
+        ]);
+        let mut s_err_box = Box::pin(s_err);
+        let outcome = peek_gemini_stream_start(
+            &mut s_err_box,
+            "s-err",
+            "gemini-3.8-flash-high",
+            Duration::from_secs(300),
+            Duration::from_millis(50),
+        )
+        .await
+        .ok()
+        .expect("initial text chunk passes peek");
+
+        let failed_flag = Arc::new(AtomicBool::new(false));
+        let relay = build_gemini_sse_relay_stream(
+            s_err_box,
+            outcome,
+            None,
+            Duration::from_secs(300),
+            failed_flag.clone(),
+        );
+        let chunks: Vec<String> = relay
+            .map(|r| String::from_utf8(r.unwrap().to_vec()).unwrap())
+            .collect()
+            .await;
+        let joined = chunks.join("");
+        assert!(failed_flag.load(Ordering::Acquire));
+        assert!(!joined.contains("chat.completion.chunk"));
+        assert!(!joined.contains("\"choices\""));
+        assert!(!joined.contains("data: [DONE]"));
+        assert!(joined.contains("\"error\""));
+        assert!(joined.contains("tcp reset"));
+        assert!(joined.contains("BAD_GATEWAY"));
+
+        // 2. Live thinking stream released after grace window that later terminates with usageMetadata & NO finishReason
+        //    + trailing chunk lacking trailing '\n' must still be processed cleanly.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(4);
+        tx.send(Ok(Bytes::from(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"deep thought\",\"thought\":true}]}}]}}\n\n",
+        )))
+        .await
+        .unwrap();
+        let mut rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let outcome2 = peek_gemini_stream_start(
+            &mut rx_stream,
+            "s-trunc",
+            "gemini-3.8-flash-high",
+            Duration::from_secs(300),
+            Duration::from_millis(20),
+        )
+        .await
+        .ok()
+        .unwrap();
+        // Upstream sends usage without trailing newline and closes
+        tx.send(Ok(Bytes::from(
+            "data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":0}}}",
+        )))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let failed2 = Arc::new(AtomicBool::new(false));
+        let relay2 = build_gemini_sse_relay_stream(
+            rx_stream,
+            outcome2,
+            None,
+            Duration::from_secs(300),
+            failed2.clone(),
+        );
+        let chunks2: Vec<String> = relay2
+            .map(|r| String::from_utf8(r.unwrap().to_vec()).unwrap())
+            .collect()
+            .await;
+        let joined2 = chunks2.join("");
+        assert!(failed2.load(Ordering::Acquire));
+        // Trailing usage line without '\n' was flushed, AND terminal incomplete Gemini error emitted
+        assert!(joined2.contains("\"usageMetadata\""));
+        assert!(joined2.contains("\"error\""));
+        assert!(joined2.contains("thinking only and no output or finishReason"));
+    }
 }

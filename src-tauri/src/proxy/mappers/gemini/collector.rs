@@ -9,6 +9,29 @@ use tracing::debug;
 use crate::proxy::mappers::Utf8ChunkBuffer;
 use crate::proxy::SignatureCache; // Assuming this is available at crate root or re-exported
 
+/// Returns true if a Gemini candidate `part` represents substantive non-thought output
+/// (non-empty text, tool call/response, media payload, or code execution block).
+pub fn is_meaningful_output_part(part: &Value) -> bool {
+    let is_thought = part
+        .get("thought")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if is_thought {
+        return false;
+    }
+    if let Some(text) = part.get("text").and_then(Value::as_str) {
+        if !text.is_empty() {
+            return true;
+        }
+    }
+    part.get("functionCall").is_some()
+        || part.get("functionResponse").is_some()
+        || part.get("inlineData").is_some()
+        || part.get("fileData").is_some()
+        || part.get("executableCode").is_some()
+        || part.get("codeExecutionResult").is_some()
+}
+
 /// Collects a Gemini SSE stream into a complete Gemini Response Value
 /// ALSO performs signature caching side-effect
 pub async fn collect_stream_to_json<S, E>(mut stream: S, session_id: &str) -> Result<Value, String>
@@ -23,7 +46,6 @@ where
                     "parts": [],
                     "role": "model"
                 },
-                "finishReason": "STOP",
                 "index": 0
             }
         ]
@@ -32,6 +54,7 @@ where
     let mut content_parts: Vec<Value> = Vec::new(); // To accumulate parts
     let mut usage_metadata: Option<Value> = None;
     let mut finish_reason: Option<String> = None;
+    let mut stream_error: Option<String> = None;
 
     // 方案3：引入 Utf8ChunkBuffer 防止 TCP 切片截断多字节 UTF-8 字符（如中文、Emoji、思维链签名）
     let mut utf8_buf = Utf8ChunkBuffer::new();
@@ -40,10 +63,10 @@ where
     let mut process_line = |line: &str,
                             content_parts: &mut Vec<Value>,
                             usage_metadata: &mut Option<Value>,
-                            finish_reason: &mut Option<String>| {
+                            finish_reason: &mut Option<String>,
+                            stream_error: &mut Option<String>| {
         let line = line.trim();
-        if line.starts_with("data: ") {
-            let json_part = line.trim_start_matches("data: ").trim();
+        if let Some(json_part) = line.strip_prefix("data:").map(str::trim) {
             if json_part == "[DONE]" {
                 return;
             }
@@ -57,6 +80,16 @@ where
                         json
                     };
 
+                if let Some(err_obj) = actual_data.get("error") {
+                    let msg = err_obj
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| err_obj.to_string());
+                    *stream_error = Some(msg);
+                    return;
+                }
+
                 // 1. Capture Usage
                 if let Some(usage) = actual_data.get("usageMetadata") {
                     *usage_metadata = Some(usage.clone());
@@ -67,8 +100,12 @@ where
                     actual_data.get("candidates").and_then(|c| c.as_array())
                 {
                     if let Some(candidate) = candidates.first() {
-                        // Update finish reason if present
-                        if let Some(fr) = candidate.get("finishReason").and_then(|v| v.as_str())
+                        // Update finish reason if present and non-empty
+                        if let Some(fr) = candidate
+                            .get("finishReason")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
                         {
                             *finish_reason = Some(fr.to_string());
                         }
@@ -100,8 +137,8 @@ where
                                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                     if let Some(last) = content_parts.last_mut() {
                                         if last.get("text").is_some()
-                                            && part.get("thought").is_none()
-                                            && last.get("thought").is_none()
+                                            && !part.get("thought").and_then(Value::as_bool).unwrap_or(false)
+                                            && !last.get("thought").and_then(Value::as_bool).unwrap_or(false)
                                         {
                                             // Merge text
                                             if let Some(last_text) =
@@ -133,7 +170,16 @@ where
 
         while let Some(pos) = line_buffer.find('\n') {
             let line: String = line_buffer.drain(..=pos).collect();
-            process_line(&line, &mut content_parts, &mut usage_metadata, &mut finish_reason);
+            process_line(
+                &line,
+                &mut content_parts,
+                &mut usage_metadata,
+                &mut finish_reason,
+                &mut stream_error,
+            );
+            if let Some(err) = stream_error {
+                return Err(format!("Upstream stream error: {}", err));
+            }
         }
     }
 
@@ -142,11 +188,34 @@ where
         line_buffer.push_str(&lossy_tail);
     }
     if !line_buffer.is_empty() {
-        process_line(&line_buffer, &mut content_parts, &mut usage_metadata, &mut finish_reason);
+        process_line(
+            &line_buffer,
+            &mut content_parts,
+            &mut usage_metadata,
+            &mut finish_reason,
+            &mut stream_error,
+        );
         line_buffer.clear();
+        if let Some(err) = stream_error {
+            return Err(format!("Upstream stream error: {}", err));
+        }
     }
 
-    // Construct final response
+    let has_meaningful_output = content_parts.iter().any(is_meaningful_output_part);
+    if !has_meaningful_output {
+        let allow_empty = matches!(
+            finish_reason.as_deref(),
+            Some("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII")
+        );
+        if !allow_empty {
+            return Err(format!(
+                "Incomplete stream: no meaningful output content (finishReason: {:?})",
+                finish_reason
+            ));
+        }
+    }
+
+    // Construct final response (only attach finishReason when genuinely emitted by upstream)
     collected_response["candidates"][0]["content"]["parts"] = json!(content_parts);
     if let Some(fr) = finish_reason {
         collected_response["candidates"][0]["finishReason"] = json!(fr);
@@ -187,5 +256,52 @@ mod tests {
         let res = result.unwrap();
         let text = res["candidates"][0]["content"]["parts"][0]["text"].as_str().unwrap();
         assert_eq!(text, "你好世界，思维链正常！");
+    }
+
+    #[tokio::test]
+    async fn test_gemini_collector_rejects_thought_only_empty_or_error_streams() {
+        // 1. Only thinking + usageMetadata + EOF (no output, no finishReason) -> must NOT fabricate STOP
+        let thought_only_sse = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"internal reasoning\",\"thought\":true}]}}]}}\n\n",
+            "data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":0}}}\n\n",
+        );
+        let err1 = collect_stream_to_json(
+            stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(thought_only_sse))]),
+            "s1",
+        )
+        .await
+        .expect_err("thought-only stream without output must fail");
+        assert!(err1.contains("no meaningful output content"));
+
+        // 2. Thought-only even with finishReason: STOP -> still rejected
+        let fake_stop_sse = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking\",\"thought\":true}]},\"finishReason\":\"STOP\"}]}}\n\n",
+        );
+        assert!(collect_stream_to_json(
+            stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(fake_stop_sse))]),
+            "s2",
+        )
+        .await
+        .is_err());
+
+        // 3. Embedded Gemini error frame in SSE -> returns Err with upstream error message
+        let embedded_err_sse = "data: {\"error\":{\"code\":502,\"message\":\"upstream reset\",\"status\":\"BAD_GATEWAY\"}}\n\n";
+        let err3 = collect_stream_to_json(
+            stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(embedded_err_sse))]),
+            "s3",
+        )
+        .await
+        .expect_err("embedded error event must fail");
+        assert!(err3.contains("upstream reset"));
+
+        // 4. Explicit non-STOP content safety block without parts -> preserved (not dropped as broken)
+        let safety_sse = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"SAFETY\"}]}}\n\n";
+        let ok_safety = collect_stream_to_json(
+            stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(safety_sse))]),
+            "s4",
+        )
+        .await
+        .expect("explicit SAFETY stop should be returned cleanly");
+        assert_eq!(ok_safety["candidates"][0]["finishReason"], "SAFETY");
     }
 }
