@@ -744,7 +744,7 @@ pub async fn warmup_model_directly(
     project_id: &str,
     email: &str,
     percentage: i32,
-    _account_id: Option<&str>,
+    account_id: Option<&str>,
 ) -> bool {
     // Get currently configured proxy port
     let port = config::load_app_config()
@@ -752,12 +752,15 @@ pub async fn warmup_model_directly(
         .unwrap_or(8045);
 
     let warmup_url = format!("http://127.0.0.1:{}/internal/warmup", port);
-    let body = json!({
+    let mut body = json!({
         "email": email,
         "model": model_name,
         "access_token": access_token,
         "project_id": project_id
     });
+    if let Some(id) = account_id.map(str::trim).filter(|s| !s.is_empty()) {
+        body["account_id"] = json!(id);
+    }
 
     // Use a no-proxy client for local loopback requests
     // This prevents Docker environments from routing localhost through external proxies

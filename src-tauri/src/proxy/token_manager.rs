@@ -410,7 +410,7 @@ impl TokenManager {
                             }
 
                             // 2. 黄金承重预热池巡检（Pre-warming Worker）：
-                            // 统计当前随时可战（未处于小憩 Napping）的黄金承重老兵数量
+                            // 将已经在途的 Tier2Warming 账号计入热备储备，防止 240s 冷却期内每分钟重复拉新冷号
                             if !eligible_list.is_empty() {
                                 let ready_sweet_count = eligible_list
                                     .iter()
@@ -420,28 +420,36 @@ impl TokenManager {
                                     })
                                     .count();
 
-                                if ready_sweet_count < target_sweet_count {
-                                    let deficit = target_sweet_count - ready_sweet_count;
-                                    let batch_limit = std::cmp::min(deficit, 2);
-
-                                    // 优先挑选 Tier2Warming（仅差 1 次即可晋升老兵，且距上次交互已满 240s 冷却），其次挑选 Tier1Cold
-                                    let warming_candidates = eligible_list.iter().filter(|t| {
+                                let selected_indices = Self::select_prewarm_batch(
+                                    &eligible_list,
+                                    target_sweet_count,
+                                    2,
+                                    |t| {
+                                        crate::proxy::account_selector::is_sweet_spot_for_oversized(&t.account_id)
+                                            && pacer.get_nap_remaining_seconds(&t.account_id).is_none()
+                                    },
+                                    |t| {
+                                        crate::proxy::account_selector::is_warming_in_progress(&t.account_id)
+                                            && pacer.get_nap_remaining_seconds(&t.account_id).is_none()
+                                    },
+                                    |t| {
                                         crate::proxy::account_selector::get_capacity_tier(&t.account_id)
                                             == crate::proxy::account_selector::CapacityTier::Tier2Warming
                                             && crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id)
                                             && crate::proxy::account_selector::is_ready_for_background_warmup(&t.account_id)
-                                    });
-                                    let cold_candidates = eligible_list.iter().filter(|t| {
+                                    },
+                                    |t| {
                                         crate::proxy::account_selector::get_capacity_tier(&t.account_id)
                                             == crate::proxy::account_selector::CapacityTier::Tier1Cold
                                             && crate::proxy::account_selector::is_hourly_sweet_spot(&t.account_id)
                                             && crate::proxy::account_selector::is_ready_for_background_warmup(&t.account_id)
-                                    });
+                                    },
+                                );
 
-                                    let selected_batch: Vec<ProxyToken> = warming_candidates
-                                        .chain(cold_candidates)
-                                        .take(batch_limit)
-                                        .cloned()
+                                if !selected_indices.is_empty() {
+                                    let selected_batch: Vec<ProxyToken> = selected_indices
+                                        .into_iter()
+                                        .map(|idx| eligible_list[idx].clone())
                                         .collect();
 
                                     for (batch_idx, target_acc) in selected_batch.into_iter().enumerate() {
@@ -2349,6 +2357,58 @@ impl TokenManager {
         "Format JSON schema snippet for API health check endpoint",
         "Optimize string allocation in logging formatter",
     ];
+
+    /// 选择本轮需要后台预热的账号下标列表：
+    /// 优先推进已完成 240s 冷却的 Tier2Warming 账号晋升 Tier3SweetSpot；
+    /// 计算是否新拉 Tier1Cold 账号时计入在途 Tier2Warming 账号数，防止冷却期间重复唤醒过多冷号。
+    fn select_prewarm_batch<T>(
+        eligible: &[T],
+        target_sweet_count: usize,
+        max_batch: usize,
+        is_ready_sweet: impl Fn(&T) -> bool,
+        is_warming_in_progress: impl Fn(&T) -> bool,
+        is_warming_ready_to_promote: impl Fn(&T) -> bool,
+        is_cold_ready: impl Fn(&T) -> bool,
+    ) -> Vec<usize> {
+        let ready_sweet_count = eligible.iter().filter(|t| is_ready_sweet(t)).count();
+        if ready_sweet_count >= target_sweet_count || max_batch == 0 {
+            return Vec::new();
+        }
+
+        let promotion_deficit = target_sweet_count.saturating_sub(ready_sweet_count);
+        let in_flight_warming_count = eligible
+            .iter()
+            .filter(|t| !is_ready_sweet(t) && is_warming_in_progress(t))
+            .count();
+        let cold_deficit = target_sweet_count
+            .saturating_sub(ready_sweet_count.saturating_add(in_flight_warming_count));
+
+        let limit = promotion_deficit.min(max_batch);
+        let mut selected = Vec::with_capacity(limit);
+
+        for (idx, item) in eligible.iter().enumerate() {
+            if selected.len() >= limit {
+                break;
+            }
+            if is_warming_ready_to_promote(item) {
+                selected.push(idx);
+            }
+        }
+
+        let remaining_cold_slots = limit.saturating_sub(selected.len()).min(cold_deficit);
+        let mut cold_picked = 0usize;
+        for (idx, item) in eligible.iter().enumerate() {
+            if cold_picked >= remaining_cold_slots || selected.len() >= limit {
+                break;
+            }
+            if !selected.contains(&idx) && is_cold_ready(item) {
+                selected.push(idx);
+                cold_picked += 1;
+            }
+        }
+
+        selected
+    }
 
     /// 执行真实 IDE 场景官方握手热机（零 Token 消耗，建立 TLS 连接与会话状态）
     pub async fn execute_account_warmup_pad(
@@ -8904,5 +8964,79 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn test_select_prewarm_batch_counts_in_flight_warming_and_scales_with_demand() {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum State {
+            Cold,
+            WarmingCooling,
+            WarmingReady,
+            Sweet,
+        }
+
+        // Scenario 1: Idle pool (target = 2), 2 accounts already warming in 240s cooldown,
+        // 6 cold accounts waiting -> must NOT wake extra cold accounts!
+        let accounts = vec![
+            State::WarmingCooling,
+            State::WarmingCooling,
+            State::Cold,
+            State::Cold,
+            State::Cold,
+            State::Cold,
+        ];
+        let picked_idle = TokenManager::select_prewarm_batch(
+            &accounts,
+            2,
+            2,
+            |s| *s == State::Sweet,
+            |s| matches!(s, State::WarmingCooling | State::WarmingReady),
+            |s| *s == State::WarmingReady,
+            |s| *s == State::Cold,
+        );
+        assert!(
+            picked_idle.is_empty(),
+            "idle pool with 2 Tier2Warming accounts must not wake additional cold accounts: {:?}",
+            picked_idle
+        );
+
+        // Scenario 2: Those 2 Tier2Warming accounts finish 240s cooldown -> promote those 2
+        let accounts_ready = vec![
+            State::WarmingReady,
+            State::WarmingReady,
+            State::Cold,
+            State::Cold,
+        ];
+        let picked_promote = TokenManager::select_prewarm_batch(
+            &accounts_ready,
+            2,
+            2,
+            |s| *s == State::Sweet,
+            |s| matches!(s, State::WarmingCooling | State::WarmingReady),
+            |s| *s == State::WarmingReady,
+            |s| *s == State::Cold,
+        );
+        assert_eq!(picked_promote, vec![0, 1]);
+
+        // Scenario 3: Traffic spikes (target = 5): 1 Sweet + 1 WarmingCooling -> cold_deficit = 3,
+        // capped at max_batch = 2, wakes 2 Cold accounts proactively!
+        let accounts_busy = vec![
+            State::Sweet,
+            State::WarmingCooling,
+            State::Cold,
+            State::Cold,
+            State::Cold,
+        ];
+        let picked_busy = TokenManager::select_prewarm_batch(
+            &accounts_busy,
+            5,
+            2,
+            |s| *s == State::Sweet,
+            |s| matches!(s, State::WarmingCooling | State::WarmingReady),
+            |s| *s == State::WarmingReady,
+            |s| *s == State::Cold,
+        );
+        assert_eq!(picked_busy, vec![2, 3]);
     }
 }

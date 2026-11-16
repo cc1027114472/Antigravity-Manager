@@ -325,7 +325,8 @@ fn free_disk_bytes() -> u64 {
 }
 
 /// Delete in small batches so the SQLite write lock is never held for long.
-/// Uses the `idx_timestamp` index (timestamp-cutoff style), never NOT IN full scans.
+/// Uses standard SQLite `rowid IN (SELECT ... LIMIT)` (compatible with bundled builds
+/// compiled without `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`).
 fn delete_batched(
     conn: &Connection,
     status_clause: &str,
@@ -333,12 +334,23 @@ fn delete_batched(
     batch: usize,
 ) -> usize {
     let sql = format!(
-        "DELETE FROM request_logs WHERE {} AND timestamp < ?1 LIMIT ?2",
+        "DELETE FROM request_logs WHERE rowid IN (
+            SELECT rowid FROM request_logs
+            WHERE {} AND timestamp < ?1
+            ORDER BY timestamp ASC
+            LIMIT ?2
+        )",
         status_clause
     );
     let mut total = 0;
     loop {
-        let deleted = conn.execute(&sql, rusqlite::params![cutoff_ts, batch]).unwrap_or(0);
+        let deleted = match conn.execute(&sql, rusqlite::params![cutoff_ts, batch as i64]) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("delete_batched failed ({}): {}", status_clause, e);
+                break;
+            }
+        };
         if deleted == 0 {
             break;
         }
@@ -360,11 +372,15 @@ fn delete_beyond_keep(
     keep: usize,
     batch: usize,
 ) -> usize {
+    if keep == 0 {
+        return delete_batched(conn, status_clause, i64::MAX, batch);
+    }
     let lookup = format!(
         "SELECT timestamp FROM request_logs WHERE {} ORDER BY timestamp DESC LIMIT 1 OFFSET ?1",
         status_clause
     );
-    let cutoff: Option<i64> = conn.query_row(&lookup, [keep], |r| r.get(0)).unwrap_or(None);
+    let offset = (keep - 1) as i64;
+    let cutoff: Option<i64> = conn.query_row(&lookup, [offset], |r| r.get(0)).unwrap_or(None);
     match cutoff {
         Some(ts) => delete_batched(conn, status_clause, ts, batch),
         None => 0,
@@ -378,6 +394,15 @@ fn delete_beyond_keep(
 /// save_log writers on high-traffic nodes and hung the service).
 pub fn cleanup_tiered_logs() -> Result<usize, String> {
     let conn = connect_db()?;
+    let size_bytes = get_proxy_db_disk_size().ok();
+    cleanup_tiered_logs_with_conn(&conn, size_bytes, free_disk_bytes())
+}
+
+fn cleanup_tiered_logs_with_conn(
+    conn: &Connection,
+    size_bytes: Option<u64>,
+    free_disk: u64,
+) -> Result<usize, String> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut total_deleted = 0;
 
@@ -385,37 +410,60 @@ pub fn cleanup_tiered_logs() -> Result<usize, String> {
     const SUCCESS_CLAUSE: &str = "status >= 200 AND status < 400";
     const ERROR_CLAUSE: &str = "(status < 200 OR status >= 400)";
 
-    // 1. Prune success logs older than 12 hours (batched)
+    // 1. Prune success logs older than 4 hours (batched)
     let success_cutoff = now_ms - (SUCCESS_MAX_AGE_HOURS * 3600 * 1000);
-    total_deleted += delete_batched(&conn, SUCCESS_CLAUSE, success_cutoff, BATCH);
+    total_deleted += delete_batched(conn, SUCCESS_CLAUSE, success_cutoff, BATCH);
 
     // 2. Keep newest SUCCESS_MAX_ROWS success logs (index-cutoff, batched)
-    total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, SUCCESS_MAX_ROWS, BATCH);
+    total_deleted += delete_beyond_keep(conn, SUCCESS_CLAUSE, SUCCESS_MAX_ROWS, BATCH);
 
-    // 3. Prune error logs older than 30 days (batched)
+    // 3. Prune error logs older than 7 days (batched)
     let error_cutoff = now_ms - (ERROR_MAX_AGE_DAYS * 24 * 3600 * 1000);
-    total_deleted += delete_batched(&conn, ERROR_CLAUSE, error_cutoff, BATCH);
+    total_deleted += delete_batched(conn, ERROR_CLAUSE, error_cutoff, BATCH);
 
     // 4. Keep newest ERROR_MAX_ROWS error logs (index-cutoff, batched)
-    total_deleted += delete_beyond_keep(&conn, ERROR_CLAUSE, ERROR_MAX_ROWS, BATCH);
+    total_deleted += delete_beyond_keep(conn, ERROR_CLAUSE, ERROR_MAX_ROWS, BATCH);
 
     // 5. Capacity adaptive management:
     // If DB size exceeds target threshold, progressively trim oldest success logs.
-    // 关键优化：严禁在定时清理中执行锁库的 VACUUM！删除的空间由 SQLite 原生 Free-list 原地复用，
-    // 并在批处理完成后使用轻量级的 wal_checkpoint(TRUNCATE) 瞬间归零 WAL 文件。
-    if let Ok(size) = get_proxy_db_disk_size() {
+    // Normal maintenance avoids VACUUM and relies on Free-list page reuse + wal_checkpoint(TRUNCATE);
+    // only after a hard fuse trip with >=128 MB reclaimable free pages do we run VACUUM once
+    // (when sufficient free disk space is verified) so physical file size drops below fuse threshold.
+    if let Some(size) = size_bytes {
         if size > DB_FUSE_SIZE_BYTES {
             tracing::warn!(
                 "Proxy DB size ({} MB) exceeded fuse threshold. Pruning oldest success logs to relieve pressure...",
                 size / 1024 / 1024
             );
             let emergency_success_cutoff = now_ms - (1 * 3600 * 1000);
-            total_deleted += delete_batched(&conn, SUCCESS_CLAUSE, emergency_success_cutoff, BATCH);
-            total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, 200, BATCH);
-            total_deleted += delete_beyond_keep(&conn, ERROR_CLAUSE, 500, BATCH);
+            total_deleted += delete_batched(conn, SUCCESS_CLAUSE, emergency_success_cutoff, BATCH);
+            total_deleted += delete_beyond_keep(conn, SUCCESS_CLAUSE, 200, BATCH);
+            total_deleted += delete_beyond_keep(conn, ERROR_CLAUSE, 500, BATCH);
+
+            let freelist_pages: u64 = conn
+                .query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))
+                .unwrap_or(0)
+                .max(0) as u64;
+            let page_size: u64 = conn
+                .query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
+                .unwrap_or(4096)
+                .max(0) as u64;
+            let reclaimable_bytes = freelist_pages.saturating_mul(page_size);
+
+            if reclaimable_bytes >= 128 * 1024 * 1024
+                && (free_disk == 0 || free_disk > size.saturating_mul(2))
+            {
+                tracing::info!(
+                    "Proxy DB fuse recovery: compacting {} MB of reclaimable free pages via VACUUM",
+                    reclaimable_bytes / 1024 / 1024
+                );
+                if let Err(e) = conn.execute("VACUUM", []) {
+                    tracing::warn!("Proxy DB post-fuse VACUUM skipped/failed: {}", e);
+                }
+            }
         } else if size > DB_TARGET_SIZE_BYTES {
             // Prune down to 300 most recent success logs
-            total_deleted += delete_beyond_keep(&conn, SUCCESS_CLAUSE, 300, BATCH);
+            total_deleted += delete_beyond_keep(conn, SUCCESS_CLAUSE, 300, BATCH);
         }
     }
 
@@ -796,6 +844,69 @@ mod tests {
             let res = cleanup_tiered_logs();
             assert!(res.is_ok(), "cleanup_tiered_logs should execute successfully: {:?}", res);
         }
+    }
+
+    #[test]
+    fn test_cleanup_tiered_logs_actually_deletes_stale_and_excess_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE request_logs (
+                id TEXT PRIMARY KEY,
+                timestamp INTEGER,
+                method TEXT,
+                url TEXT,
+                status INTEGER,
+                duration INTEGER,
+                model TEXT,
+                error TEXT
+            )",
+            [],
+        )
+        .unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let stale_success_ts = now_ms - (6 * 3600 * 1000); // > 4h
+        let recent_ts = now_ms - (10 * 60 * 1000); // 10m ago
+
+        for i in 0..5 {
+            conn.execute(
+                "INSERT INTO request_logs (id, timestamp, method, url, status, duration) VALUES (?1, ?2, 'POST', '/v1/messages', 200, 10)",
+                rusqlite::params![format!("stale-200-{}", i), stale_success_ts - i],
+            )
+            .unwrap();
+        }
+        for i in 0..505 {
+            conn.execute(
+                "INSERT INTO request_logs (id, timestamp, method, url, status, duration) VALUES (?1, ?2, 'POST', '/v1/messages', 200, 10)",
+                rusqlite::params![format!("recent-200-{}", i), recent_ts - i],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO request_logs (id, timestamp, method, url, status, duration, error) VALUES ('err-1', ?1, 'POST', '/v1/messages', 503, 5, 'fail')",
+            rusqlite::params![stale_success_ts],
+        )
+        .unwrap();
+
+        let deleted = cleanup_tiered_logs_with_conn(&conn, None, 0).unwrap();
+        assert_eq!(deleted, 10, "5 stale (>4h) + 5 excess (>500) 200 rows must be deleted");
+
+        let ok_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM request_logs WHERE status = 200",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let err_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM request_logs WHERE status = 503",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ok_left, 500);
+        assert_eq!(err_left, 1, "error rows within 7d retention must be preserved");
     }
 }
 

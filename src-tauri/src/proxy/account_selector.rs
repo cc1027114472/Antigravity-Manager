@@ -979,6 +979,20 @@ pub fn is_ready_for_background_warmup(account_id: &str) -> bool {
     true
 }
 
+/// 检查账号是否处于 `Tier2Warming` 在途热身阶段（已成功交互 1 次，且未因预热失败进入退避），
+/// 避免后台 PrewarmingWorker 在 240s 冷却期间重复拉新冷号充数。
+pub fn is_warming_in_progress(account_id: &str) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    if GLOBAL_WARMUP_BACKOFF
+        .get(account_id)
+        .map_or(false, |until| now < *until)
+    {
+        return false;
+    }
+    AccountSelector.get_capacity_tier(account_id, now) == CapacityTier::Tier2Warming
+        && AccountSelector.is_hourly_sweet_spot(account_id, now)
+}
+
 pub fn is_hourly_sweet_spot(account_id: &str) -> bool {
     let now = chrono::Utc::now().timestamp();
     AccountSelector.is_hourly_sweet_spot(account_id, now)

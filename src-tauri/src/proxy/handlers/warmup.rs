@@ -25,10 +25,98 @@ pub struct WarmupRequest {
     pub email: String,
     /// 模型名称（原始名称，不做映射）
     pub model: String,
+    /// 可选：账号 ID（确保内部预热保留专属代理绑定、sessionId 与设备 UA）
+    #[serde(default)]
+    pub account_id: Option<String>,
     /// 可选：直接提供 Access Token（用于不在 TokenManager 中的账号）
     pub access_token: Option<String>,
     /// 可选：直接提供 Project ID
     pub project_id: Option<String>,
+}
+
+fn resolve_warmup_account_id(provided: Option<&str>, email: &str) -> String {
+    provided
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| crate::modules::account::find_account_id_by_email(email))
+        .unwrap_or_default()
+}
+
+fn build_warmup_payload(
+    model: &str,
+    project_id: &str,
+    acc_opt: Option<&str>,
+) -> Result<Value, String> {
+    let lower = model.to_lowercase();
+    let is_claude = lower.contains("claude");
+    let is_image = lower.contains("image");
+
+    if is_claude {
+        let session_id = format!(
+            "warmup_{}_{}",
+            chrono::Utc::now().timestamp_millis(),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
+        let claude_request = crate::proxy::mappers::claude::models::ClaudeRequest {
+            model: model.to_string(),
+            messages: vec![crate::proxy::mappers::claude::models::Message {
+                role: "user".to_string(),
+                content: crate::proxy::mappers::claude::models::MessageContent::String(
+                    "ping".to_string(),
+                ),
+            }],
+            max_tokens: None,
+            stream: true,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            metadata: Some(crate::proxy::mappers::claude::models::Metadata {
+                user_id: Some(session_id.clone()),
+            }),
+            thinking: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        crate::proxy::mappers::claude::transform_claude_request_in(
+            &claude_request,
+            project_id,
+            false,
+            acc_opt,
+            &session_id,
+            None,
+        )
+    } else {
+        let base_request = if is_image {
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "Say hi"}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 10,
+                    "responseModalities": ["TEXT"]
+                }
+            })
+        } else {
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "Say hi"}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 128
+                }
+            })
+        };
+
+        Ok(wrap_request(
+            &base_request,
+            project_id,
+            model,
+            acc_opt,
+            None,
+            None,
+        ))
+    }
 }
 
 /// 预热响应
@@ -76,7 +164,11 @@ pub async fn handle_warmup(
     // ===== 步骤 1: 获取 Token =====
     let (access_token, project_id, account_id) =
         if let (Some(at), Some(pid)) = (&req.access_token, &req.project_id) {
-            (at.clone(), pid.clone(), String::new())
+            (
+                at.clone(),
+                pid.clone(),
+                resolve_warmup_account_id(req.account_id.as_deref(), &req.email),
+            )
         } else {
             match state.token_manager.get_token_by_email(&req.email).await {
                 Ok((at, pid, _, acc_id, _wait_ms)) => (at, pid, acc_id),
@@ -98,138 +190,37 @@ pub async fn handle_warmup(
             }
         };
 
+    let acc_opt = (!account_id.trim().is_empty()).then_some(account_id.as_str());
+
     // ===== 步骤 2: 根据模型类型构建请求体 =====
-    let is_claude = req.model.to_lowercase().contains("claude");
-    let is_image = req.model.to_lowercase().contains("image");
-
-    let body: Value = if is_claude {
-        // Claude 模型：使用 transform_claude_request_in 转换
-        let session_id = format!(
-            "warmup_{}_{}",
-            chrono::Utc::now().timestamp_millis(),
-            &uuid::Uuid::new_v4().to_string()[..8]
-        );
-        let claude_request = crate::proxy::mappers::claude::models::ClaudeRequest {
-            model: req.model.clone(),
-            messages: vec![crate::proxy::mappers::claude::models::Message {
-                role: "user".to_string(),
-                content: crate::proxy::mappers::claude::models::MessageContent::String(
-                    "ping".to_string(),
-                ),
-            }],
-            max_tokens: None,
-            stream: false,
-            system: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            tools: None,
-            metadata: Some(crate::proxy::mappers::claude::models::Metadata {
-                user_id: Some(session_id.clone()),
-            }),
-            thinking: None,
-            output_config: None,
-            size: None,
-            quality: None,
-        };
-
-        let acc_opt = if account_id.is_empty() {
-            None
-        } else {
-            Some(account_id.as_str())
-        };
-
-        match crate::proxy::mappers::claude::transform_claude_request_in(
-            &claude_request,
-            &project_id,
-            false,
-            acc_opt,
-            &session_id,
-            None, // [NEW] No token for warmup
-        ) {
-            Ok(transformed) => transformed,
-            Err(e) => {
-                warn!("[Warmup-API] Step 2 FAILED: Claude transform error: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(WarmupResponse {
-                        success: false,
-                        message: format!("Transform error: {}", e),
-                        error: Some(e),
-                    }),
-                )
-                    .into_response();
-            }
+    let body: Value = match build_warmup_payload(&req.model, &project_id, acc_opt) {
+        Ok(transformed) => transformed,
+        Err(e) => {
+            warn!("[Warmup-API] Step 2 FAILED: Warmup payload build error: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(WarmupResponse {
+                    success: false,
+                    message: format!("Transform error: {}", e),
+                    error: Some(e),
+                }),
+            )
+                .into_response();
         }
-    } else {
-        // Gemini 模型：使用 wrap_request（不塞入非官方 "model" 或 "session_id": "warmup_..."）
-        let base_request = if is_image {
-            json!({
-                "contents": [{"role": "user", "parts": [{"text": "Say hi"}]}],
-                "generationConfig": {
-                    "maxOutputTokens": 10,
-                    "responseModalities": ["TEXT"]
-                }
-            })
-        } else {
-            json!({
-                "contents": [{"role": "user", "parts": [{"text": "Say hi"}]}],
-                "generationConfig": {
-                    "maxOutputTokens": 128
-                }
-            })
-        };
-
-        let acc_opt = if account_id.is_empty() {
-            None
-        } else {
-            Some(account_id.as_str())
-        };
-
-        wrap_request(
-            &base_request,
-            &project_id,
-            &req.model,
-            acc_opt,
-            None,
-            None,
-        )
     };
 
     // ===== 步骤 3: 调用 UpstreamClient =====
-    let model_lower = req.model.to_lowercase();
-    let prefer_non_stream = model_lower.contains("flash-lite") || model_lower.contains("2.5-pro");
-
-    let (method, query) = if prefer_non_stream {
-        ("generateContent", None)
-    } else {
-        ("streamGenerateContent", Some("alt=sse"))
-    };
-
-    let mut result = state
+    // 对齐官方抓包：requestType="agent" 100% 走 streamGenerateContent?alt=sse，严禁回退 generateContent 或隐藏重发
+    let result = state
         .upstream
         .call_v1_internal(
-            method,
+            "streamGenerateContent",
             &access_token,
-            body.clone(),
-            query,
-            Some(account_id.as_str()),
+            body,
+            Some("alt=sse"),
+            acc_opt,
         )
         .await;
-
-    // 如果流式请求失败，尝试非流式请求
-    if result.is_err() && !prefer_non_stream {
-        result = state
-            .upstream
-            .call_v1_internal(
-                "generateContent",
-                &access_token,
-                body,
-                None,
-                Some(account_id.as_str()),
-            )
-            .await;
-    }
 
     let duration = start_time.elapsed().as_millis() as u64;
 
@@ -251,7 +242,7 @@ pub async fn handle_warmup(
                 model: Some(req.model.clone()),
                 mapped_model: Some(req.model.clone()),
                 account_email: Some(req.email.clone()),
-                account_id: None,
+                account_id: acc_opt.map(str::to_string),
                 client_ip: Some("127.0.0.1".to_string()),
                 error: if status.is_success() {
                     None
@@ -363,7 +354,7 @@ pub async fn handle_warmup(
                 model: Some(req.model.clone()),
                 mapped_model: Some(req.model.clone()),
                 account_email: Some(req.email.clone()),
-                account_id: None,
+                account_id: acc_opt.map(str::to_string),
                 client_ip: Some("127.0.0.1".to_string()),
                 error: Some(e.clone()),
                 request_body: Some(format!(
@@ -401,5 +392,49 @@ pub async fn handle_warmup(
 
             response
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_warmup_request_parses_optional_account_id() {
+        let with_id: WarmupRequest = serde_json::from_value(json!({
+            "email": "user@example.com",
+            "model": "gemini-3.8-flash-medium",
+            "account_id": "acc-123"
+        }))
+        .unwrap();
+        assert_eq!(with_id.account_id.as_deref(), Some("acc-123"));
+        assert_eq!(
+            resolve_warmup_account_id(with_id.account_id.as_deref(), &with_id.email),
+            "acc-123"
+        );
+
+        let without_id: WarmupRequest = serde_json::from_value(json!({
+            "email": "user@example.com",
+            "model": "gemini-3.8-flash-medium"
+        }))
+        .unwrap();
+        assert!(without_id.account_id.is_none());
+    }
+
+    #[test]
+    fn test_build_warmup_payload_includes_session_id_and_account_seed() {
+        let gemini_body =
+            build_warmup_payload("gemini-3.5-flash-lite", "proj-1", Some("acc-xyz")).unwrap();
+        assert_eq!(gemini_body["requestType"], "agent");
+        assert!(gemini_body["request"].get("sessionId").is_some());
+        assert_eq!(
+            gemini_body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "LOW"
+        );
+
+        let claude_body =
+            build_warmup_payload("claude-sonnet-5-5-medium", "proj-1", Some("acc-xyz")).unwrap();
+        assert_eq!(claude_body["requestType"], "agent");
+        assert!(claude_body["request"].get("sessionId").is_some());
     }
 }
