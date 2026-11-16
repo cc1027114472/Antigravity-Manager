@@ -29,44 +29,45 @@ pub fn derive_uuid_from_seed(seed: &str) -> uuid::Uuid {
 
 /// Maps a model ID to the official Antigravity IDE `labels.model_enum`
 pub fn resolve_official_model_enum(model: &str) -> &'static str {
+    // Ordered most-specific first so variants like -low/-medium/-lite/-thinking never collide.
+    const MODEL_ENUM_TABLE: &[(&str, &str)] = &[
+        ("claude-opus-5-5-low", "MODEL_PLACEHOLDER_M400"),
+        ("claude-opus-5-5-medium", "MODEL_PLACEHOLDER_M401"),
+        ("claude-opus-5", "MODEL_PLACEHOLDER_M402"),
+        ("claude-opus", "MODEL_PLACEHOLDER_M402"),
+        ("claude-sonnet-5-5-low", "MODEL_PLACEHOLDER_M403"),
+        ("claude-sonnet-5-5-medium", "MODEL_PLACEHOLDER_M404"),
+        ("claude-sonnet-5", "MODEL_PLACEHOLDER_M405"),
+        ("claude", "MODEL_PLACEHOLDER_M405"),
+        ("gemini-3.8-flash-tiered", "MODEL_PLACEHOLDER_M322"),
+        ("gemini-3.8-flash-low", "MODEL_PLACEHOLDER_M320"),
+        ("gemini-3.8-flash-medium", "MODEL_PLACEHOLDER_M319"),
+        ("gemini-3.8-flash", "MODEL_PLACEHOLDER_M318"),
+        ("gemini-4-argon-low", "MODEL_PLACEHOLDER_M419"),
+        ("gemini-4-argon-medium", "MODEL_PLACEHOLDER_M418"),
+        ("gemini-4-argon", "MODEL_PLACEHOLDER_M417"),
+        ("gemini-3.5-flash", "MODEL_PLACEHOLDER_M198"),
+        ("gemini-3.1-flash-image", "MODEL_PLACEHOLDER_M21"),
+        ("-image", "MODEL_PLACEHOLDER_M21"),
+        ("gemini-3.1-flash-lite", "MODEL_PLACEHOLDER_M50"),
+        ("gemini-3-flash", "MODEL_PLACEHOLDER_M18"),
+        ("gemini-2.5-flash-lite", "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE"),
+        ("gemini-2.5-flash-thinking", "MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING"),
+        ("gemini-2.5-flash", "MODEL_GOOGLE_GEMINI_2_5_FLASH"),
+        ("gemini-2.5-pro", "MODEL_GOOGLE_GEMINI_2_5_PRO"),
+        ("gpt-oss-120b", "MODEL_OPENAI_GPT_OSS_120B_MEDIUM"),
+        ("tab_jump_flash_lite_preview", "MODEL_PLACEHOLDER_M28"),
+        ("tab_flash_lite_preview", "MODEL_PLACEHOLDER_M19"),
+        ("chat_20706", "MODEL_CHAT_20706"),
+        ("chat_23310", "MODEL_CHAT_23310"),
+    ];
+
     let lower = model.to_lowercase();
-    if lower.contains("claude-opus-5-5-low") {
-        "MODEL_PLACEHOLDER_M400"
-    } else if lower.contains("claude-opus-5-5-medium") {
-        "MODEL_PLACEHOLDER_M401"
-    } else if lower.contains("claude-opus-5") || lower.contains("claude-opus") {
-        "MODEL_PLACEHOLDER_M402"
-    } else if lower.contains("claude-sonnet-5-5-low") {
-        "MODEL_PLACEHOLDER_M403"
-    } else if lower.contains("claude-sonnet-5-5-medium") {
-        "MODEL_PLACEHOLDER_M404"
-    } else if lower.contains("claude-sonnet-5") || lower.contains("claude") {
-        "MODEL_PLACEHOLDER_M405"
-    } else if lower.contains("gemini-3.8-flash-tiered") {
-        "MODEL_PLACEHOLDER_M322"
-    } else if lower.contains("gemini-3.8-flash-low") {
-        "MODEL_PLACEHOLDER_M320"
-    } else if lower.contains("gemini-3.8-flash-medium") {
-        "MODEL_PLACEHOLDER_M319"
-    } else if lower.contains("gemini-3.8-flash") {
-        "MODEL_PLACEHOLDER_M318"
-    } else if lower.contains("gemini-4-argon-low") {
-        "MODEL_PLACEHOLDER_M419"
-    } else if lower.contains("gemini-4-argon-medium") {
-        "MODEL_PLACEHOLDER_M418"
-    } else if lower.contains("gemini-4-argon") {
-        "MODEL_PLACEHOLDER_M417"
-    } else if lower.contains("gemini-3.5-flash") {
-        "MODEL_PLACEHOLDER_M198"
-    } else if lower.contains("gemini-3.1-flash-image") || lower.contains("-image") {
-        "MODEL_PLACEHOLDER_M21"
-    } else if lower.contains("gemini-3.1-flash-lite") || lower.contains("gemini-2.5-flash-lite") {
-        "MODEL_PLACEHOLDER_M50"
-    } else if lower.contains("gemini-3-flash") {
-        "MODEL_PLACEHOLDER_M18"
-    } else {
-        "MODEL_PLACEHOLDER_M318"
-    }
+    MODEL_ENUM_TABLE
+        .iter()
+        .find(|(needle, _)| lower.contains(needle))
+        .map(|(_, enum_name)| *enum_name)
+        .unwrap_or("MODEL_PLACEHOLDER_M318")
 }
 
 /// Generates a 5-segment requestId AND matching `request.labels` object
@@ -193,5 +194,46 @@ mod tests {
         assert!(labels_step2.get("last_execution_id").is_some());
         assert_eq!(labels_step2["model_enum"], "MODEL_PLACEHOLDER_M198");
         assert_eq!(labels_step2["used_claude"], "false");
+    }
+
+    #[test]
+    fn test_resolve_official_model_enum_matches_all_26_fetch_models() {
+        let expected = [
+            ("chat_20706", "MODEL_CHAT_20706"),
+            ("chat_23310", "MODEL_CHAT_23310"),
+            ("claude-opus-5-5-high", "MODEL_PLACEHOLDER_M402"),
+            ("claude-opus-5-5-low", "MODEL_PLACEHOLDER_M400"),
+            ("claude-opus-5-5-medium", "MODEL_PLACEHOLDER_M401"),
+            ("claude-sonnet-5-5-high", "MODEL_PLACEHOLDER_M405"),
+            ("claude-sonnet-5-5-low", "MODEL_PLACEHOLDER_M403"),
+            ("claude-sonnet-5-5-medium", "MODEL_PLACEHOLDER_M404"),
+            ("gemini-2.5-flash", "MODEL_GOOGLE_GEMINI_2_5_FLASH"),
+            ("gemini-2.5-flash-lite", "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE"),
+            ("gemini-2.5-flash-thinking", "MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING"),
+            ("gemini-2.5-pro", "MODEL_GOOGLE_GEMINI_2_5_PRO"),
+            ("gemini-3-flash", "MODEL_PLACEHOLDER_M18"),
+            ("gemini-3.1-flash-image", "MODEL_PLACEHOLDER_M21"),
+            ("gemini-3.1-flash-lite", "MODEL_PLACEHOLDER_M50"),
+            ("gemini-3.5-flash-lite", "MODEL_PLACEHOLDER_M198"),
+            ("gemini-3.8-flash-high", "MODEL_PLACEHOLDER_M318"),
+            ("gemini-3.8-flash-low", "MODEL_PLACEHOLDER_M320"),
+            ("gemini-3.8-flash-medium", "MODEL_PLACEHOLDER_M319"),
+            ("gemini-3.8-flash-tiered", "MODEL_PLACEHOLDER_M322"),
+            ("gemini-4-argon-high", "MODEL_PLACEHOLDER_M417"),
+            ("gemini-4-argon-low", "MODEL_PLACEHOLDER_M419"),
+            ("gemini-4-argon-medium", "MODEL_PLACEHOLDER_M418"),
+            ("gpt-oss-120b-medium", "MODEL_OPENAI_GPT_OSS_120B_MEDIUM"),
+            ("tab_flash_lite_preview", "MODEL_PLACEHOLDER_M19"),
+            ("tab_jump_flash_lite_preview", "MODEL_PLACEHOLDER_M28"),
+        ];
+
+        for (model_id, expected_enum) in expected {
+            assert_eq!(
+                resolve_official_model_enum(model_id),
+                expected_enum,
+                "mismatch for model_id={}",
+                model_id
+            );
+        }
     }
 }

@@ -115,6 +115,101 @@ pub fn build_function_response_part(
     json!({ "functionResponse": Value::Object(fr) })
 }
 
+/// Ensure every `functionCall` and `functionResponse` part across `contents` carries a
+/// non-empty `"id"` and pairs unlabelled responses with the earliest pending call ID of the
+/// same tool name (`call_{name}_{count}` fallback, matching official captures).
+pub fn ensure_paired_tool_call_ids(contents: &mut [Value], log_prefix: &str) {
+    let mut pending_call_ids: std::collections::HashMap<
+        String,
+        std::collections::VecDeque<String>,
+    > = std::collections::HashMap::new();
+    let mut global_name_counters: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for content in contents.iter_mut() {
+        let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) else {
+            continue;
+        };
+        for part in parts {
+            let Some(obj) = part.as_object_mut() else {
+                continue;
+            };
+
+            if let Some(fc) = obj.get_mut("functionCall") {
+                let name = fc
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let existing_id = fc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let call_id = if let Some(id) = existing_id {
+                    id
+                } else {
+                    let count = global_name_counters.entry(name.clone()).or_insert(0);
+                    let call_id = format!("call_{}_{}", name, count);
+                    *count += 1;
+
+                    if let Some(fc_obj) = fc.as_object_mut() {
+                        fc_obj.insert("id".to_string(), json!(call_id));
+                    }
+                    tracing::debug!(
+                        "{} Request stage: Injected missing call_id '{}'",
+                        log_prefix,
+                        call_id
+                    );
+                    call_id
+                };
+                pending_call_ids.entry(name).or_default().push_back(call_id);
+            }
+
+            if let Some(fr) = obj.get_mut("functionResponse") {
+                let name = fr
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let existing_id = fr
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                if let Some(existing) = existing_id {
+                    if let Some(q) = pending_call_ids.get_mut(&name) {
+                        if let Some(pos) = q.iter().position(|x| x == &existing) {
+                            q.remove(pos);
+                        }
+                    }
+                } else {
+                    let matched_id = pending_call_ids
+                        .get_mut(&name)
+                        .and_then(|q| q.pop_front());
+                    let call_id = if let Some(id) = matched_id {
+                        id
+                    } else {
+                        let count = global_name_counters.entry(name.clone()).or_insert(0);
+                        let generated = format!("call_{}_{}", name, count);
+                        *count += 1;
+                        generated
+                    };
+
+                    if let Some(fr_obj) = fr.as_object_mut() {
+                        fr_obj.insert("id".to_string(), json!(call_id));
+                    }
+                    tracing::debug!(
+                        "{} Request stage: Injected synced response_id '{}'",
+                        log_prefix,
+                        call_id
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Normalize inner & outer v1internal envelope fields for `web_search` requests
 /// to match official Antigravity captures (`generationConfig: {"candidateCount": 1}`,
 /// and no `sessionId`, `labels`, `toolConfig`, or outer `requestId`).
@@ -284,7 +379,9 @@ pub fn is_modern_thinking_level_model(model: &str) -> bool {
     if m.contains("-image") {
         return false;
     }
-    m.contains("gemini-3.1-flash-lite")
+    m.contains("gemini-2.5-flash")
+        || m.contains("gemini-3-flash")
+        || m.contains("gemini-3.1-flash-lite")
         || m.contains("gemini-3.5")
         || m.contains("gemini-3.8")
         || m.contains("gemini-4")
@@ -301,7 +398,7 @@ pub fn should_omit_default_max_output_tokens(model: &str) -> bool {
 }
 
 /// 推导官方大写 `thinkingLevel`（`"MINIMAL" | "LOW" | "MEDIUM" | "HIGH"`）
-/// 优先级：显式参数 (`effort` / `thinkingLevel` / `reasoning_effort`) > 模型名后缀 (`-low` / `-medium` / `-high` / `flash-lite` / `-tiered`) > `fallback`
+/// 优先级：显式参数 (`effort` / `thinkingLevel` / `reasoning_effort`) > 模型名后缀 (`-low` / `-medium` / `-high` / `flash-lite` / `-tiered`) > 模型默认等级 (`gemini-2.5-flash*` LOW, `gemini-3-flash` HIGH) > `fallback`
 pub fn resolve_modern_thinking_level(
     model: &str,
     explicit_level: Option<&str>,
@@ -317,11 +414,15 @@ pub fn resolve_modern_thinking_level(
         }
     }
     let m = model.to_lowercase();
-    if m.contains("-low") || m.contains("flash-lite") || m.contains("-tiered") {
+    if m.contains("-low")
+        || m.contains("flash-lite")
+        || m.contains("-tiered")
+        || m.contains("gemini-2.5-flash")
+    {
         "LOW"
     } else if m.contains("-medium") {
         "MEDIUM"
-    } else if m.contains("-high") || m.contains("-max") {
+    } else if m.contains("-high") || m.contains("-max") || m.contains("gemini-3-flash") {
         "HIGH"
     } else {
         fallback
@@ -903,6 +1004,42 @@ mod tests {
             resolve_modern_thinking_level("gemini-3.1-flash-lite", None, "MEDIUM"),
             "LOW"
         );
+        assert!(is_modern_thinking_level_model("gemini-2.5-flash"));
+        assert!(is_modern_thinking_level_model("gemini-2.5-flash-lite"));
+        assert!(is_modern_thinking_level_model("gemini-2.5-flash-thinking"));
+        assert!(is_modern_thinking_level_model("gemini-3-flash"));
+        assert!(!is_modern_thinking_level_model("gemini-2.5-pro"));
+        assert!(!is_modern_thinking_level_model("gemini-3.1-flash-image"));
+        assert_eq!(
+            resolve_modern_thinking_level("gemini-2.5-flash", None, "HIGH"),
+            "LOW"
+        );
+        assert_eq!(
+            resolve_modern_thinking_level("gemini-2.5-flash-thinking", None, "HIGH"),
+            "LOW"
+        );
+        assert_eq!(
+            resolve_modern_thinking_level("gemini-3-flash", None, "MEDIUM"),
+            "HIGH"
+        );
+        assert_eq!(
+            resolve_modern_thinking_level("gemini-3-flash", Some("low"), "MEDIUM"),
+            "LOW"
+        );
+
+        let mut contents = vec![
+            json!({
+                "role": "model",
+                "parts": [{ "functionCall": { "name": "ping", "args": {}, "id": "" } }]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{ "functionResponse": { "name": "ping", "response": { "output": "ok" } } }]
+            }),
+        ];
+        ensure_paired_tool_call_ids(&mut contents, "[Test]");
+        assert_eq!(contents[0]["parts"][0]["functionCall"]["id"], "call_ping_0");
+        assert_eq!(contents[1]["parts"][0]["functionResponse"]["id"], "call_ping_0");
 
         // 4. Official tool schema cleaning: uppercase types + minLength/minItems/minimum preserved
         let mut schema = json!({

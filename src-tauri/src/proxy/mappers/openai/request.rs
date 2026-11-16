@@ -400,7 +400,9 @@ pub fn transform_openai_request(
                 } else {
                     &name
                 };
-                tool_id_to_name.insert(call.id.clone(), final_name.to_string());
+                if !call.id.is_empty() {
+                    tool_id_to_name.insert(call.id.clone(), final_name.to_string());
+                }
             }
         }
     }
@@ -599,16 +601,22 @@ pub fn transform_openai_request(
                         crate::proxy::common::json_schema::fix_tool_call_args(&mut args, original_schema);
                     }
 
+                    let mut fc_obj = serde_json::Map::new();
+                    fc_obj.insert(
+                        "name".to_string(),
+                        json!(if func_name == "local_shell_call" {
+                            "shell"
+                        } else {
+                            func_name.as_str()
+                        }),
+                    );
+                    fc_obj.insert("args".to_string(), args);
+                    if !tc.id.is_empty() {
+                        fc_obj.insert("id".to_string(), json!(&tc.id));
+                    }
                     let mut func_call_part = json!({
-                        "functionCall": {
-                            "name": if func_name == "local_shell_call" { "shell" } else { func_name.as_str() },
-                            "args": args,
-                            "id": &tc.id,
-                        }
+                        "functionCall": Value::Object(fc_obj)
                     });
-
-                    // [New] 递归清理参数中可能存在的非法校验字段
-                    crate::proxy::common::json_schema::clean_json_schema(&mut func_call_part);
 
                     if !attached_fc_sig {
                         if let Some(ref sig) = thought_sig {
@@ -638,7 +646,7 @@ pub fn transform_openai_request(
             if msg.role == "tool" || msg.role == "function" {
                 let name = msg.name.as_deref().unwrap_or("unknown");
                 let final_name = if name == "local_shell_call" { "shell" }
-                                else if let Some(id) = &msg.tool_call_id { tool_id_to_name.get(id).map(|s| s.as_str()).unwrap_or(name) }
+                                else if let Some(id) = msg.tool_call_id.as_deref().filter(|s| !s.is_empty()) { tool_id_to_name.get(id).map(|s| s.as_str()).unwrap_or(name) }
                                 else { name };
 
                 let mut extra_parts = Vec::new();
@@ -702,6 +710,10 @@ pub fn transform_openai_request(
     // [FIX #1575] 针对思维模型的历史故障恢复
     // 在带有工具的历史记录中，剥离旧的思考块，防止 API 因签名失效或结构冲突报 400
     let mut contents = contents;
+    crate::proxy::mappers::common_utils::ensure_paired_tool_call_ids(
+        &mut contents,
+        "[OpenAI-Request]",
+    );
     if actual_include_thinking && has_tool_history {
         tracing::debug!("[OpenAI-Thinking] Applied thinking recovery (stripping old thought blocks) for tool history");
         contents = super::thinking_recovery::strip_all_thinking_blocks(contents);
@@ -2223,5 +2235,122 @@ mod tests {
             transform_openai_request(&req_none, "proj", "gemini-3.8-flash-tiered", None);
         assert!(res_none["request"].get("tools").is_none());
         assert!(res_none["request"].get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn test_openai_tool_args_not_sanitized_as_schema_and_empty_ids_paired() {
+        let req = OpenAIRequest {
+            model: "gemini-3-flash".to_string(),
+            messages: vec![
+                OpenAIMessage {
+                    role: "user".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("Run regex edit".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                OpenAIMessage {
+                    role: "assistant".to_string(),
+                    refusal: None,
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "".to_string(),
+                        r#type: "function".to_string(),
+                        function: Some(ToolFunction {
+                            name: "edit_schema_like_payload".to_string(),
+                            arguments: json!({
+                                "pattern": "^foo.*bar$",
+                                "format": "date-time",
+                                "multipleOf": 5,
+                                "maxLength": 128,
+                                "$ref": "#/defs/Item",
+                                "nested": { "type": "string", "title": "Keep Me" }
+                            })
+                            .to_string(),
+                        }),
+                        status: None,
+                        call_id: None,
+                        operation: None,
+                    }]),
+                    tool_call_id: None,
+                    name: None,
+                },
+                OpenAIMessage {
+                    role: "tool".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("ok".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some("".to_string()),
+                    name: Some("edit_schema_like_payload".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let (res, _, _, _) = transform_openai_request(&req, "proj", "gemini-3-flash", None);
+        let contents = res["request"]["contents"].as_array().unwrap();
+        let fc = &contents[1]["parts"][0]["functionCall"];
+        let args = &fc["args"];
+        assert_eq!(args["pattern"], "^foo.*bar$");
+        assert_eq!(args["format"], "date-time");
+        assert_eq!(args["multipleOf"], 5);
+        assert_eq!(args["maxLength"], 128);
+        assert_eq!(args["$ref"], "#/defs/Item");
+        assert_eq!(args["nested"]["type"], "string");
+        assert_eq!(args["nested"]["title"], "Keep Me");
+
+        let fc_id = fc["id"].as_str().expect("functionCall must get non-empty id");
+        let fr_id = contents[2]["parts"][0]["functionResponse"]["id"]
+            .as_str()
+            .expect("functionResponse must get paired non-empty id");
+        assert!(!fc_id.is_empty());
+        assert_eq!(fc_id, fr_id);
+
+        assert_eq!(
+            res["request"]["generationConfig"]["thinkingConfig"],
+            json!({ "includeThoughts": true, "thinkingLevel": "HIGH" })
+        );
+        assert_eq!(
+            res["request"]["labels"]["model_enum"],
+            "MODEL_PLACEHOLDER_M18"
+        );
+    }
+
+    #[test]
+    fn test_gemini_25_flash_and_3_flash_alignment_openai() {
+        crate::proxy::config::update_thinking_budget_config(
+            crate::proxy::config::ThinkingBudgetConfig::default(),
+        );
+        let cases = [
+            ("gemini-2.5-flash", "LOW", 65535, "MODEL_GOOGLE_GEMINI_2_5_FLASH"),
+            ("gemini-2.5-flash-lite", "LOW", 65535, "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE"),
+            ("gemini-2.5-flash-thinking", "LOW", 65535, "MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING"),
+            ("gemini-3-flash", "HIGH", 65536, "MODEL_PLACEHOLDER_M18"),
+        ];
+        for (model_id, expected_level, expected_max, expected_enum) in cases {
+            let req = OpenAIRequest {
+                model: model_id.to_string(),
+                messages: vec![OpenAIMessage {
+                    role: "user".to_string(),
+                    refusal: None,
+                    content: Some(OpenAIContent::String("Hi".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                }],
+                ..Default::default()
+            };
+            let (res, _, _, _) = transform_openai_request(&req, "proj", model_id, None);
+            let gc = &res["request"]["generationConfig"];
+            assert_eq!(gc["thinkingConfig"]["thinkingLevel"], expected_level, "[{}]", model_id);
+            assert!(gc["thinkingConfig"].get("thinkingBudget").is_none(), "[{}]", model_id);
+            assert_eq!(gc["maxOutputTokens"], expected_max, "[{}]", model_id);
+            assert_eq!(res["request"]["labels"]["model_enum"], expected_enum, "[{}]", model_id);
+        }
     }
 }

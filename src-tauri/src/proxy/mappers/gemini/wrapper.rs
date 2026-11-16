@@ -226,12 +226,10 @@ pub fn wrap_request_v2(
         .get_mut("contents")
         .and_then(|c| c.as_array_mut())
     {
-        let mut pending_call_ids: std::collections::HashMap<
-            String,
-            std::collections::VecDeque<String>,
-        > = std::collections::HashMap::new();
-        let mut global_name_counters: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        crate::proxy::mappers::common_utils::ensure_paired_tool_call_ids(
+            contents,
+            "[Gemini-Wrap]",
+        );
 
         for content in contents.iter_mut() {
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
@@ -242,77 +240,8 @@ pub fn wrap_request_v2(
                 });
                 for part in parts {
                     if let Some(obj) = part.as_object_mut() {
-                        // 1. 处理 functionCall (全模型统一确保携带非空 id，对齐抓包 100% 覆盖率)
-                        if let Some(fc) = obj.get_mut("functionCall") {
-                            let name = fc
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let existing_id = fc
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| !s.is_empty())
-                                .map(|s| s.to_string());
-                            let call_id = if let Some(id) = existing_id {
-                                id
-                            } else {
-                                let count = global_name_counters.entry(name.clone()).or_insert(0);
-                                let call_id = format!("call_{}_{}", name, count);
-                                *count += 1;
-
-                                if let Some(fc_obj) = fc.as_object_mut() {
-                                    fc_obj.insert("id".to_string(), json!(call_id));
-                                }
-                                tracing::debug!(
-                                    "[Gemini-Wrap] Request stage: Injected missing call_id '{}'",
-                                    call_id
-                                );
-                                call_id
-                            };
-                            pending_call_ids.entry(name).or_default().push_back(call_id);
-                        }
-
-                        // 2. 处理 functionResponse (匹配最近未响应的同名 functionCall id)
+                        // 1. 统一 functionResponse.response 结构为官方 UTF-8 字符串输出
                         if let Some(fr) = obj.get_mut("functionResponse") {
-                            let name = fr
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let existing_id = fr
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| !s.is_empty())
-                                .map(|s| s.to_string());
-                            if let Some(existing) = existing_id {
-                                if let Some(q) = pending_call_ids.get_mut(&name) {
-                                    if let Some(pos) = q.iter().position(|x| x == &existing) {
-                                        q.remove(pos);
-                                    }
-                                }
-                            } else {
-                                let matched_id = pending_call_ids
-                                    .get_mut(&name)
-                                    .and_then(|q| q.pop_front());
-                                let call_id = if let Some(id) = matched_id {
-                                    id
-                                } else {
-                                    let count =
-                                        global_name_counters.entry(name.clone()).or_insert(0);
-                                    let generated = format!("call_{}_{}", name, count);
-                                    *count += 1;
-                                    generated
-                                };
-
-                                if let Some(fr_obj) = fr.as_object_mut() {
-                                    fr_obj.insert("id".to_string(), json!(call_id));
-                                }
-                                tracing::debug!(
-                                    "[Gemini-Wrap] Request stage: Injected synced response_id '{}'",
-                                    call_id
-                                );
-                            }
                             if let Some(fr_obj) = fr.as_object_mut() {
                                 let resp_val = fr_obj
                                     .entry("response")
@@ -572,8 +501,9 @@ pub fn wrap_request_v2(
                 .get("thinkingBudget")
                 .and_then(|v| v.as_i64());
 
-            // For adaptive or dynamic mode, we only need to ensure max tokens is large.
-            // For fixed budget, we must satisfy maxOutputTokens > thinkingBudget.
+            // For adaptive/thinkingLevel mode without a positive fixed thinkingBudget, only inject a
+            // default maxOutputTokens when omitted (never overwrite client-supplied limits); when a
+            // positive thinkingBudget is set, keep maxOutputTokens > thinkingBudget.
             let current_max = gen_config
                 .get("maxOutputTokens")
                 .and_then(|v| v.as_u64())
@@ -583,15 +513,13 @@ pub fn wrap_request_v2(
                 crate::proxy::mappers::common_utils::should_omit_default_max_output_tokens(
                     final_model_name,
                 );
-            if is_adaptive {
-                if !(current_max.is_none() && omit_default_max)
-                    && current_max.map_or(true, |m| m < 131072)
-                {
-                    gen_config.insert("maxOutputTokens".to_string(), json!(131072));
-                }
-            } else if let Some(budget_i64) = budget_opt {
-                if budget_i64 > 0 {
-                    let budget = budget_i64 as u64;
+            if let Some(budget_i64) = budget_opt.filter(|&b| b > 0) {
+                let budget = budget_i64 as u64;
+                if is_adaptive {
+                    if current_max.map_or(true, |m| m <= budget) {
+                        gen_config.insert("maxOutputTokens".to_string(), json!(131072));
+                    }
+                } else {
                     let min_required_max = budget + 8192;
                     if current_max.map_or(true, |m| m <= budget) {
                         tracing::info!(
@@ -600,6 +528,10 @@ pub fn wrap_request_v2(
                         );
                         gen_config.insert("maxOutputTokens".to_string(), json!(min_required_max));
                     }
+                }
+            } else if is_adaptive {
+                if current_max.is_none() && !omit_default_max {
+                    gen_config.insert("maxOutputTokens".to_string(), json!(131072));
                 }
             }
         }
@@ -2138,6 +2070,111 @@ mod tests {
         assert_eq!(
             wrapped["request"]["generationConfig"]["maxOutputTokens"],
             json!(65535)
+        );
+    }
+
+    #[test]
+    fn test_adaptive_preserves_explicit_max_output_tokens_and_aligns_flash_levels() {
+        // Explicit maxOutputTokens on thinkingLevel/adaptive models must be preserved
+        let explicit_body = json!({
+            "model": "gemini-3.8-flash-medium",
+            "generationConfig": { "maxOutputTokens": 4096 },
+            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+        });
+        let explicit_wrapped = wrap_request(
+            &explicit_body,
+            "test-proj",
+            "gemini-3.8-flash-medium",
+            None,
+            Some("sess-explicit-max"),
+            None,
+        );
+        assert_eq!(
+            explicit_wrapped["request"]["generationConfig"]["maxOutputTokens"],
+            json!(4096)
+        );
+        assert_eq!(
+            explicit_wrapped["request"]["generationConfig"]["thinkingConfig"],
+            json!({ "includeThoughts": true, "thinkingLevel": "MEDIUM" })
+        );
+
+        let warmup_like_body = json!({
+            "model": "gemini-3.1-flash-lite",
+            "generationConfig": { "maxOutputTokens": 128 },
+            "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }]
+        });
+        let warmup_wrapped = wrap_request(
+            &warmup_like_body,
+            "test-proj",
+            "gemini-3.1-flash-lite",
+            None,
+            Some("sess-explicit-128"),
+            None,
+        );
+        assert_eq!(
+            warmup_wrapped["request"]["generationConfig"]["maxOutputTokens"],
+            json!(128)
+        );
+
+        // Omitted maxOutputTokens still injects model default cap
+        let omitted_body = json!({
+            "model": "gemini-3.8-flash-medium",
+            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+        });
+        let omitted_wrapped = wrap_request(
+            &omitted_body,
+            "test-proj",
+            "gemini-3.8-flash-medium",
+            None,
+            Some("sess-omitted-max"),
+            None,
+        );
+        assert_eq!(
+            omitted_wrapped["request"]["generationConfig"]["maxOutputTokens"],
+            json!(65536)
+        );
+
+        // gemini-2.5-flash -> LOW (65535); gemini-3-flash -> HIGH (65536)
+        let f25_wrapped = wrap_request(
+            &json!({ "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }] }),
+            "test-proj",
+            "gemini-2.5-flash",
+            None,
+            Some("sess-25f"),
+            None,
+        );
+        assert_eq!(
+            f25_wrapped["request"]["generationConfig"]["thinkingConfig"],
+            json!({ "includeThoughts": true, "thinkingLevel": "LOW" })
+        );
+        assert_eq!(
+            f25_wrapped["request"]["generationConfig"]["maxOutputTokens"],
+            json!(65535)
+        );
+        assert_eq!(
+            f25_wrapped["request"]["labels"]["model_enum"],
+            "MODEL_GOOGLE_GEMINI_2_5_FLASH"
+        );
+
+        let f3_wrapped = wrap_request(
+            &json!({ "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }] }),
+            "test-proj",
+            "gemini-3-flash",
+            None,
+            Some("sess-3f"),
+            None,
+        );
+        assert_eq!(
+            f3_wrapped["request"]["generationConfig"]["thinkingConfig"],
+            json!({ "includeThoughts": true, "thinkingLevel": "HIGH" })
+        );
+        assert_eq!(
+            f3_wrapped["request"]["generationConfig"]["maxOutputTokens"],
+            json!(65536)
+        );
+        assert_eq!(
+            f3_wrapped["request"]["labels"]["model_enum"],
+            "MODEL_PLACEHOLDER_M18"
         );
     }
 }

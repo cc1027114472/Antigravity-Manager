@@ -15,6 +15,11 @@
             "thinking_budget": 24576,
             "is_thinking": true
         },
+        "gemini-2.5-flash-thinking": {
+            "max_output_tokens": 65535,
+            "thinking_budget": 24576,
+            "is_thinking": true
+        },
         "gemini-2.5-pro": {
             "max_output_tokens": 65535,
             "thinking_budget": 32768,
