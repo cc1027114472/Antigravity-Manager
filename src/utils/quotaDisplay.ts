@@ -92,14 +92,16 @@ export function officialBillingPercentages(
     const fallback: Partial<Record<BillingGroup, { percentage: number; reset_time?: string }>> = {};
 
     for (const group of groups) {
+        const dn = (group.display_name || '').toLowerCase();
+        if (dn.includes('argon')) continue;
         for (const bucket of group.buckets ?? []) {
             const id = (bucket.bucket_id || '').toLowerCase();
+            if (id.includes('argon')) continue;
             const window = (bucket.window || '').toLowerCase();
             let billing: BillingGroup | null = null;
             if (id.startsWith('gemini') || id.includes('gemini')) billing = 'gemini';
             else if (id.startsWith('3p') || id.includes('3p') || id.includes('claude')) billing = 'claude';
             if (!billing) {
-                const dn = (group.display_name || '').toLowerCase();
                 if (dn.includes('gemini')) billing = 'gemini';
                 else if (dn.includes('claude') || dn.includes('gpt') || dn.includes('3p')) billing = 'claude';
             }

@@ -371,5 +371,48 @@ test('prefers 5h window when 5h triggered, and weekly when weekly triggered', ()
     assertEq(geminiWeekly?.label.includes('(周)'), true);
 });
 
+test('split display: argon separate weekly bucket does not override gemini 5h/weekly pool', () => {
+    const account = baseAccount({
+        quota: {
+            models: [],
+            last_updated: 1,
+            quota_groups: [
+                {
+                    display_name: 'Gemini Models',
+                    buckets: [
+                        {
+                            bucket_id: 'gemini-weekly',
+                            window: 'weekly',
+                            remaining_fraction: 0.92,
+                            reset_time: 'reset-weekly',
+                        },
+                        {
+                            bucket_id: 'gemini-5h',
+                            window: '5h',
+                            remaining_fraction: 0.95,
+                            reset_time: 'reset-5h',
+                        },
+                    ],
+                },
+                {
+                    display_name: 'Gemini 4 Argon',
+                    buckets: [
+                        {
+                            bucket_id: 'gemini-argon-wtu-weekly',
+                            window: 'weekly',
+                            remaining_fraction: 0,
+                            reset_time: 'reset-argon',
+                        },
+                    ],
+                },
+            ],
+        },
+    });
+    const rows = getSplitQuotaDisplays(account);
+    const gemini = rows.find((r) => r.id === 'gemini-pro');
+    assertEq(gemini?.percentage, 95);
+    assertEq(gemini?.reset_time, 'reset-5h');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

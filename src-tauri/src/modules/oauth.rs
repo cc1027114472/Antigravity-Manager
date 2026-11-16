@@ -57,7 +57,7 @@ const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.goo
 const CLIENT_SECRET: &str = "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";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
-const TOKEN_REFRESH_SKEW_SECONDS: i64 = 900;
+pub const TOKEN_REFRESH_SKEW_SECONDS: i64 = 900;
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 
@@ -835,7 +835,7 @@ pub async fn ensure_fresh_token(
     current_token: &crate::models::TokenData,
     account_id: Option<&str>,
 ) -> Result<crate::models::TokenData, String> {
-    let now = chrono::Local::now().timestamp();
+    let now = chrono::Utc::now().timestamp();
 
     // Keep enough validity to avoid immediate post-switch refresh failure.
     if current_token.expiry_timestamp > now + TOKEN_REFRESH_SKEW_SECONDS {

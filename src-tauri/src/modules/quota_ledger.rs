@@ -173,6 +173,33 @@ pub fn estimated_percentage_map(account: &Account) -> HashMap<String, i32> {
         })
 }
 
+/// Resolve a quota summary bucket (and its parent group display name) to a canonical
+/// billing group (`"gemini"` | `"claude"`).
+///
+/// Official Pro accounts expose a separate `"Gemini 4 Argon"` group
+/// (`bucketId: "gemini-argon-wtu-weekly"`). Official docs note Argon quota is separate on Pro plans,
+/// so Argon-scoped buckets must not overwrite the shared Flash/Pro `gemini` billing bucket.
+fn resolve_quota_group_bucket_billing(group_display_name: &str, bucket_id: &str) -> Option<String> {
+    let id = bucket_id.to_lowercase();
+    let dn = group_display_name.to_lowercase();
+    if id.contains("argon") || dn.contains("argon") {
+        return None;
+    }
+    if id.starts_with("gemini") || id.contains("gemini") {
+        return Some(BILLING_GEMINI.to_string());
+    }
+    if id.starts_with("3p") || id.contains("3p") || id.contains("claude") {
+        return Some(BILLING_CLAUDE.to_string());
+    }
+    if dn.contains("gemini") {
+        Some(BILLING_GEMINI.to_string())
+    } else if dn.contains("claude") || dn.contains("gpt") || dn.contains("3p") {
+        Some(BILLING_CLAUDE.to_string())
+    } else {
+        None
+    }
+}
+
 /// Map official quota_groups buckets → billing group percentages.
 /// Prefers `5h` window; when weekly is exhausted (<=0%), prefers weekly (aligns with quotaDisplay.ts).
 pub fn billing_percentages_from_quota_groups(groups: &[QuotaGroup]) -> HashMap<String, i32> {
@@ -183,7 +210,10 @@ pub fn billing_percentages_from_quota_groups(groups: &[QuotaGroup]) -> HashMap<S
 
     for group in groups {
         for bucket in &group.buckets {
-            if let Some((billing, pct)) = bucket_to_billing_pct(bucket) {
+            if let Some(billing) =
+                resolve_quota_group_bucket_billing(&group.display_name, &bucket.bucket_id)
+            {
+                let pct = fraction_to_pct(bucket.remaining_fraction);
                 let is_5h = bucket.window.eq_ignore_ascii_case("5h")
                     || bucket.bucket_id.to_lowercase().contains("5h");
                 let is_weekly = bucket.window.eq_ignore_ascii_case("weekly")
@@ -194,18 +224,6 @@ pub fn billing_percentages_from_quota_groups(groups: &[QuotaGroup]) -> HashMap<S
                     weekly.insert(billing, pct);
                 } else {
                     fallback.entry(billing).or_insert(pct);
-                }
-            }
-        }
-        // Also try display_name heuristics when buckets lack gemini-/3p- prefixes
-        if five_h.is_empty() && weekly.is_empty() && fallback.is_empty() {
-            let dn = group.display_name.to_lowercase();
-            if let Some(first) = group.buckets.first() {
-                let pct = fraction_to_pct(first.remaining_fraction);
-                if dn.contains("gemini") {
-                    fallback.insert(BILLING_GEMINI.to_string(), pct);
-                } else if dn.contains("claude") || dn.contains("gpt") || dn.contains("3p") {
-                    fallback.insert(BILLING_CLAUDE.to_string(), pct);
                 }
             }
         }
@@ -253,21 +271,12 @@ pub fn extract_dual_window_online_map(quota: &QuotaData) -> HashMap<String, Onli
     if let Some(ref groups) = quota.quota_groups {
         for group in groups {
             for bucket in &group.buckets {
-                let id = bucket.bucket_id.to_lowercase();
-                let billing = if id.starts_with("gemini") || id.contains("gemini") {
-                    BILLING_GEMINI.to_string()
-                } else if id.starts_with("3p") || id.contains("3p") || id.contains("claude") {
-                    BILLING_CLAUDE.to_string()
-                } else {
-                    let dn = group.display_name.to_lowercase();
-                    if dn.contains("gemini") {
-                        BILLING_GEMINI.to_string()
-                    } else if dn.contains("claude") || dn.contains("gpt") || dn.contains("3p") {
-                        BILLING_CLAUDE.to_string()
-                    } else {
-                        continue;
-                    }
+                let Some(billing) =
+                    resolve_quota_group_bucket_billing(&group.display_name, &bucket.bucket_id)
+                else {
+                    continue;
                 };
+                let id = bucket.bucket_id.to_lowercase();
 
                 let entry = map.entry(billing).or_insert(OnlineDualWindowBucket {
                     pct_5h: 100,
@@ -343,18 +352,6 @@ pub fn calibrate_account_dual_window(account: &mut Account, quota: &QuotaData) {
 
 fn fraction_to_pct(fraction: f64) -> i32 {
     ((fraction * 100.0).round() as i32).clamp(0, 100)
-}
-
-fn bucket_to_billing_pct(bucket: &QuotaBucket) -> Option<(String, i32)> {
-    let id = bucket.bucket_id.to_lowercase();
-    let billing = if id.starts_with("gemini") || id.contains("gemini") {
-        BILLING_GEMINI.to_string()
-    } else if id.starts_with("3p") || id.contains("3p") || id.contains("claude") {
-        BILLING_CLAUDE.to_string()
-    } else {
-        return None;
-    };
-    Some((billing, fraction_to_pct(bucket.remaining_fraction)))
 }
 
 /// Build percentage map from online sources using official billing groups.
@@ -1036,5 +1033,78 @@ mod tests {
 
         // Gemini should now be protected
         assert!(account.protected_models.contains("gemini"));
+    }
+
+    #[test]
+    fn test_argon_separate_weekly_bucket_does_not_overwrite_gemini_group() {
+        let groups = vec![
+            QuotaGroup {
+                display_name: "Gemini Models".into(),
+                description: None,
+                buckets: vec![
+                    QuotaBucket {
+                        bucket_id: "gemini-weekly".into(),
+                        window: "weekly".into(),
+                        remaining_fraction: 0.92,
+                        reset_time: "2026-11-10T15:42:31Z".into(),
+                        display_name: None,
+                        description: None,
+                    },
+                    QuotaBucket {
+                        bucket_id: "gemini-5h".into(),
+                        window: "5h".into(),
+                        remaining_fraction: 0.95,
+                        reset_time: "2026-11-04T20:24:19Z".into(),
+                        display_name: None,
+                        description: None,
+                    },
+                ],
+            },
+            QuotaGroup {
+                display_name: "Claude and GPT models".into(),
+                description: None,
+                buckets: vec![
+                    QuotaBucket {
+                        bucket_id: "3p-weekly".into(),
+                        window: "weekly".into(),
+                        remaining_fraction: 0.91,
+                        reset_time: "2026-11-11T15:49:42Z".into(),
+                        display_name: None,
+                        description: None,
+                    },
+                    QuotaBucket {
+                        bucket_id: "3p-5h".into(),
+                        window: "5h".into(),
+                        remaining_fraction: 0.82,
+                        reset_time: "2026-11-04T20:49:42Z".into(),
+                        display_name: None,
+                        description: None,
+                    },
+                ],
+            },
+            QuotaGroup {
+                display_name: "Gemini 4 Argon".into(),
+                description: Some("For paid Pro plans, Argon quota is separate.".into()),
+                buckets: vec![QuotaBucket {
+                    bucket_id: "gemini-argon-wtu-weekly".into(),
+                    window: "weekly".into(),
+                    remaining_fraction: 0.0,
+                    reset_time: "2026-11-10T15:17:45Z".into(),
+                    display_name: None,
+                    description: None,
+                }],
+            },
+        ];
+
+        let map = billing_percentages_from_quota_groups(&groups);
+        assert_eq!(map.get("gemini"), Some(&95));
+        assert_eq!(map.get("claude"), Some(&82));
+
+        let mut quota = QuotaData::default();
+        quota.quota_groups = Some(groups);
+        let dual = extract_dual_window_online_map(&quota);
+        let gemini_dual = dual.get("gemini").expect("gemini dual bucket");
+        assert_eq!(gemini_dual.pct_5h, 95);
+        assert_eq!(gemini_dual.pct_weekly, 92);
     }
 }

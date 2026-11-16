@@ -2537,11 +2537,22 @@ impl TokenManager {
     /// 2. 采用单账号粒度的双重检查互斥锁（Double-Checked Locking）：
     ///    第一个协程去向 Google OAuth 换新 Token，并发排队的协程等待锁释放后直接复用已刷新好的 Token，杜绝并发重复刷新。
     /// 3. 刷新成功并保存后，加入拟人化平滑沉淀延迟 tokio::time::sleep(rand 400..800ms)，以消除跨机房扩散延迟和机器瞬击特征。
-    pub async fn ensure_token_valid(&self, mut token: ProxyToken) -> Result<ProxyToken, String> {
-        let now = chrono::Utc::now().timestamp();
+    pub async fn ensure_token_valid(&self, token: ProxyToken) -> Result<ProxyToken, String> {
+        self.ensure_token_valid_with_skew(token, Self::OAUTH_PRE_REFRESH_WINDOW_SECS)
+            .await
+    }
 
-        // 快路径（Fast-Path）：Token 依然有效且余量充足（>= 180 秒），零锁开销直接放行
-        if !Self::token_needs_oauth_refresh(&token, now) {
+    /// 带可配提前刷新窗口的单账号互斥刷新入口（供配额同步等复用 TokenManager refresh_locks）。
+    pub async fn ensure_token_valid_with_skew(
+        &self,
+        mut token: ProxyToken,
+        skew_secs: i64,
+    ) -> Result<ProxyToken, String> {
+        let now = chrono::Utc::now().timestamp();
+        let needs_refresh = |t: &ProxyToken, ts: i64| ts >= t.timestamp - skew_secs;
+
+        // 快路径（Fast-Path）：Token 依然有效且余量充足，零锁开销直接放行
+        if !needs_refresh(&token, now) {
             return Ok(token);
         }
 
@@ -2556,7 +2567,7 @@ impl TokenManager {
         // Double-Checked Locking：持锁二次检查最新内存缓存，并发排队协程直接复用已刷新的 Token
         let now_recheck = chrono::Utc::now().timestamp();
         if let Some(latest) = self.tokens.get(&token.account_id).map(|r| r.clone()) {
-            if !Self::token_needs_oauth_refresh(&latest, now_recheck) {
+            if !needs_refresh(&latest, now_recheck) {
                 tracing::debug!(
                     "账号 {} OAuth Token 已由并发协程完成懒加载刷新，直接复用",
                     latest.email
@@ -2568,9 +2579,10 @@ impl TokenManager {
 
         // 真实需要刷新：第一个到达的协程向 Google OAuth 换新 Token
         tracing::info!(
-            "🔄 [TokenManager] 账号 {} OAuth Token 余量不足 ({}s < 180s)，执行请求驱动懒加载刷新...",
+            "🔄 [TokenManager] 账号 {} OAuth Token 余量不足 ({}s < {}s)，执行单账号互斥刷新...",
             token.email,
-            token.timestamp - now_recheck
+            token.timestamp - now_recheck,
+            skew_secs
         );
 
         let refresh_start = std::time::Instant::now();

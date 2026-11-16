@@ -90,8 +90,12 @@ pub fn start_scheduler(
             let mut warmup_tasks = Vec::new();
             let mut skipped_cooldown = 0;
 
-            // Scan each model for each account
+            // Scan each active model for each non-disabled, non-forbidden account
             for account in &accounts {
+                if account.disabled || account.proxy_disabled || account.is_hard_forbidden() {
+                    continue;
+                }
+
                 // Get valid token
                 let Ok((token, pid)) = quota::get_valid_token_for_warmup(account).await else {
                     continue;

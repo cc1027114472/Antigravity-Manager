@@ -714,14 +714,25 @@ pub async fn get_valid_token_for_warmup(
         }
     }
 
-    // Fetch project_id
-    let (project_id, _) = fetch_project_id(
-        &account.token.access_token,
-        &account.email,
-        Some(&account.id),
-    )
-    .await;
-    let final_pid = project_id.unwrap_or_else(|| "aicode-consumers".to_string());
+    // Prefer cached project_id when present; only call loadCodeAssist when missing.
+    let cached_pid = account
+        .token
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let final_pid = if let Some(pid) = cached_pid {
+        pid
+    } else {
+        let (project_id, _) = fetch_project_id(
+            &account.token.access_token,
+            &account.email,
+            Some(&account.id),
+        )
+        .await;
+        project_id.unwrap_or_else(|| "aicode-consumers".to_string())
+    };
 
     Ok((account.token.access_token, final_pid))
 }

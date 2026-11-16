@@ -2150,9 +2150,13 @@ pub async fn fetch_quota_with_retry_opts(
                 account.token.project_id = mem_tok.project_id.clone();
             }
             let now = chrono::Utc::now().timestamp();
-            if now >= account.token.expiry_timestamp - 300 || account.token.access_token.is_empty()
+            if now >= account.token.expiry_timestamp - oauth::TOKEN_REFRESH_SKEW_SECONDS
+                || account.token.access_token.is_empty()
             {
-                if let Ok(refreshed_mem) = tm.ensure_token_valid(mem_tok).await {
+                if let Ok(refreshed_mem) = tm
+                    .ensure_token_valid_with_skew(mem_tok, oauth::TOKEN_REFRESH_SKEW_SECONDS)
+                    .await
+                {
                     account.token.access_token = refreshed_mem.access_token;
                     account.token.expires_in = refreshed_mem.expires_in;
                     account.token.expiry_timestamp = refreshed_mem.timestamp;
