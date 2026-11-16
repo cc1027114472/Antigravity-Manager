@@ -728,11 +728,14 @@ pub fn transform_openai_request(
     // 3. 构建请求体
 
     let mut gen_config = json!({});
-    if let Some(temp) = request.temperature {
-        gen_config["temperature"] = json!(temp);
-    }
-    if let Some(top_p) = request.top_p {
-        gen_config["topP"] = json!(top_p);
+    let is_agent_req = config.request_type != "web_search" && config.request_type != "image_gen";
+    if !is_agent_req {
+        if let Some(temp) = request.temperature {
+            gen_config["temperature"] = json!(temp);
+        }
+        if let Some(top_p) = request.top_p {
+            gen_config["topP"] = json!(top_p);
+        }
     }
 
     // [FIX] 移除旧的硬编码限额，改为动态查询 (v4.1.29)；官方省略默认 maxOutputTokens 的模型保持省略
@@ -746,9 +749,11 @@ pub fn transform_openai_request(
         gen_config["maxOutputTokens"] = json!(limit);
     }
 
-    // [NEW] 支持多候选结果数量 (n -> candidateCount)
-    if let Some(n) = request.n {
-        gen_config["candidateCount"] = json!(n);
+    // [NEW] 非 agent 场景保留多候选数量 (web_search/image_gen)
+    if !is_agent_req {
+        if let Some(n) = request.n {
+            gen_config["candidateCount"] = json!(n);
+        }
     }
 
     // [FIXED] Official Antigravity client never sends presencePenalty / frequencyPenalty / seed (0/3322 captures).
@@ -1021,9 +1026,13 @@ pub fn transform_openai_request(
                     if let Some(name) = obj.get("name") {
                         clean_obj.insert("name".to_string(), name.clone());
                     }
+                    let tool_name_str = obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool");
                     let desc_val = match obj.get("description") {
-                        Some(Value::String(s)) => Value::String(s.clone()),
-                        _ => Value::String(String::new()),
+                        Some(Value::String(s)) if !s.trim().is_empty() => Value::String(s.clone()),
+                        _ => Value::String(tool_name_str.to_string()),
                     };
                     clean_obj.insert("description".to_string(), desc_val);
                     if let Some(params) = obj.get("parameters") {
@@ -1209,10 +1218,7 @@ pub fn transform_openai_request(
     if let Some(gc) = inner_request.get("generationConfig") {
         reordered_request["generationConfig"] = gc.clone();
     }
-    // 5. safetySettings (恒定常量)
-    if let Some(ss) = inner_request.get("safetySettings") {
-        reordered_request["safetySettings"] = ss.clone();
-    }
+    // 5. 对齐官方抓包：v1internal 请求不透传 safetySettings
     // 6. sessionId (稳定，基于 account_id hash)
     if let Some(sid) = inner_request.get("sessionId") {
         reordered_request["sessionId"] = sid.clone();
@@ -1221,6 +1227,9 @@ pub fn transform_openai_request(
     reordered_request["contents"] = inner_request.get("contents").cloned().unwrap_or(json!([]));
     // 8. 其他可能存在的字段 (metadata, cachedContent 等)
     for (k, v) in inner_request.as_object().iter().flat_map(|o| o.iter()) {
+        if k == "safetySettings" {
+            continue;
+        }
         if !reordered_request
             .as_object()
             .map(|o| o.contains_key(k))
@@ -2077,9 +2086,9 @@ mod tests {
         // 1. tool_choice: "auto" must NOT emit toolConfig
         assert!(res["request"].get("toolConfig").is_none());
 
-        // 2. Zero-arg tool must emit clean {"type": "OBJECT"} without fake "content" field or null description
+        // 2. Zero-arg tool must emit clean {"type": "OBJECT"} without fake "content" field or empty description
         let decl = &res["request"]["tools"][0]["functionDeclarations"][0];
-        assert_eq!(decl["description"], "");
+        assert_eq!(decl["description"], "list_plugin_accounts");
         assert_eq!(decl["parameters"], json!({ "type": "OBJECT" }));
 
         // 3. systemInstruction must not inject hardcoded SKILL.md PowerShell instruction

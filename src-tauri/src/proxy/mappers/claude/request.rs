@@ -966,6 +966,7 @@ fn build_contents(
             }
         }
         MessageContent::Array(blocks) => {
+            let mut pending_turn_thought_sig: Option<String> = None;
             // 官方并行 functionCall 抓包特征：同一 assistant 轮次内仅首个无独立签名的 functionCall 回填或注入签名
             let mut turn_has_fc_sig = blocks.iter().any(|b| {
                 matches!(
@@ -995,11 +996,21 @@ fn build_contents(
                                 }
                             }
 
-                            parts.extend(
+                            let mut parsed_parts =
                                 crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(
                                     text,
-                                ),
-                            );
+                                );
+                            if is_assistant {
+                                if let Some(sig) = pending_turn_thought_sig.take() {
+                                    if let Some(first_part) = parsed_parts.first_mut() {
+                                        first_part["thoughtSignature"] = json!(sig);
+                                        turn_has_fc_sig = true;
+                                    } else {
+                                        pending_turn_thought_sig = Some(sig);
+                                    }
+                                }
+                            }
+                            parts.extend(parsed_parts);
                             saw_non_thinking = true;
 
                             // 记录最近一次 User 任务文本用于后续比对
@@ -1091,14 +1102,16 @@ fn build_contents(
                                         saw_non_thinking = true;
                                         continue;
                                     }
-                                    // Compatible and not a retry: use signature
+                                    // Compatible and not a retry: keep thought part clean (official captures never place thoughtSignature on thought:true)
+                                    // and defer thoughtSignature to the first non-thought part (text or functionCall) of this turn.
                                     *last_thought_signature = Some(sig.clone());
-                                    let mut part = json!({
+                                    pending_turn_thought_sig = Some(
+                                        crate::proxy::mappers::common_utils::ensure_upstream_thought_signature(sig),
+                                    );
+                                    let part = json!({
                                         "text": thinking,
-                                        "thought": true,
-                                        "thoughtSignature": sig
+                                        "thought": true
                                     });
-                                    crate::proxy::common::json_schema::clean_json_schema(&mut part);
                                     parts.push(part);
                                 }
                                 None => {
@@ -1110,14 +1123,13 @@ fn build_contents(
                                             sig.len()
                                         );
                                         *last_thought_signature = Some(sig.clone());
-                                        let mut part = json!({
-                                            "text": thinking,
-                                            "thought": true,
-                                            "thoughtSignature": sig
-                                        });
-                                        crate::proxy::common::json_schema::clean_json_schema(
-                                            &mut part,
+                                        pending_turn_thought_sig = Some(
+                                            crate::proxy::mappers::common_utils::ensure_upstream_thought_signature(sig),
                                         );
+                                        let part = json!({
+                                            "text": thinking,
+                                            "thought": true
+                                        });
                                         parts.push(part);
                                     } else {
                                         // Unknown and too short: downgrade to text for safety
@@ -1319,8 +1331,11 @@ fn build_contents(
                                         }
                                     };
                                     if should_use_sig {
-                                        part["thoughtSignature"] = json!(sig);
+                                        part["thoughtSignature"] = json!(
+                                            crate::proxy::mappers::common_utils::ensure_upstream_thought_signature(&sig)
+                                        );
                                         turn_has_fc_sig = true;
+                                        pending_turn_thought_sig = None;
                                     }
                                 }
                             }
@@ -1452,6 +1467,14 @@ fn build_contents(
                         // 搜索结果 block 不应由客户端发回给上游 (已由 tool_result 替代)
                         continue;
                     }
+                }
+            }
+            if is_assistant {
+                if let Some(sig) = pending_turn_thought_sig.take() {
+                    parts.push(json!({
+                        "text": "",
+                        "thoughtSignature": sig
+                    }));
                 }
             }
         }
@@ -1783,9 +1806,16 @@ fn build_tools(
                 });
                 crate::proxy::common::json_schema::clean_official_tool_schema(&mut input_schema);
 
+                let desc = tool
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(name.as_str());
+
                 function_declarations.push(json!({
                     "name": name,
-                    "description": tool.description.as_deref().unwrap_or(""),
+                    "description": desc,
                     "parameters": input_schema
                 }));
             }
@@ -1979,15 +2009,17 @@ fn build_generation_config(
         config["thinkingConfig"] = thinking_config;
     }
 
-    // 其他参数（仅在客户端显式传入时透传，对齐官方抓包不默认塞入 topP/topK）
-    if let Some(temp) = claude_req.temperature {
-        config["temperature"] = json!(temp);
-    }
-    if let Some(top_p) = claude_req.top_p {
-        config["topP"] = json!(top_p);
-    }
-    if let Some(top_k) = claude_req.top_k {
-        config["topK"] = json!(top_k);
+    // 非 web_search 请求对齐官方抓包，不向 generationConfig 透传 temperature/topP/topK
+    if is_web_search {
+        if let Some(temp) = claude_req.temperature {
+            config["temperature"] = json!(temp);
+        }
+        if let Some(top_p) = claude_req.top_p {
+            config["topP"] = json!(top_p);
+        }
+        if let Some(top_k) = claude_req.top_k {
+            config["topK"] = json!(top_k);
+        }
     }
 
     // web_search 强制 candidateCount=1
@@ -3424,7 +3456,7 @@ mod tests {
         assert!(!si_text.contains("MCP XML"));
 
         let decl = &result["request"]["tools"][0]["functionDeclarations"][0];
-        assert_eq!(decl["description"], "");
+        assert_eq!(decl["description"], "mcp__plugin_accounts");
         assert_eq!(decl["parameters"], json!({ "type": "OBJECT" }));
     }
 
@@ -3507,5 +3539,94 @@ mod tests {
             gen_config.get("maxOutputTokens").is_none(),
             "gemini-3.8-flash-tiered without max_tokens must omit maxOutputTokens"
         );
+    }
+
+    #[test]
+    fn test_alignment_claude_signature_reencode_placement_identity_and_sampling() {
+        use base64::Engine as _;
+        let decoded_sig =
+            "CAQS3JMBChIIExACGAI4AUIIdGhpbmtpbmcSDKLR55cngdKY26YpaRoM1C2iCmn18KKjWXAT";
+        let expected_wire_sig =
+            base64::engine::general_purpose::STANDARD.encode(decoded_sig.as_bytes());
+        assert!(expected_wire_sig.starts_with("Q0FR"));
+
+        let req = ClaudeRequest {
+            model: "claude-sonnet-5-5".to_string(),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String("Check config".to_string()),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: MessageContent::Array(vec![
+                        ContentBlock::Thinking {
+                            thinking: "Inspecting...".to_string(),
+                            signature: Some(decoded_sig.to_string()),
+                            cache_control: None,
+                        },
+                        ContentBlock::Text {
+                            text: "Let me check.".to_string(),
+                        },
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String("Continue".to_string()),
+                },
+            ],
+            system: None,
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("ping".to_string()),
+                description: Some("   ".to_string()),
+                input_schema: Some(json!({"type": "object"})),
+            }]),
+            stream: true,
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            thinking: Some(ThinkingConfig {
+                type_: "enabled".to_string(),
+                budget_tokens: Some(4096),
+                effort: None,
+            }),
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        let out = transform_claude_request_in(&req, "proj", false, None, "sess_sig_place", None)
+            .expect("transform must succeed");
+        let inner = &out["request"];
+
+        // 1. systemInstruction starts with <identity>
+        let si_text = inner["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(si_text.starts_with("<identity>\n"));
+
+        // 2. thought:true part has NO thoughtSignature; text part receives re-encoded Q0FR... signature
+        let model_parts = inner["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(model_parts.len(), 2);
+        assert_eq!(model_parts[0]["thought"], json!(true));
+        assert!(model_parts[0].get("thoughtSignature").is_none());
+        assert_eq!(model_parts[1]["text"], json!("Let me check."));
+        assert_eq!(
+            model_parts[1]["thoughtSignature"].as_str(),
+            Some(expected_wire_sig.as_str())
+        );
+
+        // 3. Empty tool description falls back to tool name
+        let decl = &inner["tools"][0]["functionDeclarations"][0];
+        assert_eq!(decl["description"].as_str(), Some("ping"));
+
+        // 4. Agent generationConfig omits temperature / topP / topK
+        let gc = &inner["generationConfig"];
+        assert!(gc.get("temperature").is_none());
+        assert!(gc.get("topP").is_none());
+        assert!(gc.get("topK").is_none());
     }
 }

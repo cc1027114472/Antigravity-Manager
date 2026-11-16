@@ -867,12 +867,25 @@ impl<'a> PartProcessor<'a> {
             }
         }
 
-        // 非空 text 带签名 - 立即处理
-        if signature.is_some() {
-            // [FIX] 为保护签名, 签名所在的 Text 块直接发送
-            // 注意: 不得在此开启 thinking 块, 因为之前可能已有非 thinking 内容。
-            // 这种情况下, 我们只需确签被缓存在状态中。
-            self.state.store_signature(signature);
+        // 非空 text 带签名 - 立即处理并同步缓存会话签名
+        if let Some(ref sig) = signature {
+            if let Some(model) = &self.state.model_name {
+                SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
+            }
+            if let Some(session_id) = &self.state.session_id {
+                SignatureCache::global().cache_session_signature(
+                    session_id,
+                    sig.clone(),
+                    self.state.message_count,
+                );
+            }
+            // 若当前之前已有 open Thinking 块，store_signature 会在紧接着 start_block(Text)->end_block() 时作为 signature_delta 发出；
+            // 若此前没有 Thinking 块，额外暂存到 trailing_signature，避免在无前置思考块的 Gemini 响应中丢弃签名。
+            let had_open_thinking = self.state.current_block_type() == BlockType::Thinking;
+            self.state.store_signature(signature.clone());
+            if !had_open_thinking {
+                self.state.set_trailing_signature(Some(sig.clone()));
+            }
 
             chunks.extend(
                 self.state

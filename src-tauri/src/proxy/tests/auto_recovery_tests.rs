@@ -141,7 +141,7 @@ fn test_build_probe_payload() {
         .expect("contents must have parts array");
     assert_eq!(parts[0].get("text").and_then(|v| v.as_str()), Some("ping"));
 
-    // Generation config: maxOutputTokens: 1, temperature: 0
+    // Generation config: maxOutputTokens: 1; official agent generationConfig omits temperature
     let gen_config = req
         .get("generationConfig")
         .expect("request must have generationConfig");
@@ -149,10 +149,7 @@ fn test_build_probe_payload() {
         gen_config.get("maxOutputTokens").and_then(|v| v.as_i64()),
         Some(1)
     );
-    assert_eq!(
-        gen_config.get("temperature").and_then(|v| v.as_i64()),
-        Some(0)
-    );
+    assert!(gen_config.get("temperature").is_none());
 
     // Session ID uses standard camelCase sessionId (negative integer string) and never leaks snake_case session_id
     assert!(

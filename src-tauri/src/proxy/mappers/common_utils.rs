@@ -5,10 +5,12 @@ use serde_json::{json, Value};
 
 /// Default Antigravity system identity prepended when no client Antigravity identity is provided.
 pub const FALLBACK_ANTIGRAVITY_IDENTITY: &str =
-    "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
+    "<identity>\n\
+    You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
     You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
     **Absolute paths only**\n\
-    **Proactiveness**";
+    **Proactiveness**\n\
+    </identity>";
 
 /// Search-specific system identity used when `requestType == "web_search"`.
 pub const FALLBACK_WEB_SEARCH_IDENTITY: &str =
@@ -1296,4 +1298,15 @@ pub fn parse_markdown_images_to_parts(text: &str) -> Vec<Value> {
     }
 
     parts
+}
+
+/// Re-encode decoded Claude thought signatures (`CAQS...`) back to the outer
+/// Base64 wire format (`Q0FR...`) expected by upstream `v1internal`.
+pub fn ensure_upstream_thought_signature(sig: &str) -> String {
+    if sig.starts_with("CAQS") {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(sig.as_bytes())
+    } else {
+        sig.to_string()
+    }
 }

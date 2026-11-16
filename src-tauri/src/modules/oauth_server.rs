@@ -401,7 +401,7 @@ pub async fn start_oauth_flow(
     }
 
     // Take code_rx to wait for it
-    let (mut code_rx, redirect_uri, client_key) = {
+    let (mut code_rx, redirect_uri, client_key, flow_state_id) = {
         let mut lock = get_oauth_flow_state()
             .lock()
             .map_err(|_| "OAuth state lock corrupted".to_string())?;
@@ -412,7 +412,12 @@ pub async fn start_oauth_flow(
             .code_rx
             .take()
             .ok_or_else(|| "OAuth authorization already in progress".to_string())?;
-        (rx, state.redirect_uri.clone(), state.client_key.clone())
+        (
+            rx,
+            state.redirect_uri.clone(),
+            state.client_key.clone(),
+            state.state.clone(),
+        )
     };
 
     // Wait for code (if user has already authorized, this returns immediately)
@@ -428,7 +433,13 @@ pub async fn start_oauth_flow(
         *lock = None;
     }
 
-    oauth::exchange_code_with_client(&code, &redirect_uri, Some(&client_key)).await
+    oauth::exchange_code_with_client_and_state(
+        &code,
+        &redirect_uri,
+        Some(&client_key),
+        Some(&flow_state_id),
+    )
+    .await
 }
 
 /// Завершить OAuth flow без открытия браузера.
@@ -441,7 +452,7 @@ pub async fn complete_oauth_flow(
     let _ = ensure_oauth_flow_prepared(app_handle, None).await?;
 
     // Take receiver to wait for code
-    let (mut code_rx, redirect_uri, client_key) = {
+    let (mut code_rx, redirect_uri, client_key, flow_state_id) = {
         let mut lock = get_oauth_flow_state()
             .lock()
             .map_err(|_| "OAuth state lock corrupted".to_string())?;
@@ -452,7 +463,12 @@ pub async fn complete_oauth_flow(
             .code_rx
             .take()
             .ok_or_else(|| "OAuth authorization already in progress".to_string())?;
-        (rx, state.redirect_uri.clone(), state.client_key.clone())
+        (
+            rx,
+            state.redirect_uri.clone(),
+            state.client_key.clone(),
+            state.state.clone(),
+        )
     };
 
     let code = match code_rx.recv().await {
@@ -465,7 +481,13 @@ pub async fn complete_oauth_flow(
         *lock = None;
     }
 
-    oauth::exchange_code_with_client(&code, &redirect_uri, Some(&client_key)).await
+    oauth::exchange_code_with_client_and_state(
+        &code,
+        &redirect_uri,
+        Some(&client_key),
+        Some(&flow_state_id),
+    )
+    .await
 }
 
 /// Manually submit an OAuth code to complete the flow.

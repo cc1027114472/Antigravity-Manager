@@ -754,6 +754,17 @@ pub fn wrap_request_v2(
             }
         }
     } else {
+        if config.request_type != "web_search" {
+            if let Some(gen_obj) = inner_request
+                .get_mut("generationConfig")
+                .and_then(|v| v.as_object_mut())
+            {
+                gen_obj.remove("temperature");
+                gen_obj.remove("topP");
+                gen_obj.remove("topK");
+                gen_obj.remove("candidateCount");
+            }
+        }
         let antigravity_identity =
             crate::proxy::mappers::common_utils::default_identity_for_request_type(
                 &config.request_type,
@@ -909,10 +920,7 @@ pub fn wrap_request_v2(
     if let Some(gc) = inner_request.get("generationConfig") {
         reordered_inner["generationConfig"] = gc.clone();
     }
-    // 5. safetySettings (恒定)
-    if let Some(ss) = inner_request.get("safetySettings") {
-        reordered_inner["safetySettings"] = ss.clone();
-    }
+    // 5. 对齐官方抓包：v1internal 请求不透传 safetySettings
     // 6. sessionId (稳定，基于 account hash)
     if let Some(sid) = inner_request.get("sessionId") {
         reordered_inner["sessionId"] = sid.clone();
@@ -921,6 +929,9 @@ pub fn wrap_request_v2(
     reordered_inner["contents"] = inner_request.get("contents").cloned().unwrap_or(json!([]));
     // 8. 其他字段 (metadata, cachedContent 等 — 保持原样但覆盖已有)
     for (k, v) in inner_request.as_object().iter().flat_map(|o| o.iter()) {
+        if k == "safetySettings" {
+            continue;
+        }
         if !reordered_inner
             .as_object()
             .map(|o| o.contains_key(k))
@@ -1500,7 +1511,7 @@ mod tests {
         // Single-part systemInstruction containing both Antigravity identity and user instruction
         assert_eq!(parts.len(), 1);
         let merged_text = parts[0].get("text").unwrap().as_str().unwrap();
-        assert!(merged_text.starts_with("You are Antigravity"));
+        assert!(merged_text.starts_with("<identity>\nYou are Antigravity"));
         assert!(merged_text.ends_with("User custom prompt"));
     }
 

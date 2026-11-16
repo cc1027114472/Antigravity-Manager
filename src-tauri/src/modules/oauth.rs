@@ -1,4 +1,56 @@
+use base64::Engine as _;
+use once_cell::sync::Lazy;
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+static PKCE_VERIFIER_BY_STATE: Lazy<Mutex<HashMap<String, String>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static PKCE_VERIFIER_BY_REDIRECT: Lazy<Mutex<HashMap<String, String>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn generate_pkce_pair() -> (String, String) {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let digest = Sha256::digest(verifier.as_bytes());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    (verifier, challenge)
+}
+
+fn store_pkce_verifier(state: &str, redirect_uri: &str, verifier: &str) {
+    if let Ok(mut map) = PKCE_VERIFIER_BY_STATE.lock() {
+        if map.len() >= 64 {
+            map.clear();
+        }
+        map.insert(state.to_string(), verifier.to_string());
+    }
+    if let Ok(mut map) = PKCE_VERIFIER_BY_REDIRECT.lock() {
+        if map.len() >= 64 {
+            map.clear();
+        }
+        map.insert(redirect_uri.to_string(), verifier.to_string());
+    }
+}
+
+fn take_pkce_verifier(state: Option<&str>, redirect_uri: &str) -> Option<String> {
+    if let Some(st) = state {
+        if let Ok(mut map) = PKCE_VERIFIER_BY_STATE.lock() {
+            if let Some(v) = map.remove(st) {
+                if let Ok(mut rmap) = PKCE_VERIFIER_BY_REDIRECT.lock() {
+                    rmap.remove(redirect_uri);
+                }
+                return Some(v);
+            }
+        }
+    }
+    if let Ok(mut rmap) = PKCE_VERIFIER_BY_REDIRECT.lock() {
+        return rmap.remove(redirect_uri);
+    }
+    None
+}
 
 // Google OAuth configuration
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
@@ -334,23 +386,27 @@ pub fn get_auth_url_with_client(
     let client = select_auth_client(client_key)?;
 
     let scopes = vec![
-        "openid",
         "https://www.googleapis.com/auth/cloud-platform",
         "https://www.googleapis.com/auth/userinfo.email",
         "https://www.googleapis.com/auth/userinfo.profile",
         "https://www.googleapis.com/auth/cclog",
         "https://www.googleapis.com/auth/experimentsandconfigs",
+        "https://www.googleapis.com/auth/aicode",
     ]
     .join(" ");
 
+    let (code_verifier, code_challenge) = generate_pkce_pair();
+    store_pkce_verifier(state, redirect_uri, &code_verifier);
+
     let params = vec![
+        ("access_type", "offline"),
         ("client_id", client.client_id.as_str()),
+        ("code_challenge", code_challenge.as_str()),
+        ("code_challenge_method", "S256"),
+        ("prompt", "consent"),
         ("redirect_uri", redirect_uri),
         ("response_type", "code"),
         ("scope", &scopes),
-        ("access_type", "offline"),
-        ("prompt", "consent"),
-        ("include_granted_scopes", "true"),
         ("state", state),
     ];
 
@@ -370,6 +426,7 @@ async fn exchange_code_once(
     code: &str,
     redirect_uri: &str,
     client_cfg: &OAuthClientConfig,
+    code_verifier: Option<&str>,
 ) -> Result<TokenResponse, (Option<reqwest::StatusCode>, String)> {
     // [PHASE 2] 对于登录行为，尚未有 account_id，使用全局池阶梯逻辑
     let (client, egress) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
@@ -390,13 +447,16 @@ async fn exchange_code_once(
 
     let prefix = egress.error_prefix();
 
-    let params = [
+    let mut params = vec![
         ("client_id", client_cfg.client_id.as_str()),
         ("client_secret", client_cfg.client_secret.as_str()),
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("grant_type", "authorization_code"),
     ];
+    if let Some(verifier) = code_verifier {
+        params.push(("code_verifier", verifier));
+    }
 
     // Header-only vscode UA for oauth2.googleapis.com; TLS is still Chrome132 (same egress as AI).
     tracing::debug!(
@@ -472,22 +532,24 @@ async fn exchange_code_once(
     }
 }
 
-/// Exchange authorization code for token using optional preferred client.
+/// Exchange authorization code for token using optional preferred client and OAuth state (PKCE).
 /// When preferred/active client mismatches, fallback to other configured clients.
-pub async fn exchange_code_with_client(
+pub async fn exchange_code_with_client_and_state(
     code: &str,
     redirect_uri: &str,
     preferred_client_key: Option<&str>,
+    state: Option<&str>,
 ) -> Result<TokenResponse, String> {
     let candidates = get_candidate_clients(preferred_client_key);
     if candidates.is_empty() {
         return Err("No OAuth clients configured".to_string());
     }
 
+    let code_verifier = take_pkce_verifier(state, redirect_uri);
     let mut attempt_errors: Vec<String> = Vec::new();
 
     for (idx, client_cfg) in candidates.iter().enumerate() {
-        match exchange_code_once(code, redirect_uri, client_cfg).await {
+        match exchange_code_once(code, redirect_uri, client_cfg, code_verifier.as_deref()).await {
             Ok(token_res) => {
                 if idx > 0 {
                     crate::modules::logger::log_info(&format!(
@@ -524,6 +586,15 @@ pub async fn exchange_code_with_client(
         "Token exchange failed for all OAuth clients: {}",
         attempt_errors.join(" | ")
     ))
+}
+
+/// Exchange authorization code for token using optional preferred client.
+pub async fn exchange_code_with_client(
+    code: &str,
+    redirect_uri: &str,
+    preferred_client_key: Option<&str>,
+) -> Result<TokenResponse, String> {
+    exchange_code_with_client_and_state(code, redirect_uri, preferred_client_key, None).await
 }
 
 /// Exchange authorization code for token
@@ -813,5 +884,21 @@ mod tests {
         assert!(url.contains("state=test-state-123456"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback"));
         assert!(url.contains("response_type=code"));
+        assert!(url.contains("code_challenge="));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("https%3A%2F%2Fwww.googleapis.com%2Fauth%2Faicode"));
+        assert!(!url.contains("openid"));
+        assert!(!url.contains("include_granted_scopes"));
+
+        let parsed = url::Url::parse(&url).unwrap();
+        let challenge = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "code_challenge")
+            .map(|(_, v)| v.to_string())
+            .unwrap();
+        let verifier = take_pkce_verifier(Some(state), redirect_uri).expect("pkce verifier");
+        let expected_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
+        assert_eq!(challenge, expected_challenge);
     }
 }
