@@ -19,6 +19,16 @@ const NEAR_READY_THRESHOLD: i32 = 95;
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY_SECS: u64 = 30;
 
+/// Build project request payload for quota / models endpoints, falling back to
+/// `"aicode-consumers"` when no project_id is cached (matching official captures).
+fn build_quota_project_payload(project_id: Option<&str>) -> serde_json::Value {
+    let pid = project_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("aicode-consumers");
+    json!({ "project": pid })
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct QuotaResponse {
     models: std::collections::HashMap<String, ModelInfo>,
@@ -376,11 +386,7 @@ pub async fn fetch_quota_with_cache(
             return Err(AppError::Network(e, None));
         }
     };
-    let payload = if let Some(ref pid) = project_id {
-        json!({ "project": pid })
-    } else {
-        json!({}) // Empty payload fallback
-    };
+    let payload = build_quota_project_payload(project_id.as_deref());
 
     let mut last_error: Option<AppError> = None;
 
@@ -583,11 +589,7 @@ async fn fetch_quota_summary(
             return None;
         }
     };
-    let payload = if let Some(pid) = project_id {
-        json!({ "project": pid })
-    } else {
-        json!({})
-    };
+    let payload = build_quota_project_payload(project_id);
 
     for ep_url in QUOTA_SUMMARY_ENDPOINTS.iter() {
         let res = client
@@ -1052,4 +1054,25 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
         "Successfully triggered warmup for {} model series",
         warmed_count
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_quota_project_payload_fallback() {
+        assert_eq!(
+            build_quota_project_payload(None),
+            json!({ "project": "aicode-consumers" })
+        );
+        assert_eq!(
+            build_quota_project_payload(Some("  ")),
+            json!({ "project": "aicode-consumers" })
+        );
+        assert_eq!(
+            build_quota_project_payload(Some("custom-proj-123")),
+            json!({ "project": "custom-proj-123" })
+        );
+    }
 }

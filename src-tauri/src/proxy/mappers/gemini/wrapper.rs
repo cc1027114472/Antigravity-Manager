@@ -779,7 +779,13 @@ pub fn wrap_request_v2(
 
         if let Some(system_instruction) = inner_request.get_mut("systemInstruction") {
             if let Some(obj) = system_instruction.as_object_mut() {
-                if !obj.contains_key("role") {
+                // 官方 3322/3322 条抓包 systemInstruction 统一携带 role: "user"
+                let needs_user_role = obj
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .map(|r| r != "user")
+                    .unwrap_or(true);
+                if needs_user_role {
                     obj.insert("role".to_string(), json!("user"));
                 }
             }
@@ -1532,7 +1538,8 @@ mod tests {
             .unwrap();
         let parts = sys.get("parts").unwrap().as_array().unwrap();
 
-        // Should NOT inject duplicate, so only 1 part remains
+        // Should NOT inject duplicate, so only 1 part remains, and role defaults to "user"
+        assert_eq!(sys.get("role").and_then(|v| v.as_str()), Some("user"));
         assert_eq!(parts.len(), 1);
     }
 
