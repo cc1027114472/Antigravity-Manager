@@ -369,7 +369,7 @@ impl ProxyPoolManager {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> Client {
-        let mut builder = crate::utils::http::apply_chrome_identity(
+        let mut builder = crate::utils::http::apply_aidev_http1_identity(
             Client::builder().timeout(Duration::from_secs(timeout_secs)),
         );
 
@@ -487,7 +487,35 @@ impl ProxyPoolManager {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> (Client, EgressRoute) {
-        let mut builder = crate::utils::http::apply_chrome_identity(
+        self.get_effective_client_with_identity(
+            account_id,
+            timeout_secs,
+            crate::utils::http::apply_aidev_http1_identity,
+        )
+        .await
+    }
+
+    /// Same egress selection as `get_effective_standard_client_with_route`, using non-Chrome TLS allowing HTTP/2 (`oauth2.googleapis.com/token`).
+    pub async fn get_effective_oauth_client_with_route(
+        &self,
+        account_id: Option<&str>,
+        timeout_secs: u64,
+    ) -> (Client, EgressRoute) {
+        self.get_effective_client_with_identity(
+            account_id,
+            timeout_secs,
+            crate::utils::http::apply_oauth_h2_identity,
+        )
+        .await
+    }
+
+    async fn get_effective_client_with_identity(
+        &self,
+        account_id: Option<&str>,
+        timeout_secs: u64,
+        apply_identity: fn(rquest::ClientBuilder) -> rquest::ClientBuilder,
+    ) -> (Client, EgressRoute) {
+        let mut builder = apply_identity(
             Client::builder().timeout(Duration::from_secs(timeout_secs)),
         );
 

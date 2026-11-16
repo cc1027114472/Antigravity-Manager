@@ -185,7 +185,7 @@ impl UpstreamClient {
     fn build_client_internal(
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
     ) -> Result<Client, String> {
-        let mut builder = crate::utils::http::apply_chrome_identity(
+        let mut builder = crate::utils::http::apply_aidev_http1_identity(
             Client::builder().timeout(Duration::from_secs(600)),
         );
 
@@ -218,7 +218,7 @@ impl UpstreamClient {
         proxy_config: crate::proxy::proxy_pool::PoolProxyConfig,
     ) -> Result<Client, rquest::Error> {
         // Reuse base settings similar to default client but with specific proxy
-        crate::utils::http::apply_chrome_identity(
+        crate::utils::http::apply_aidev_http1_identity(
             Client::builder()
                 .timeout(Duration::from_secs(600))
                 .proxy(proxy_config.proxy),

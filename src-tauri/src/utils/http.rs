@@ -4,27 +4,49 @@ use rquest::{header, Client, ClientBuilder, Proxy};
 use rquest_util::{Emulation, EmulationOption};
 use std::time::Duration;
 
-/// Same TLS / HTTP2 identity as official Antigravity IDE (BoringSSL Chrome 132 TLS & HTTP/2).
-/// Strips browser document navigation headers (sec-ch-ua, sec-fetch-*, etc.) via skip_headers(true).
-pub fn apply_chrome_identity(builder: ClientBuilder) -> ClientBuilder {
-    let emu = EmulationOption::builder()
-        .emulation(Emulation::Chrome132)
-        .skip_headers(true)
-        .build();
-
+/// Shared transport settings without Chrome132 TLS/H2 impersonation.
+fn apply_base_transport_settings(builder: ClientBuilder) -> ClientBuilder {
     let mut default_headers = header::HeaderMap::new();
     default_headers.insert(
         header::ACCEPT_ENCODING,
         header::HeaderValue::from_static("gzip"),
     );
 
-    let builder = builder
-        .emulation(emu)
+    builder
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
         .default_headers(default_headers)
         .connect_timeout(Duration::from_secs(20))
         .pool_max_idle_per_host(20)
         .pool_idle_timeout(Duration::from_secs(90))
-        .tcp_keepalive(Duration::from_secs(60));
+        .tcp_keepalive(Duration::from_secs(60))
+}
+
+/// Official `aidev_client` (`antigravity/hub/2.x`) HTTP/1.1 transport without Chrome132 TLS/ALPS/H2 extensions.
+/// Used for `daily-cloudcode-pa`, `cloudcode-pa`, `aicode`, and `www.googleapis.com` (`10,224/10,224` captures HTTP/1.1).
+pub fn apply_aidev_http1_identity(builder: ClientBuilder) -> ClientBuilder {
+    apply_base_transport_settings(builder)
+        .http1_only()
+        .http1(|mut h| {
+            h.title_case_headers(true);
+        })
+}
+
+/// Clean BoringSSL transport allowing ALPN HTTP/2 negotiation without Chrome132 browser headers/ALPS/ECH.
+/// Matches `Go-http-client/2.0` against `oauth2.googleapis.com/token`.
+pub fn apply_oauth_h2_identity(builder: ClientBuilder) -> ClientBuilder {
+    apply_base_transport_settings(builder)
+}
+
+/// Legacy Chrome132 TLS/HTTP2 identity kept for callers explicitly requesting browser emulation.
+pub fn apply_chrome_identity(builder: ClientBuilder) -> ClientBuilder {
+    let emu = EmulationOption::builder()
+        .emulation(Emulation::Chrome132)
+        .skip_headers(true)
+        .build();
+
+    let builder = apply_base_transport_settings(builder.emulation(emu));
     let ua = crate::constants::USER_AGENT.as_str();
     if header::HeaderValue::from_str(ua).is_ok() {
         builder.user_agent(ua)
@@ -67,8 +89,43 @@ pub static SHARED_CLIENT: Lazy<Client> = Lazy::new(|| create_base_client(15));
 pub static SHARED_CLIENT_LONG: Lazy<Client> = Lazy::new(|| create_base_client(60));
 
 /// Base client: Chrome132 impersonation + Antigravity UA (same as AI upstream).
+static SHARED_OAUTH_CLIENT_LONG: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+
+fn create_oauth_base_client(timeout_secs: u64) -> Client {
+    let mut builder =
+        apply_oauth_h2_identity(Client::builder().timeout(Duration::from_secs(timeout_secs)));
+    if let Ok(app_cfg) = crate::modules::config::load_app_config() {
+        let up = app_cfg.proxy.upstream_proxy;
+        if up.enabled && !up.url.trim().is_empty() {
+            let normalized = crate::proxy::config::normalize_proxy_url(&up.url);
+            match rquest::Proxy::all(&normalized) {
+                Ok(p) => builder = builder.proxy(p),
+                Err(e) => {
+                    return build_blackhole_client(&format!(
+                        "Invalid app upstream proxy for OAuth client ({}): {}",
+                        normalized, e
+                    ));
+                }
+            }
+        }
+    }
+    builder.build().unwrap_or_else(|e| {
+        build_blackhole_client(&format!("Failed to build OAuth HTTP client: {}", e))
+    })
+}
+
+/// Long-timeout (60s) shared client allowing HTTP/2 without Chrome132 ALPS/TLS extensions
+/// for `oauth2.googleapis.com/token`.
+pub fn get_long_oauth_client() -> Client {
+    SHARED_OAUTH_CLIENT_LONG
+        .get_or_init(|| create_oauth_base_client(60))
+        .clone()
+}
+
 fn create_base_client(timeout_secs: u64) -> Client {
-    let mut builder = apply_chrome_identity(Client::builder().timeout(Duration::from_secs(timeout_secs)));
+    let mut builder = apply_aidev_http1_identity(
+        Client::builder().timeout(Duration::from_secs(timeout_secs)),
+    );
 
     match load_app_config() {
         Ok(config) => {
@@ -82,7 +139,7 @@ fn create_base_client(timeout_secs: u64) -> Client {
                             "HTTP shared client enabled upstream proxy: {}",
                             normalized
                         );
-                        tracing::info!("Initialized JA3/TLS Impersonation (Chrome132)");
+                        tracing::info!("Initialized Antigravity Go-like HTTP/1.1 TLS transport (Chrome132 ALPS/H2 disabled)");
                         return builder.build().unwrap_or_else(|e| {
                             build_blackhole_client(&format!(
                                 "shared JA3 client build failed: {}",

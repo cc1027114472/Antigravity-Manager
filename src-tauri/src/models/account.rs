@@ -193,9 +193,24 @@ impl Account {
     }
 
     pub fn update_quota(&mut self, mut quota: QuotaData) {
+        let preserve_hard_forbidden = self.is_hard_forbidden() && !quota.is_forbidden;
         if let Some(ref existing) = self.quota {
             if quota.subscription_tier.is_none() {
                 quota.subscription_tier = existing.subscription_tier.clone();
+            }
+            if preserve_hard_forbidden {
+                quota.is_forbidden = true;
+                if quota.forbidden_reason.is_none() {
+                    quota.forbidden_reason = existing
+                        .forbidden_reason
+                        .clone()
+                        .or_else(|| self.proxy_disabled_reason.clone());
+                }
+            }
+        } else if preserve_hard_forbidden {
+            quota.is_forbidden = true;
+            if quota.forbidden_reason.is_none() {
+                quota.forbidden_reason = self.proxy_disabled_reason.clone();
             }
         }
         self.quota = Some(quota);
@@ -294,4 +309,61 @@ pub struct AccountExportItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountExportResponse {
     pub accounts: Vec<AccountExportItem>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{QuotaData, TokenData};
+
+    fn make_test_account() -> Account {
+        Account::new(
+            "acc-1".to_string(),
+            "user@example.com".to_string(),
+            TokenData::new(
+                "at".to_string(),
+                "rt".to_string(),
+                3600,
+                Some("user@example.com".to_string()),
+                None,
+                None,
+                false,
+                None,
+            ),
+        )
+    }
+
+    #[test]
+    fn test_update_quota_preserves_hard_forbidden_status() {
+        let mut account = make_test_account();
+        account.proxy_disabled = true;
+        account.proxy_disabled_reason = Some(
+            "403 Forbidden: TOS_VIOLATION on generateContent".to_string(),
+        );
+        let mut old_quota = QuotaData::new();
+        old_quota.is_forbidden = true;
+        old_quota.forbidden_reason = Some("TOS_VIOLATION".to_string());
+        account.quota = Some(old_quota);
+
+        // Simulate fetchAvailableModels returning 200 OK during manual refresh
+        let fresh_quota = QuotaData::new();
+        assert!(!fresh_quota.is_forbidden);
+        account.update_quota(fresh_quota);
+
+        let updated = account.quota.as_ref().expect("quota should remain set");
+        assert!(
+            updated.is_forbidden,
+            "quota.is_forbidden must stay true while hard forbidden"
+        );
+        assert_eq!(updated.forbidden_reason.as_deref(), Some("TOS_VIOLATION"));
+    }
+
+    #[test]
+    fn test_aidev_and_oauth_http_builders_construct_cleanly() {
+        let http1 = crate::utils::http::apply_aidev_http1_identity(rquest::Client::builder())
+            .build();
+        assert!(http1.is_ok(), "http1 aidev client must build cleanly");
+        let oauth = crate::utils::http::apply_oauth_h2_identity(rquest::Client::builder()).build();
+        assert!(oauth.is_ok(), "oauth h2 client must build cleanly");
+    }
 }

@@ -428,12 +428,12 @@ async fn exchange_code_once(
     client_cfg: &OAuthClientConfig,
     code_verifier: Option<&str>,
 ) -> Result<TokenResponse, (Option<reqwest::StatusCode>, String)> {
-    // [PHASE 2] 对于登录行为，尚未有 account_id，使用全局池阶梯逻辑
+    // [PHASE 2] 对于登录行为，尚未有 account_id，使用全局池阶梯逻辑（OAuth Token 允许 H2）
     let (client, egress) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client_with_route(None, 60).await
+        pool.get_effective_oauth_client_with_route(None, 60).await
     } else {
         (
-            crate::utils::http::get_long_standard_client(),
+            crate::utils::http::get_long_oauth_client(),
             crate::proxy::proxy_pool::EgressRoute::from_app_upstream_fallback(),
         )
     };
@@ -607,13 +607,13 @@ async fn refresh_access_token_once(
     account_id: Option<&str>,
     client_cfg: &OAuthClientConfig,
 ) -> Result<TokenResponse, (Option<reqwest::StatusCode>, String)> {
-    // [PHASE 2] 根据 account_id 使用与 AI 反代相同的代理选择（bound → pool → upstream → direct）
+    // [PHASE 2] 根据 account_id 使用与 AI 反代相同的代理选择（bound → pool → upstream → direct；OAuth Token 允许 H2）
     let (client, egress) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client_with_route(account_id, 60)
+        pool.get_effective_oauth_client_with_route(account_id, 60)
             .await
     } else {
         (
-            crate::utils::http::get_long_standard_client(),
+            crate::utils::http::get_long_oauth_client(),
             crate::proxy::proxy_pool::EgressRoute::from_app_upstream_fallback(),
         )
     };

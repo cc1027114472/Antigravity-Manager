@@ -691,19 +691,15 @@ pub fn transform_claude_request_in(
         inner_request["labels"] = official_labels;
     }
 
-    // 构建最终请求体
-    let mut body = json!({
-        "project": project_id,
-        "requestId": request_id,
-        "request": inner_request,
-        "model": config.final_model,
-        "userAgent": "antigravity",
-        "requestType": req_type,
-    });
-
-    if req_type == "web_search" {
-        crate::proxy::mappers::common_utils::apply_web_search_envelope_overrides(&mut body);
-    }
+    // 构建最终请求体（对齐官方 envelope + inner 字段顺序）
+    let mut body = crate::proxy::mappers::common_utils::build_v1internal_envelope(
+        project_id,
+        &request_id,
+        inner_request,
+        &config.final_model,
+        "antigravity",
+        &req_type,
+    );
 
     // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
     // 确保发送给 Antigravity 的请求中不包含任何 cache_control
@@ -2027,9 +2023,17 @@ fn build_generation_config(
         config["candidateCount"] = json!(1);
     }*/
 
-    // max_tokens 映射为 maxOutputTokens
+    // max_tokens 映射为 maxOutputTokens（agent 场景拦截 < 4096 的探活小上限，防止 512 泄露上游）
     // [FIX] 不再默认设置 81920，防止非思维模型 (如 claude-sonnet-4-6) 报 400 Invalid Argument
-    let mut final_max_tokens: Option<i64> = claude_req.max_tokens.map(|t| t as i64);
+    let is_agent_req = !mapped_model.to_lowercase().contains("-image");
+    let mut final_max_tokens: Option<i64> = claude_req.max_tokens.and_then(|t| {
+        crate::proxy::mappers::common_utils::resolve_agent_max_output_tokens(
+            Some(t as i64),
+            crate::proxy::model_specs::get_max_output_tokens(mapped_model, token),
+            mapped_model,
+            is_agent_req,
+        )
+    });
 
     // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
     let model_lower = mapped_model.to_lowercase();
@@ -3632,5 +3636,74 @@ mod tests {
         assert!(gc.get("temperature").is_none());
         assert!(gc.get("topP").is_none());
         assert!(gc.get("topK").is_none());
+    }
+
+    #[test]
+    fn test_claude_official_key_order_and_small_probe_max_tokens() {
+        let req = ClaudeRequest {
+            model: "gemini-3.8-flash-high".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("Hello".to_string()),
+            }],
+            system: None,
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("read_file".to_string()),
+                description: Some("Read file".to_string()),
+                input_schema: Some(json!({"type": "object"})),
+            }]),
+            stream: true,
+            max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        let out = transform_claude_request_in(&req, "proj", false, None, "sess_order", None)
+            .expect("transform must succeed");
+        let outer_keys: Vec<&str> = out
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            outer_keys,
+            vec![
+                "project",
+                "requestId",
+                "request",
+                "model",
+                "userAgent",
+                "requestType"
+            ]
+        );
+
+        let inner_keys: Vec<&str> = out["request"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            inner_keys,
+            vec![
+                "contents",
+                "systemInstruction",
+                "tools",
+                "labels",
+                "generationConfig"
+            ]
+        );
+        assert_eq!(
+            out["request"]["generationConfig"]["maxOutputTokens"],
+            json!(65536)
+        );
     }
 }

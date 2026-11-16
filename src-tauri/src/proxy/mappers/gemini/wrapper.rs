@@ -899,21 +899,14 @@ pub fn wrap_request_v2(
         reordered_inner["labels"] = official_labels;
     }
 
-    let mut final_request_obj = json!({
-        "project": project_id,
-        "request": reordered_inner,
-        "model": config.final_model,
-        "userAgent": official_user_agent,
-        // [CACHE] requestId 移到末尾避免动态值破坏前缀字节一致性
-        "requestId": official_request_id,
-        "requestType": req_type,
-    });
-
-    if req_type == "web_search" {
-        crate::proxy::mappers::common_utils::apply_web_search_envelope_overrides(
-            &mut final_request_obj,
-        );
-    }
+    let mut final_request_obj = crate::proxy::mappers::common_utils::build_v1internal_envelope(
+        project_id,
+        &official_request_id,
+        reordered_inner,
+        &config.final_model,
+        official_user_agent,
+        &req_type,
+    );
 
     if is_agent_request && enable_g1_credits {
         if let Some(obj) = final_request_obj.as_object_mut() {
@@ -2175,6 +2168,83 @@ mod tests {
         assert_eq!(
             f3_wrapped["request"]["labels"]["model_enum"],
             "MODEL_PLACEHOLDER_M18"
+        );
+    }
+
+    #[test]
+    fn test_gemini_official_outer_and_inner_key_order() {
+        let body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "Inspect" }] }],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "list_dir",
+                    "description": "List directory",
+                    "parameters": { "type": "object", "properties": {} }
+                }]
+            }],
+            "toolConfig": { "functionCallingConfig": { "mode": "AUTO" } }
+        });
+        let wrapped = wrap_request(
+            &body,
+            "test-proj",
+            "gemini-3.8-flash-high",
+            None,
+            Some("sess-order"),
+            None,
+        );
+        let outer_keys: Vec<&str> = wrapped
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            outer_keys,
+            vec![
+                "project",
+                "requestId",
+                "request",
+                "model",
+                "userAgent",
+                "requestType"
+            ]
+        );
+
+        let inner_keys: Vec<&str> = wrapped["request"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            inner_keys,
+            vec![
+                "contents",
+                "systemInstruction",
+                "tools",
+                "toolConfig",
+                "labels",
+                "generationConfig"
+            ]
+        );
+
+        let ws = wrap_request(
+            &json!({ "contents": [{ "role": "user", "parts": [{ "text": "Latest rust release" }] }] }),
+            "test-proj",
+            "gemini-2.5-flash-online",
+            None,
+            Some("sess-ws-order"),
+            None,
+        );
+        let ws_outer_keys: Vec<&str> = ws
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            ws_outer_keys,
+            vec!["project", "request", "model", "userAgent", "requestType"]
         );
     }
 }

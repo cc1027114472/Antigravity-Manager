@@ -750,15 +750,16 @@ pub fn transform_openai_request(
         }
     }
 
-    // [FIX] 移除旧的硬编码限额，改为动态查询 (v4.1.29)；官方省略默认 maxOutputTokens 的模型保持省略
-    if let Some(max_tokens) = request.max_tokens {
-        gen_config["maxOutputTokens"] = json!(max_tokens);
-    } else if !crate::proxy::mappers::common_utils::should_omit_default_max_output_tokens(
-        mapped_model,
-    ) {
-        // 使用动态优先的规格限额
-        let limit = model_specs::get_max_output_tokens(mapped_model, token);
-        gen_config["maxOutputTokens"] = json!(limit);
+    // [FIX] 对齐官方 maxOutputTokens：agent 场景拦截 < 4096 的探活小上限（如 max_tokens: 512）
+    if let Some(max_output_tokens) =
+        crate::proxy::mappers::common_utils::resolve_agent_max_output_tokens(
+            request.max_tokens.map(|m| m as i64),
+            model_specs::get_max_output_tokens(mapped_model, token),
+            mapped_model,
+            is_agent_req,
+        )
+    {
+        gen_config["maxOutputTokens"] = json!(max_output_tokens);
     }
 
     // [NEW] 非 agent 场景保留多候选数量 (web_search/image_gen)
@@ -1272,20 +1273,14 @@ pub fn transform_openai_request(
         reordered_request["labels"] = official_labels;
     }
 
-    let mut final_body = json!({
-        "project": project_id,
-        // [CACHE] 使用重排后的字段顺序，稳定前缀在前
-        "request": reordered_request,
-        "model": config.final_model,
-        "userAgent": "antigravity",
-        // [CACHE] requestId 移到末尾避免动态 message_count 破坏前缀字节一致性
-        "requestId": official_request_id,
-        "requestType": req_type,
-    });
-
-    if req_type == "web_search" {
-        crate::proxy::mappers::common_utils::apply_web_search_envelope_overrides(&mut final_body);
-    }
+    let mut final_body = crate::proxy::mappers::common_utils::build_v1internal_envelope(
+        project_id,
+        &official_request_id,
+        reordered_request,
+        &config.final_model,
+        "antigravity",
+        &req_type,
+    );
 
     // [CACHE:L3] 使用多层级缓存的 compute_prefix_hash 计算组合哈希
     // Layer 1 + Layer 2 的独立 hash 组合 → Layer 3 key
@@ -2352,5 +2347,97 @@ mod tests {
             assert_eq!(gc["maxOutputTokens"], expected_max, "[{}]", model_id);
             assert_eq!(res["request"]["labels"]["model_enum"], expected_enum, "[{}]", model_id);
         }
+    }
+
+    #[test]
+    fn test_official_envelope_key_order_and_small_probe_max_tokens_normalized() {
+        crate::proxy::config::update_thinking_budget_config(
+            crate::proxy::config::ThinkingBudgetConfig::default(),
+        );
+        let req = OpenAIRequest {
+            model: "gemini-3.8-flash-high".to_string(),
+            max_tokens: Some(512),
+            messages: vec![OpenAIMessage {
+                role: "user".to_string(),
+                refusal: None,
+                content: Some(OpenAIContent::String("Hello".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            tools: Some(vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "ping_tool",
+                    "description": "test tool",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            })]),
+            ..Default::default()
+        };
+
+        let (res, _, _, _) = transform_openai_request(&req, "proj", "gemini-3.8-flash-high", None);
+        let outer_keys: Vec<&str> = res
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            outer_keys,
+            vec![
+                "project",
+                "requestId",
+                "request",
+                "model",
+                "userAgent",
+                "requestType"
+            ]
+        );
+
+        let inner_keys: Vec<&str> = res["request"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            inner_keys,
+            vec![
+                "contents",
+                "systemInstruction",
+                "tools",
+                "labels",
+                "generationConfig"
+            ]
+        );
+        assert_eq!(
+            res["request"]["generationConfig"]["maxOutputTokens"],
+            json!(65536)
+        );
+
+        let tiered_req = OpenAIRequest {
+            model: "gemini-3.8-flash-tiered".to_string(),
+            max_tokens: Some(512),
+            messages: vec![OpenAIMessage {
+                role: "user".to_string(),
+                refusal: None,
+                content: Some(OpenAIContent::String("Hello".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            ..Default::default()
+        };
+        let (tiered_res, _, _, _) =
+            transform_openai_request(&tiered_req, "proj", "gemini-3.8-flash-tiered", None);
+        assert!(
+            tiered_res["request"]["generationConfig"]
+                .get("maxOutputTokens")
+                .is_none(),
+            "gemini-3.8-flash-tiered small probe max_tokens must omit maxOutputTokens"
+        );
     }
 }

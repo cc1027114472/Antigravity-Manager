@@ -214,15 +214,123 @@ pub fn ensure_paired_tool_call_ids(contents: &mut [Value], log_prefix: &str) {
 /// to match official Antigravity captures (`generationConfig: {"candidateCount": 1}`,
 /// and no `sessionId`, `labels`, `toolConfig`, or outer `requestId`).
 pub fn apply_web_search_envelope_overrides(outer_body: &mut Value) {
-    if let Some(inner_obj) = outer_body.get_mut("request").and_then(|v| v.as_object_mut()) {
-        inner_obj.insert("generationConfig".to_string(), json!({ "candidateCount": 1 }));
-        inner_obj.remove("sessionId");
-        inner_obj.remove("labels");
-        inner_obj.remove("toolConfig");
+    if let Some(inner) = outer_body.get_mut("request") {
+        if let Some(inner_obj) = inner.as_object_mut() {
+            inner_obj.insert("generationConfig".to_string(), json!({ "candidateCount": 1 }));
+            inner_obj.remove("sessionId");
+            inner_obj.remove("labels");
+            inner_obj.remove("toolConfig");
+        }
+        reorder_inner_request_official(inner);
     }
     if let Some(outer_obj) = outer_body.as_object_mut() {
-        outer_obj.remove("requestId");
+        // Avoid Map::remove (= IndexMap::swap_remove) scrambling relative key order
+        let old = std::mem::take(outer_obj);
+        for (k, v) in old {
+            if k != "requestId" {
+                outer_obj.insert(k, v);
+            }
+        }
     }
+}
+
+/// Minimum `maxOutputTokens` allowed on normal OpenAI/Claude `agent` calls before
+/// normalizing small probe caps (`512`, `1024`, etc.) to official model defaults.
+pub const MIN_AGENT_MAX_OUTPUT_TOKENS: i64 = 4096;
+
+/// Normalize small client-provided `max_tokens` on `agent` calls so health-check
+/// / probe caps (`max_tokens: 512`) do not leak upstream as bot fingerprints or
+/// starve `thinkingLevel` reasoning before emitting text.
+pub fn resolve_agent_max_output_tokens(
+    raw_max_tokens: Option<i64>,
+    default_max_output_tokens: u64,
+    mapped_model: &str,
+    is_agent_req: bool,
+) -> Option<i64> {
+    match raw_max_tokens {
+        Some(max_tokens) => {
+            if is_agent_req && max_tokens > 0 && max_tokens < MIN_AGENT_MAX_OUTPUT_TOKENS {
+                if should_omit_default_max_output_tokens(mapped_model) {
+                    None
+                } else {
+                    Some(default_max_output_tokens as i64)
+                }
+            } else {
+                Some(max_tokens)
+            }
+        }
+        None => {
+            if !is_agent_req || should_omit_default_max_output_tokens(mapped_model) {
+                None
+            } else {
+                Some(default_max_output_tokens as i64)
+            }
+        }
+    }
+}
+
+/// Reorder inner `v1internal` `request` object keys in place to match official Antigravity captures
+/// (`contents -> systemInstruction -> tools -> toolConfig -> labels -> generationConfig -> sessionId`,
+/// followed by any remaining keys such as `metadata` or `cachedContent`).
+pub fn reorder_inner_request_official(inner: &mut Value) {
+    let Some(old_obj) = inner.as_object_mut() else {
+        return;
+    };
+    let old = std::mem::take(old_obj);
+    let mut ordered = serde_json::Map::with_capacity(old.len());
+    const OFFICIAL_ORDER: &[&str] = &[
+        "contents",
+        "systemInstruction",
+        "tools",
+        "toolConfig",
+        "labels",
+        "generationConfig",
+        "sessionId",
+    ];
+    let mut slots: [Option<Value>; OFFICIAL_ORDER.len()] = Default::default();
+    let mut extras: Vec<(String, Value)> = Vec::new();
+    for (k, v) in old {
+        if let Some(pos) = OFFICIAL_ORDER.iter().position(|&target| target == k.as_str()) {
+            slots[pos] = Some(v);
+        } else {
+            extras.push((k, v));
+        }
+    }
+    for (idx, val_opt) in slots.into_iter().enumerate() {
+        if let Some(val) = val_opt {
+            ordered.insert(OFFICIAL_ORDER[idx].to_string(), val);
+        }
+    }
+    for (k, v) in extras {
+        ordered.insert(k, v);
+    }
+    *old_obj = ordered;
+}
+
+/// Construct the outer `v1internal` envelope in official capture field order
+/// (`project -> requestId -> request -> model -> userAgent -> requestType`)
+/// with officially ordered inner `request` keys (`web_search` omits `requestId` etc.).
+pub fn build_v1internal_envelope(
+    project: &str,
+    request_id: &str,
+    mut request: Value,
+    model: &str,
+    user_agent: &str,
+    request_type: &str,
+) -> Value {
+    reorder_inner_request_official(&mut request);
+    let mut outer = json!({
+        "project": project,
+        "requestId": request_id,
+        "request": request,
+        "model": model,
+        "userAgent": user_agent,
+        "requestType": request_type,
+    });
+    if request_type == "web_search" {
+        apply_web_search_envelope_overrides(&mut outer);
+    }
+    outer
 }
 
 /// Request configuration after grounding resolution
