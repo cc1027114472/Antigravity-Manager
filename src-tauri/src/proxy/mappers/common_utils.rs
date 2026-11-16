@@ -307,6 +307,113 @@ pub fn reorder_inner_request_official(inner: &mut Value) {
     *old_obj = ordered;
 }
 
+const DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK: &str = concat!(
+    "<tool_availability>\n",
+    "Direct conversational mode: no interactive workspace or external tool execution runtime is attached to this turn. ",
+    "Answer the user's request directly in text and do not invoke any declared tools or functions.\n",
+    "</tool_availability>"
+);
+
+/// Official 14-tool Antigravity IDE schema captured verbatim from `v1internal` `agent` traffic (`3,024/3,024` captures).
+pub fn official_default_agent_tools() -> &'static Value {
+    static DEFAULT_TOOLS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    DEFAULT_TOOLS.get_or_init(|| {
+        serde_json::from_str(include_str!("official_fallback_tools.json"))
+            .expect("official_fallback_tools.json must be valid JSON")
+    })
+}
+
+fn append_direct_chat_tool_availability(inner: &mut Value) {
+    let Some(obj) = inner.as_object_mut() else {
+        return;
+    };
+    let si = obj
+        .entry("systemInstruction".to_string())
+        .or_insert_with(|| json!({ "role": "user", "parts": [] }));
+    let Some(si_obj) = si.as_object_mut() else {
+        return;
+    };
+    si_obj
+        .entry("role".to_string())
+        .or_insert_with(|| json!("user"));
+    let parts = si_obj
+        .entry("parts".to_string())
+        .or_insert_with(|| json!([]));
+    let Some(parts_arr) = parts.as_array_mut() else {
+        return;
+    };
+
+    if parts_arr.iter().any(|p| {
+        p.get("text")
+            .and_then(Value::as_str)
+            .map_or(false, |t| t.contains("<tool_availability>"))
+    }) {
+        return;
+    }
+
+    if let Some(first_text_val) = parts_arr.iter_mut().find_map(|p| p.get_mut("text")) {
+        if let Some(existing) = first_text_val.as_str() {
+            let updated = if let Some(idx) = existing.find("</identity>") {
+                let split = idx + "</identity>".len();
+                let (head, tail) = existing.split_at(split);
+                if tail.trim().is_empty() {
+                    format!("{}\n\n{}{}", head.trim_end(), DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK, tail)
+                } else {
+                    format!(
+                        "{}\n\n{}\n\n{}",
+                        head.trim_end(),
+                        DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK,
+                        tail.trim_start_matches('\n')
+                    )
+                }
+            } else if existing.trim().is_empty() {
+                DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK.to_string()
+            } else {
+                format!("{}\n\n{}", DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK, existing)
+            };
+            *first_text_val = json!(updated);
+            return;
+        }
+    }
+
+    parts_arr.push(json!({ "text": DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK }));
+}
+
+/// Inject official Antigravity IDE default `tools` when an `agent` request arrives without any client tools
+/// (`3,024/3,024` official `agent` captures carry `tools`), plus `<tool_availability>` to keep direct text replies.
+pub fn inject_fallback_agent_tools_if_missing(
+    inner: &mut Value,
+    request_type: &str,
+    model: &str,
+) -> bool {
+    if request_type != "agent" || model.eq_ignore_ascii_case("loadCodeAssist") {
+        return false;
+    }
+    let Some(obj) = inner.as_object_mut() else {
+        return false;
+    };
+    if obj.get("metadata").is_some() {
+        return false;
+    }
+    if obj
+        .get("generationConfig")
+        .and_then(|g| g.get("imageConfig"))
+        .is_some()
+    {
+        return false;
+    }
+    let tools_missing = obj
+        .get("tools")
+        .and_then(Value::as_array)
+        .map_or(true, |arr| arr.is_empty());
+    if !tools_missing {
+        return false;
+    }
+    obj.insert("tools".to_string(), official_default_agent_tools().clone());
+    append_direct_chat_tool_availability(inner);
+    true
+}
+
 /// Construct the outer `v1internal` envelope in official capture field order
 /// (`project -> requestId -> request -> model -> userAgent -> requestType`)
 /// with officially ordered inner `request` keys (`web_search` omits `requestId` etc.).
@@ -318,6 +425,7 @@ pub fn build_v1internal_envelope(
     user_agent: &str,
     request_type: &str,
 ) -> Value {
+    inject_fallback_agent_tools_if_missing(&mut request, request_type, model);
     reorder_inner_request_official(&mut request);
     let mut outer = json!({
         "project": project,

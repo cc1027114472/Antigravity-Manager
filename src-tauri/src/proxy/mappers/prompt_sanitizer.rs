@@ -1627,8 +1627,13 @@ mod tests {
         let bare_si = wrapped_bare["request"]["systemInstruction"]["parts"][0]["text"]
             .as_str()
             .unwrap();
-        assert_eq!(bare_si, fallback);
+        assert!(bare_si.starts_with(fallback));
+        assert!(bare_si.contains("<tool_availability>"));
         assert!(!bare_si.contains("<identity>\n\n</identity>"));
+        assert_eq!(
+            wrapped_bare["request"]["tools"].as_array().unwrap().len(),
+            14
+        );
 
         // 2. Duplicate wrapped identity or bare SELF_IDENTITY_BLOCK mixed into prompt gets deduplicated, keeping canonical header intact
         let mixed = format!("{fallback}\n\n{fallback}\n\n{SELF_IDENTITY_BLOCK}\n\nRule 1: stay accurate.");
@@ -1663,11 +1668,14 @@ mod tests {
         let agent_si = wrapped_agent["request"]["systemInstruction"]["parts"][0]["text"]
             .as_str()
             .unwrap();
-        assert_eq!(
-            agent_si,
-            format!("{fallback}\n\n## Progress\n- Keep concise.")
-        );
+        assert!(agent_si.starts_with(fallback));
+        assert!(agent_si.contains("<tool_availability>"));
+        assert!(agent_si.ends_with("## Progress\n- Keep concise."));
         assert!(!agent_si.contains("<identity>\n\n</identity>"));
         assert!(!agent_si.to_lowercase().contains("deepseek harness"));
+        assert_eq!(
+            wrapped_agent["request"]["tools"].as_array().unwrap().len(),
+            14
+        );
     }
 }

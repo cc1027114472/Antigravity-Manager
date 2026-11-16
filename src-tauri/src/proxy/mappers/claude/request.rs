@@ -3705,5 +3705,60 @@ mod tests {
             out["request"]["generationConfig"]["maxOutputTokens"],
             json!(65536)
         );
+        assert!(
+            !out["request"]["systemInstruction"]["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("<tool_availability>")
+        );
+
+        let no_tools_req = ClaudeRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("Hello".to_string()),
+            }],
+            system: None,
+            tools: None,
+            stream: true,
+            max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+        let no_tools_out =
+            transform_claude_request_in(&no_tools_req, "proj", false, None, "sess_fb", None)
+                .expect("transform without tools must succeed");
+        assert_eq!(
+            no_tools_out["request"]["tools"].as_array().unwrap().len(),
+            14
+        );
+        assert!(
+            no_tools_out["request"]["systemInstruction"]["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("<tool_availability>")
+        );
+        let no_tools_inner_keys: Vec<&str> = no_tools_out["request"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            no_tools_inner_keys,
+            vec![
+                "contents",
+                "systemInstruction",
+                "tools",
+                "labels",
+                "generationConfig"
+            ]
+        );
     }
 }

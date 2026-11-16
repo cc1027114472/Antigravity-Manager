@@ -2246,5 +2246,38 @@ mod tests {
             ws_outer_keys,
             vec!["project", "request", "model", "userAgent", "requestType"]
         );
+        assert_eq!(ws["request"]["tools"].as_array().unwrap().len(), 1);
+        assert!(ws["request"]["tools"][0].get("googleSearch").is_some());
+
+        // Bare Gemini agent request without tools gets 14 official default tools + <tool_availability>
+        let bare = wrap_request(
+            &json!({ "contents": [{ "role": "user", "parts": [{ "text": "Explain HTTP keepalive" }] }] }),
+            "test-proj",
+            "gemini-3.8-flash-high",
+            None,
+            Some("sess-bare-tools"),
+            None,
+        );
+        assert_eq!(bare["request"]["tools"].as_array().unwrap().len(), 14);
+        assert!(bare["request"]["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<tool_availability>"));
+        let bare_keys: Vec<&str> = bare["request"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            bare_keys,
+            vec![
+                "contents",
+                "systemInstruction",
+                "tools",
+                "labels",
+                "generationConfig"
+            ]
+        );
     }
 }
