@@ -464,9 +464,22 @@ async fn exchange_code_once(
         crate::constants::NATIVE_OAUTH_USER_AGENT.as_str()
     );
 
-    let response = client
-        .post(TOKEN_URL)
-        .header(rquest::header::USER_AGENT, crate::constants::NATIVE_OAUTH_USER_AGENT.as_str())
+    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+        &client,
+        TOKEN_URL,
+        None,
+        "h2",
+        false,
+        Some(60_000),
+    )
+    .await
+    .map_err(|e| (None, e))?;
+
+    let response = rb
+        .header(
+            rquest::header::USER_AGENT,
+            crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
+        )
         .form(&params)
         .send()
         .await

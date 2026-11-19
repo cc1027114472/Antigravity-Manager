@@ -1162,13 +1162,24 @@ async fn try_compress_gemini_with_summary(
         ));
     }
 
-    let upstream_url = format!(
-        "https://daily-cloudcode-pa.googleapis.com/v1internal/projects/{}/locations/global/models/{}:generateContent",
-        project_id, INTERNAL_BACKGROUND_TASK
-    );
+    let _ = project_id; // project_id is already embedded in wrapped_summary_body
+    let upstream_url = "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
 
-    let response = client
-        .post(&upstream_url)
+    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+        &client,
+        upstream_url,
+        Some(account_id),
+        "h1",
+        false,
+        Some(60_000),
+    )
+    .await?;
+
+    let response = rb
+        .header(
+            "User-Agent",
+            crate::constants::get_account_user_agent(Some(account_id)),
+        )
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
         .json(&wrapped_summary_body)
@@ -1198,7 +1209,8 @@ async fn try_compress_gemini_with_summary(
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-    let xml_summary = gemini_response
+    let payload = gemini_response.get("response").unwrap_or(&gemini_response);
+    let xml_summary = payload
         .get("candidates")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("content"))

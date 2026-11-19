@@ -75,7 +75,6 @@ func buildTransport(proxyURL *url.URL, proto string) *http.Transport {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   20 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression:    true,
 	}
 	if proto == "h2" {
 		// Native Go HTTP/2 (matches Go-http-client/2.0 against oauth2.googleapis.com)
@@ -197,7 +196,7 @@ func newRelayHandler(pool *transportPool) http.Handler {
 		}
 
 		for k, vals := range r.Header {
-			if isInternalHeader(k) || isHopByHopHeader(k) {
+			if isInternalHeader(k) || isHopByHopHeader(k) || strings.EqualFold(k, "accept-encoding") {
 				continue
 			}
 			for _, v := range vals {

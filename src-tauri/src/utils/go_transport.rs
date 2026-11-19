@@ -274,3 +274,52 @@ pub async fn get_with_sidecar_or_fallback(
         Ok((fallback_client.get(target_url), None, false))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_loopback_client_emits_no_unexpected_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+            raw
+        });
+
+        let relay = format!("http://{}/relay", addr);
+        let rb = prepare_relay_request(
+            loopback_client().post(&relay),
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent",
+            "http://127.0.0.1:8888",
+            "h1",
+            false,
+            Some(60_000),
+            Some(1),
+        )
+        .header("User-Agent", "antigravity/hub/2.31.0 (aidev_client; os_type=windows; arch=amd64; cl=1017595969)")
+        .header("Authorization", "Bearer test-token")
+        .header("Content-Type", "application/json")
+        .body(r#"{"model":"gemini-2.5-flash"}"#);
+
+        let resp = rb.send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let raw = server.await.unwrap();
+        let headers_section = raw.split("\r\n\r\n").next().unwrap_or("");
+        let lower = headers_section.to_ascii_lowercase();
+        assert!(!lower.contains("\naccept:"), "unexpected Accept header emitted: {}", headers_section);
+        assert!(!lower.contains("\ncookie:"), "unexpected Cookie header emitted: {}", headers_section);
+        assert!(!lower.contains("\nsec-"), "unexpected Sec-* browser header emitted: {}", headers_section);
+    }
+}

@@ -5881,15 +5881,28 @@ async fn call_openai_gemini_sync(
         ));
     }
 
-    let upstream_url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-        model
+    let upstream_url = "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
+
+    debug!(
+        "[{}] [OpenAI-BG] Calling Gemini API via Go sidecar/proxy ({:?}): {}",
+        trace_id, route, model
     );
 
-    debug!("[{}] [OpenAI-BG] Calling Gemini API via proxy ({:?}): {}", trace_id, route, model);
+    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+        &client,
+        upstream_url,
+        Some(account_id.as_str()),
+        "h1",
+        false,
+        Some(60_000),
+    )
+    .await?;
 
-    let response = client
-        .post(&upstream_url)
+    let response = rb
+        .header(
+            "User-Agent",
+            crate::constants::get_account_user_agent(Some(&account_id)),
+        )
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
         .json(&gemini_body)
@@ -5919,7 +5932,8 @@ async fn call_openai_gemini_sync(
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-    gemini_response
+    let payload = gemini_response.get("response").unwrap_or(&gemini_response);
+    payload
         .get("candidates")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("content"))
