@@ -5299,14 +5299,16 @@ impl TokenManager {
                             tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
                             self.rate_limit_tracker.cleanup_expired();
 
+                            let cb_enabled = self.circuit_breaker_config.read().await.enabled;
                             // 重新尝试选择账号
                             let retry_token = tokens_snapshot.iter().find(|t| {
                                 !attempted.contains(&t.account_id)
                                     && !self.pacer.is_in_nap(&t.account_id)
-                                    && !self.is_rate_limited_sync(
-                                        &t.account_id,
-                                        Some(&normalized_target),
-                                    )
+                                    && !(cb_enabled
+                                        && self.rate_limit_tracker.is_rate_limited(
+                                            &t.account_id,
+                                            Some(&normalized_target),
+                                        ))
                                     && !(quota_protection_enabled
                                         && Self::is_model_quota_protected(&t.protected_models, target_model))
                             });
@@ -5478,12 +5480,15 @@ impl TokenManager {
 
     /// 保存 project_id 到账号文件
     async fn save_project_id(&self, account_id: &str, project_id: &str) -> Result<(), String> {
-        let entry = self.tokens.get(account_id).ok_or("账号不存在")?;
-
-        let path = &entry.account_path;
+        let path = self
+            .tokens
+            .get(account_id)
+            .ok_or("账号不存在")?
+            .account_path
+            .clone();
 
         let mut content: serde_json::Value = serde_json::from_str(
-            &tokio::fs::read_to_string(path)
+            &tokio::fs::read_to_string(&path)
                 .await
                 .map_err(|e| format!("读取文件失败: {}", e))?,
         )
@@ -5491,7 +5496,7 @@ impl TokenManager {
 
         content["token"]["project_id"] = serde_json::Value::String(project_id.to_string());
 
-        tokio::fs::write(path, serde_json::to_string_pretty(&content).unwrap())
+        tokio::fs::write(&path, serde_json::to_string_pretty(&content).unwrap())
             .await
             .map_err(|e| format!("写入文件失败: {}", e))?;
 
@@ -5505,12 +5510,17 @@ impl TokenManager {
         account_id: &str,
         token_response: &crate::modules::oauth::TokenResponse,
     ) -> Result<(), String> {
-        let entry = self.tokens.get(account_id).ok_or("账号不存在")?;
-
-        let path = &entry.account_path;
+        let path = self
+            .tokens
+            .get(account_id)
+            .ok_or("账号不存在")?
+            .account_path
+            .clone();
 
         let mut content: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(path).map_err(|e| format!("读取文件失败: {}", e))?,
+            &tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|e| format!("读取文件失败: {}", e))?,
         )
         .map_err(|e| format!("解析 JSON 失败: {}", e))?;
 
@@ -5541,7 +5551,8 @@ impl TokenManager {
             }
         }
 
-        std::fs::write(path, serde_json::to_string_pretty(&content).unwrap())
+        tokio::fs::write(&path, serde_json::to_string_pretty(&content).unwrap())
+            .await
             .map_err(|e| format!("写入文件失败: {}", e))?;
 
         tracing::debug!("已保存刷新后的 token 到账号 {}", account_id);
@@ -5666,11 +5677,14 @@ impl TokenManager {
         self.rate_limit_tracker.is_rate_limited(account_id, model)
     }
 
-    /// [NEW] 检查账号是否在限流中 (同步版本，仅用于 Iterator)
+    /// [NEW] 检查账号是否在限流中 (同步版本，禁止在 Tokio 运行时内调用阻塞锁)
     pub fn is_rate_limited_sync(&self, account_id: &str, model: Option<&str>) -> bool {
-        // 同步版本无法读取 async RwLock，这里使用 blocking_read
-        let config = self.circuit_breaker_config.blocking_read();
-        if !config.enabled {
+        let enabled = self
+            .circuit_breaker_config
+            .try_read()
+            .map(|c| c.enabled)
+            .unwrap_or(true);
+        if !enabled {
             return false;
         }
         self.rate_limit_tracker.is_rate_limited(account_id, model)
@@ -5757,9 +5771,10 @@ impl TokenManager {
             .map(|cfg| cfg.quota_protection.enabled)
             .unwrap_or(false);
 
-        // 遍历所有账号,检查是否有可用的
-        for entry in self.tokens.iter() {
-            let token = entry.value();
+        // 遍历所有账号,检查是否有可用的（先克隆快照，避免跨 .await 持有 DashMap 读锁）
+        let tokens_snapshot: Vec<ProxyToken> =
+            self.tokens.iter().map(|e| e.value().clone()).collect();
+        for token in &tokens_snapshot {
 
             // 1. 检查是否被限流
             if self.is_rate_limited(&token.account_id, None).await {
