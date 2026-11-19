@@ -1151,6 +1151,7 @@ async fn try_compress_gemini_with_summary(
     if let Some(inner) = wrapped_summary_body.get_mut("request") {
         crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(inner);
         crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(inner);
+        crate::proxy::mappers::common_utils::reorder_inner_request_official(inner);
     }
 
     let pool = crate::proxy::proxy_pool::get_global_proxy_pool()
@@ -1168,17 +1169,19 @@ async fn try_compress_gemini_with_summary(
     }
 
     let _ = project_id; // project_id is already embedded in wrapped_summary_body
-    let upstream_url = "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
+    let upstream_url =
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 
-    let (rb, go_egress, via_go) = crate::utils::go_transport::post_with_sidecar_or_fallback(
-        &client,
-        upstream_url,
-        Some(account_id),
-        "h1",
-        false,
-        Some(60_000),
-    )
-    .await?;
+    let (rb, go_egress, via_go) =
+        crate::utils::go_transport::post_with_sidecar_header_timeout(
+            &client,
+            upstream_url,
+            Some(account_id),
+            "h1",
+            true,
+            Some(60_000),
+        )
+        .await?;
 
     let fallback_pid = match &route {
         crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
@@ -1208,13 +1211,13 @@ async fn try_compress_gemini_with_summary(
         ));
     }
 
-    let gemini_response: Value = response
-        .json()
+    let raw_sse = response
+        .text()
         .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+        .map_err(|e| format!("Failed to read SSE response: {}", e))?;
 
     let xml_summary =
-        crate::proxy::mappers::common_utils::extract_v1internal_primary_text(&gemini_response)
+        crate::proxy::mappers::common_utils::extract_v1internal_sse_text(&raw_sse)
             .ok_or_else(|| "Failed to extract text from response".to_string())?;
 
     info!(

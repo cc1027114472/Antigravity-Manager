@@ -2196,58 +2196,41 @@ pub async fn fetch_quota_with_retry_opts(
     if token.access_token != account.token.access_token {
         modules::logger::log_info(&format!("Time-based Token refresh: {}", account.email));
         account.token = token.clone();
-
-        // Get display name (incidental to Token refresh)
-        let name = if account.name.is_none()
-            || account.name.as_ref().map_or(false, |n| n.trim().is_empty())
-        {
-            match oauth::get_user_info(&token.access_token, Some(&account.id)).await {
-                Ok(user_info) => user_info.get_display_name(),
-                Err(_) => None,
-            }
-        } else {
-            account.name.clone()
-        };
-
-        account.name = name.clone();
-        upsert_account(account.email.clone(), name, token.clone()).map_err(AppError::Account)?;
+        upsert_account(account.email.clone(), account.name.clone(), token.clone())
+            .map_err(AppError::Account)?;
     }
 
-    // 0. Supplement display name (if missing or upper step failed)
-    if account.name.is_none() || account.name.as_ref().map_or(false, |n| n.trim().is_empty()) {
-        modules::logger::log_info(&format!(
-            "Account {} missing display name, attempting to fetch...",
-            account.email
-        ));
-        // Use updated token
-        match oauth::get_user_info(&account.token.access_token, Some(&account.id)).await {
-            Ok(user_info) => {
-                let display_name = user_info.get_display_name();
-                modules::logger::log_info(&format!(
-                    "Successfully fetched display name: {:?}",
-                    display_name
-                ));
-                account.name = display_name.clone();
-                // Save immediately
-                if let Err(e) =
-                    upsert_account(account.email.clone(), display_name, account.token.clone())
-                {
-                    modules::logger::log_warn(&format!("Failed to save display name: {}", e));
-                }
-            }
-            Err(e) => {
-                modules::logger::log_warn(&format!("Failed to fetch display name: {}", e));
-            }
+    // 2. Attempt query (reuse cached project_id + subscription_tier to skip redundant loadCodeAssist calls)
+    let existing_tier = account
+        .quota
+        .as_ref()
+        .and_then(|q| q.subscription_tier.clone())
+        .filter(|s| !s.trim().is_empty());
+    let cached_pid: Option<String> = if existing_tier.is_some() {
+        account
+            .token
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    let mut result: crate::error::AppResult<(QuotaData, Option<String>)> =
+        modules::quota::fetch_quota_with_cache(
+            &account.token.access_token,
+            &account.email,
+            cached_pid.as_deref(),
+            Some(&account.id),
+        )
+        .await;
+    if let Ok((ref mut q, _)) = result {
+        if q.subscription_tier.is_none() && existing_tier.is_some() {
+            q.subscription_tier = existing_tier.clone();
         }
     }
-
-    // 2. Attempt query
-    let result: crate::error::AppResult<(QuotaData, Option<String>)> = modules::fetch_quota(
-        &account.token.access_token,
-        &account.email,
-        Some(&account.id),
-    )
-    .await;
 
     // Capture potentially updated project_id and save
     if let Ok((ref _q, ref project_id)) = result {
@@ -2318,31 +2301,28 @@ pub async fn fetch_quota_with_retry_opts(
                         .or_else(|| account.token.oauth_client_key.clone()),
                 );
 
-                // Re-fetch display name
-                let name = if account.name.is_none()
-                    || account.name.as_ref().map_or(false, |n| n.trim().is_empty())
-                {
-                    match oauth::get_user_info(&token_res.access_token, Some(&account.id)).await {
-                        Ok(user_info) => user_info.get_display_name(),
-                        Err(_) => None,
-                    }
-                } else {
-                    account.name.clone()
-                };
-
                 account.token = new_token.clone();
-                account.name = name.clone();
-                upsert_account(account.email.clone(), name, new_token.clone())
-                    .map_err(AppError::Account)?;
+                upsert_account(
+                    account.email.clone(),
+                    account.name.clone(),
+                    new_token.clone(),
+                )
+                .map_err(AppError::Account)?;
 
-                // Retry query
-                let retry_result: crate::error::AppResult<(QuotaData, Option<String>)> =
-                    modules::fetch_quota(
+                // Retry query (reuse cached project_id + subscription_tier when available)
+                let mut retry_result: crate::error::AppResult<(QuotaData, Option<String>)> =
+                    modules::quota::fetch_quota_with_cache(
                         &new_token.access_token,
                         &account.email,
+                        cached_pid.as_deref(),
                         Some(&account.id),
                     )
                     .await;
+                if let Ok((ref mut q, _)) = retry_result {
+                    if q.subscription_tier.is_none() && existing_tier.is_some() {
+                        q.subscription_tier = existing_tier.clone();
+                    }
+                }
 
                 // Also handle project_id saving during retry
                 if let Ok((ref _q, ref project_id)) = retry_result {

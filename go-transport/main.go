@@ -36,6 +36,8 @@ const (
 type transportEntry struct {
 	client       *http.Client
 	transport    *http.Transport
+	accountID    string
+	proxyKey     string
 	evictGen     string
 	lastUsedUnix atomic.Int64
 }
@@ -114,7 +116,8 @@ func (p *transportPool) getClient(proxyRaw, proto, accountID, evictGen string) (
 		return &http.Client{Transport: tr}, tr.CloseIdleConnections, nil
 	}
 
-	key := proto + "|" + accountID + "|" + proxyURL.String()
+	proxyKey := proxyURL.String()
+	key := proto + "|" + accountID + "|" + proxyKey
 	now := time.Now().Unix()
 
 	p.mu.RLock()
@@ -135,6 +138,15 @@ func (p *transportPool) getClient(proxyRaw, proto, accountID, evictGen string) (
 		ent.transport.CloseIdleConnections()
 	}
 
+	// If this account switched to a different proxy URL, immediately close & evict all old proxy transports
+	// for this account (across both h1 and h2) so the same account never holds lingering TLS sockets on 2 IPs.
+	for k, ent := range p.entries {
+		if ent.accountID == accountID && ent.proxyKey != proxyKey {
+			ent.transport.CloseIdleConnections()
+			delete(p.entries, k)
+		}
+	}
+
 	if len(p.entries) >= maxTransportPoolEntries {
 		for k, ent := range p.entries {
 			if now-ent.lastUsedUnix.Load() > transportIdleEvictSecs {
@@ -151,6 +163,8 @@ func (p *transportPool) getClient(proxyRaw, proto, accountID, evictGen string) (
 	entry := &transportEntry{
 		client:    client,
 		transport: tr,
+		accountID: accountID,
+		proxyKey:  proxyKey,
 		evictGen:  evictGen,
 	}
 	entry.lastUsedUnix.Store(now)

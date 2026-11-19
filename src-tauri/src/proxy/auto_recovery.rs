@@ -169,7 +169,13 @@ impl AutoRecoveryScheduler {
                         let now = chrono::Utc::now().timestamp();
                         let is_expired = now >= (account.token.expiry_timestamp - 300);
                         let tok = if is_expired {
-                            if let Ok(token_resp) = crate::modules::oauth::refresh_access_token(&account.token.refresh_token, Some(account_id)).await {
+                            if let Ok(token_resp) = crate::modules::oauth::refresh_access_token_with_client(
+                                &account.token.refresh_token,
+                                Some(account_id),
+                                account.token.oauth_client_key.as_deref(),
+                            )
+                            .await
+                            {
                                 account.token.access_token = token_resp.access_token.clone();
                                 account.token.expires_in = token_resp.expires_in;
                                 account.token.expiry_timestamp = now + token_resp.expires_in;

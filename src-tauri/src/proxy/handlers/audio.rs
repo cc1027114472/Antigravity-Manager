@@ -114,24 +114,24 @@ pub async fn handle_audio_transcription(
         "sessionId": session_id,
     });
 
-    // 7. 包装请求为 v1internal 格式
-    let wrapped_body = json!({
-        "project": project_id,
-        "requestId": request_id,
-        "request": gemini_request,
-        "model": model,
-        "userAgent": "antigravity",
-        "requestType": "agent",
-    });
+    // 7. 包装请求为标准官方 v1internal 信封（含官方字段顺序与 fallback tools）
+    let wrapped_body = crate::proxy::mappers::common_utils::build_v1internal_envelope(
+        &project_id,
+        &request_id,
+        gemini_request,
+        &model,
+        "antigravity",
+        "agent",
+    );
 
-    // 8. 发送请求到 Gemini
+    // 8. 发送请求到 Gemini（对齐官方抓包：requestType="agent" 一律走 streamGenerateContent?alt=sse）
     let upstream = state.upstream.clone();
     let response = upstream
         .call_v1_internal(
-            "generateContent",
+            "streamGenerateContent",
             &access_token,
             wrapped_body,
-            None,
+            Some("alt=sse"),
             Some(account_id.as_str()),
         )
         .await
@@ -149,22 +149,14 @@ pub async fn handle_audio_transcription(
         ));
     }
 
-    let result: Value = response
-        .json()
+    let raw_body = response
+        .text()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("解析响应失败: {}", e)))?;
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("读取响应失败: {}", e)))?;
 
-    // 9. 提取文本响应（解包 v1internal 响应）
-    let inner_response = result.get("response").unwrap_or(&result);
-    let text = inner_response
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.get(0))
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    // 9. 聚合 SSE 非思考正文响应
+    let text = crate::proxy::mappers::common_utils::extract_v1internal_sse_text(&raw_body)
+        .unwrap_or_default();
 
     info!("音频转录完成，返回 {} 字符", text.len());
 

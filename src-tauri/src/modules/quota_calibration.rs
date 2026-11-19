@@ -19,19 +19,32 @@ pub async fn run_staggered_calibration() -> Result<crate::modules::account::Refr
     let now = chrono::Utc::now().timestamp();
 
     for mut account in accounts {
-        if let Some(ref q) = account.quota {
-            if q.is_forbidden {
-                continue;
-            }
+        // 严格跳过已禁用 / 关闭反代 / 403 硬封锁账号
+        if account.disabled || account.proxy_disabled || account.is_hard_forbidden() {
+            continue;
         }
-        let last_calibrated = account
+        // 严禁唤醒完全没有本地消耗账本记录的冷置储备号主动刷配额/刷 OAuth
+        if account.estimated_quotas.is_empty() {
+            tracing::debug!(
+                "[QuotaCalibration] Account {} has no local ledger usage yet (idle reserve), skipping",
+                account.email
+            );
+            continue;
+        }
+        let last_est_calibrated = account
             .estimated_quotas
             .values()
             .filter_map(|e| e.last_calibrated_at)
             .max()
             .unwrap_or(0);
+        let last_quota_updated = account
+            .quota
+            .as_ref()
+            .map(|q| q.last_updated)
+            .unwrap_or(0);
+        let last_calibrated = last_est_calibrated.max(last_quota_updated);
 
-        // 如果距离上次在线校准不到 10 小时，无需重复刷新
+        // 如果距离上次在线校准/配额更新不到 10 小时，无需重复刷新
         if now - last_calibrated < 10 * 3600 && last_calibrated > 0 {
             tracing::debug!(
                 "[QuotaCalibration] Account {} was calibrated {}s ago, skipping",
@@ -79,8 +92,8 @@ pub async fn run_staggered_calibration() -> Result<crate::modules::account::Refr
 pub fn start_quota_calibration_ticker() {
     let fut = async move {
         info!("[QuotaCalibration] Low-frequency staggered calibration ticker started");
-        // 启动后先休眠 60 秒，避免应用刚启动时网络阻塞
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        // 启动后先休眠 5 分钟 (300s)，错开重启后的冷启动缓冲与后台预热窗口
+        tokio::time::sleep(Duration::from_secs(300)).await;
 
         loop {
             let (enabled, interval_min) = match crate::modules::config::load_app_config() {

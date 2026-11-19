@@ -13,24 +13,63 @@ impl AccountService {
 
     /// 添加账号逻辑
     pub async fn add_account(&self, refresh_token: &str) -> Result<Account, String> {
-        // [FIX #1583] 生成临时 UUID 作为账号上下文，避免传递 None 导致代理选择异常
-        let temp_account_id = uuid::Uuid::new_v4().to_string();
+        self.add_account_with_options(refresh_token, None, false)
+            .await
+    }
 
-        // 1. 获取 Token (使用临时 ID 确保代理选择有明确上下文)
-        let token_res =
-            modules::oauth::refresh_access_token(refresh_token, Some(&temp_account_id)).await?;
+    /// 添加账号逻辑（支持在首次 OAuth/Project 探测阶段就使用指定的专属代理，防止新号先用随机 IP 再切专属 IP 触发跨 IP 风控）
+    pub async fn add_account_with_options(
+        &self,
+        refresh_token: &str,
+        preferred_proxy_id: Option<&str>,
+        skip_initial_quota: bool,
+    ) -> Result<Account, String> {
+        // 仅在指定了专属代理时创建临时绑定 ID，否则传 None 让 Go Sidecar 走一次性匿名短连接（不留孤儿连接池条目）
+        let temp_bound_id = if let (Some(pid), Some(pool)) = (
+            preferred_proxy_id.map(str::trim).filter(|s| !s.is_empty()),
+            crate::proxy::proxy_pool::get_global_proxy_pool(),
+        ) {
+            let tid = format!("tmp_import_{}", uuid::Uuid::new_v4());
+            let _ = pool.bind_account_to_proxy(tid.clone(), pid.to_string()).await;
+            Some(tid)
+        } else {
+            None
+        };
+        let probe_ctx = temp_bound_id.as_deref();
+
+        // 1. 获取 Token
+        let token_res = match modules::oauth::refresh_access_token(refresh_token, probe_ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                if let (Some(tid), Some(pool)) = (&temp_bound_id, crate::proxy::proxy_pool::get_global_proxy_pool()) {
+                    pool.unbind_account_proxy(tid.clone()).await;
+                }
+                return Err(e);
+            }
+        };
 
         // 2. 获取用户信息
-        let user_info =
-            modules::oauth::get_user_info(&token_res.access_token, Some(&temp_account_id)).await?;
+        let user_info = match modules::oauth::get_user_info(&token_res.access_token, probe_ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                if let (Some(tid), Some(pool)) = (&temp_bound_id, crate::proxy::proxy_pool::get_global_proxy_pool()) {
+                    pool.unbind_account_proxy(tid.clone()).await;
+                }
+                return Err(e);
+            }
+        };
 
         // 3. 获取项目 ID (尝试)
         let project_id = crate::proxy::project_resolver::fetch_project_id(
             &token_res.access_token,
-            Some(&temp_account_id),
+            probe_ctx,
         )
         .await
         .ok();
+
+        if let (Some(tid), Some(pool)) = (&temp_bound_id, crate::proxy::proxy_pool::get_global_proxy_pool()) {
+            pool.unbind_account_proxy(tid.clone()).await;
+        }
 
         // 4. 构造 TokenData
         let token = TokenData::new(
@@ -38,7 +77,7 @@ impl AccountService {
             refresh_token.to_string(),
             token_res.expires_in,
             Some(user_info.email.clone()),
-            project_id,
+            project_id.clone(),
             None,
             false, // 个人账号默认不开启 GCP TOS
             token_res.id_token.clone(),
@@ -49,33 +88,43 @@ impl AccountService {
         let mut account =
             modules::upsert_account(user_info.email.clone(), user_info.get_display_name(), token)?;
 
-        // 6. [NEW] 自动获取配额信息（用于刷新时间排序）
-        let email_for_log = account.email.clone();
-        let access_token = token_res.access_token.clone();
-        match modules::quota::fetch_quota(&access_token, &email_for_log, Some(&account.id)).await {
-            Ok((quota_data, new_project_id)) => {
-                account.quota = Some(quota_data);
-                if let Some(pid) = new_project_id {
-                    account.token.project_id = Some(pid);
+        // 6. 自动获取配额信息（批量导入紧接着要绑定专属代理时跳过，避免在未绑定代理前走随机 IP；
+        //    单条添加时复用第 3 步已拿到的 project_id，避免 1 秒内重复打两次 loadCodeAssist）
+        if !skip_initial_quota {
+            let email_for_log = account.email.clone();
+            let access_token = token_res.access_token.clone();
+            match modules::quota::fetch_quota_with_cache(
+                &access_token,
+                &email_for_log,
+                project_id.as_deref(),
+                Some(&account.id),
+            )
+            .await
+            {
+                Ok((quota_data, new_project_id)) => {
+                    account.quota = Some(quota_data);
+                    if let Some(pid) = new_project_id {
+                        account.token.project_id = Some(pid);
+                    }
+                    // 保存更新后的账号信息
+                    if let Err(e) = modules::account::save_account(&account) {
+                        modules::logger::log_warn(&format!(
+                            "[Service] Failed to save quota for {}: {}",
+                            email_for_log, e
+                        ));
+                    } else {
+                        modules::logger::log_info(&format!(
+                            "[Service] Fetched quota for new account: {}",
+                            email_for_log
+                        ));
+                    }
                 }
-                // 保存更新后的账号信息
-                if let Err(e) = modules::account::save_account(&account) {
+                Err(e) => {
                     modules::logger::log_warn(&format!(
-                        "[Service] Failed to save quota for {}: {}",
+                        "[Service] Failed to fetch quota for {}: {}",
                         email_for_log, e
                     ));
-                } else {
-                    modules::logger::log_info(&format!(
-                        "[Service] Fetched quota for new account: {}",
-                        email_for_log
-                    ));
                 }
-            }
-            Err(e) => {
-                modules::logger::log_warn(&format!(
-                    "[Service] Failed to fetch quota for {}: {}",
-                    email_for_log, e
-                ));
             }
         }
 

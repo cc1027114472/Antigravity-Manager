@@ -481,10 +481,13 @@ impl UpstreamClient {
         // or <app_context> tags into systemInstruction (0 occurrences across all 3,024 official captures).
 
         // [DEFENSE] 3.8 网关严格校验：工具链互斥物理收敛（functionDeclarations 存在时物理剥离 googleSearch）
+        // 并在出口处二次按官方抓包键序重排 request 内部字段，确保清洗/手工构造路径不发生键序漂移
         if let Some(inner) = body.get_mut("request") {
             crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(inner);
+            crate::proxy::mappers::common_utils::reorder_inner_request_official(inner);
         } else {
             crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(&mut body);
+            crate::proxy::mappers::common_utils::reorder_inner_request_official(&mut body);
         }
 
         // [NEW] Get client based on account (cached in proxy pool manager)

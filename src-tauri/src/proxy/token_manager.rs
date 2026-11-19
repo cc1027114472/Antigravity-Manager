@@ -61,6 +61,23 @@ enum OnDiskAccountState {
     Unknown,
 }
 
+/// Per-account preferred OAuth client key cache (populated on load / refresh) so all
+/// TokenManager refresh paths use the exact client_id that issued the refresh_token.
+static ACCOUNT_OAUTH_CLIENT_KEYS: once_cell::sync::Lazy<DashMap<String, String>> =
+    once_cell::sync::Lazy::new(DashMap::new);
+
+fn get_account_oauth_client_key(account_id: &str) -> Option<String> {
+    ACCOUNT_OAUTH_CLIENT_KEYS
+        .get(account_id)
+        .map(|v| v.value().clone())
+}
+
+fn set_account_oauth_client_key(account_id: &str, key: Option<&str>) {
+    if let Some(k) = key.map(str::trim).filter(|s| !s.is_empty()) {
+        ACCOUNT_OAUTH_CLIENT_KEYS.insert(account_id.to_string(), k.to_string());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProxyToken {
     pub account_id: String,
@@ -388,11 +405,22 @@ impl TokenManager {
                                         }
                                     }
                                     tracing::info!(
-                                        "🔄 [BackgroundWorker] 储备/活跃账号 {} 进入预刷新窗口，静默换发 ({}/6)...",
+                                        "🔄 [BackgroundWorker] 储备/活跃账号 {} 进入预刷新窗口，静默换发 ({}/4)...",
                                         t.email,
                                         refreshed_in_tick + 1
                                     );
-                                    if let Ok(token_response) = crate::modules::oauth::refresh_access_token(&t.refresh_token, Some(&t.account_id)).await {
+                                    let pref_key = get_account_oauth_client_key(&t.account_id);
+                                    if let Ok(token_response) = crate::modules::oauth::refresh_access_token_with_client(
+                                        &t.refresh_token,
+                                        Some(&t.account_id),
+                                        pref_key.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        set_account_oauth_client_key(
+                                            &t.account_id,
+                                            token_response.oauth_client_key.as_deref(),
+                                        );
                                         let refreshed_at = chrono::Utc::now().timestamp();
                                         if let Some(mut entry) = tokens_map.get_mut(&t.account_id) {
                                             entry.access_token = token_response.access_token.clone();
@@ -408,7 +436,11 @@ impl TokenManager {
                                         pacer.note_oauth_refreshed(&t.account_id);
                                         refreshed_in_tick += 1;
                                         tracing::info!("✅ [BackgroundWorker] 账号 {} 静默换发完成", t.email);
-                                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                        let jitter_ms = {
+                                            use rand::Rng;
+                                            rand::thread_rng().gen_range(1500..=3500)
+                                        };
+                                        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                                     }
                                 }
                             }
@@ -482,7 +514,18 @@ impl TokenManager {
                                                     Ok(g) => g,
                                                     Err(_) => return,
                                                 };
-                                                if let Ok(token_response) = crate::modules::oauth::refresh_access_token(&target_acc.refresh_token, Some(&target_acc.account_id)).await {
+                                                let pref_key = get_account_oauth_client_key(&target_acc.account_id);
+                                                if let Ok(token_response) = crate::modules::oauth::refresh_access_token_with_client(
+                                                    &target_acc.refresh_token,
+                                                    Some(&target_acc.account_id),
+                                                    pref_key.as_deref(),
+                                                )
+                                                .await
+                                                {
+                                                    set_account_oauth_client_key(
+                                                        &target_acc.account_id,
+                                                        token_response.oauth_client_key.as_deref(),
+                                                    );
                                                     let refreshed_at = chrono::Utc::now().timestamp();
                                                     access_tok = token_response.access_token.clone();
                                                     if let Some(mut entry) = tokens_map_clone.get_mut(&target_acc.account_id) {
@@ -983,6 +1026,11 @@ impl TokenManager {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+
+        set_account_oauth_client_key(
+            &account_id,
+            token_obj.get("oauth_client_key").and_then(|v| v.as_str()),
+        );
 
         // 【新增】提取订阅等级 (subscription_tier 为 "FREE" | "PRO" | "ULTRA")
         let subscription_tier = account
@@ -2781,13 +2829,19 @@ impl TokenManager {
         );
 
         let refresh_start = std::time::Instant::now();
-        match crate::modules::oauth::refresh_access_token(
+        let pref_key = get_account_oauth_client_key(&token.account_id);
+        match crate::modules::oauth::refresh_access_token_with_client(
             &token.refresh_token,
             Some(&token.account_id),
+            pref_key.as_deref(),
         )
         .await
         {
             Ok(token_response) => {
+                set_account_oauth_client_key(
+                    &token.account_id,
+                    token_response.oauth_client_key.as_deref(),
+                );
                 let refresh_ms = refresh_start.elapsed().as_millis() as u64;
                 let refreshed_at = chrono::Utc::now().timestamp();
                 token.access_token = token_response.access_token.clone();
@@ -2817,16 +2871,12 @@ impl TokenManager {
                 tokio::time::sleep(tokio::time::Duration::from_millis(settle_delay)).await;
 
                 if refresh_ms > 3000 {
+                    // 仅记录慢刷新观察日志：OAuth 已 200 成功，严禁因此将正常代理标红导致换 Token 与用 Token 异地 IP 跳变！
                     tracing::warn!(
-                        "⚠️ [TokenManager] 账号 {} 在途 OAuth 刷新耗时高达 {}ms (>3000ms)，标记代理 RED",
+                        "⚠️ [TokenManager] 账号 {} 在途 OAuth 刷新耗时 {}ms (>3000ms，已成功，保持原代理不变)",
                         token.email,
                         refresh_ms
                     );
-                    if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                        if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
-                            pool.mark_proxy_unhealthy(&cfg.entry_id).await;
-                        }
-                    }
                 }
 
                 Ok(token)
@@ -3202,13 +3252,19 @@ impl TokenManager {
         // 1. 若确实需要刷新 OAuth Token，执行标准 OAuth 换发
         if Self::token_needs_oauth_refresh(&token, now) {
             let refresh_start = std::time::Instant::now();
-            match crate::modules::oauth::refresh_access_token(
+            let pref_key = get_account_oauth_client_key(&token.account_id);
+            match crate::modules::oauth::refresh_access_token_with_client(
                 &token.refresh_token,
                 Some(&token.account_id),
+                pref_key.as_deref(),
             )
             .await
             {
                 Ok(token_response) => {
+                    set_account_oauth_client_key(
+                        &token.account_id,
+                        token_response.oauth_client_key.as_deref(),
+                    );
                     let refresh_ms = refresh_start.elapsed().as_millis() as u64;
                     let refreshed_at = chrono::Utc::now().timestamp();
                     token.access_token = token_response.access_token.clone();
@@ -3239,20 +3295,12 @@ impl TokenManager {
                     tokio::time::sleep(tokio::time::Duration::from_millis(settle_delay)).await;
 
                     if refresh_ms > 3000 {
+                        // OAuth 已 200 成功，严禁将已走通的代理标红，防止紧接着发对话时发生异地 IP 跳变
                         tracing::warn!(
-                            "⚠️ [TokenManager] 账号 {} 在途 OAuth 刷新耗时高达 {}ms (>3000ms)，代理隧道不稳定，已保存新 Token 并主动置 RED 换号",
+                            "⚠️ [TokenManager] 账号 {} 在途 OAuth 刷新耗时 {}ms (>3000ms，已成功，保持原代理不变)",
                             token.email,
                             refresh_ms
                         );
-                        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                            if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
-                                pool.mark_proxy_unhealthy(&cfg.entry_id).await;
-                            }
-                        }
-                        return Err(format!(
-                            "OAuth refresh latency too high ({}ms > 3000ms), aborting to switch account",
-                            refresh_ms
-                        ));
                     }
                 }
                 Err(e) => {
@@ -6780,6 +6828,53 @@ impl TokenManager {
             .map_err(|e| format!("刷新 Access Token 失败: {}", e))?;
 
         crate::modules::oauth::get_user_info(&token.access_token, None).await
+    }
+
+    /// 直接复用 OAuth exchange_code 返回的 TokenResponse 完成入库（仅 1 次 oauth2/token 请求，
+    /// 彻底避免 Web OAuth 回调在 1 秒内对同一 refresh_token 连打 3 次 oauth2/token）
+    pub async fn add_account_from_token_response(
+        &self,
+        token_resp: crate::modules::oauth::TokenResponse,
+    ) -> Result<String, String> {
+        let refresh_token = token_resp
+            .refresh_token
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "No refresh token returned by Google".to_string())?;
+
+        // 1. 直接用刚换出的 access_token 获取用户信息（不再二次调 oauth2/token）
+        let user_info =
+            crate::modules::oauth::get_user_info(&token_resp.access_token, None).await?;
+        let email = user_info.email.clone();
+        let display_name = user_info.get_display_name();
+
+        // 2. 直接用同一个 access_token 获取 project_id（不再三次调 oauth2/token）
+        let project_id =
+            crate::proxy::project_resolver::fetch_project_id(&token_resp.access_token, None)
+                .await
+                .unwrap_or_else(|_| "aicode-consumers".to_string());
+
+        let email_clone = email.clone();
+        tokio::task::spawn_blocking(move || {
+            let token_data = crate::models::TokenData::new(
+                token_resp.access_token,
+                refresh_token,
+                token_resp.expires_in,
+                Some(email_clone.clone()),
+                Some(project_id),
+                None,
+                false,
+                token_resp.id_token,
+            )
+            .with_oauth_client_key(token_resp.oauth_client_key.clone());
+
+            crate::modules::account::upsert_account(email_clone, display_name, token_data)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))??;
+
+        let _ = self.load_accounts().await;
+        Ok(email)
     }
 
     /// 添加新账号 (纯后端实现，不依赖 Tauri AppHandle)

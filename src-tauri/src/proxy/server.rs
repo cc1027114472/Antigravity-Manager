@@ -3625,34 +3625,18 @@ async fn handle_oauth_callback(
         .and_then(|h| h.to_str().ok());
     let redirect_uri = get_oauth_redirect_uri(port, host, proto);
 
-    match state
-        .token_manager
-        .exchange_code(&code, &redirect_uri)
-        .await
-    {
-        Ok(refresh_token) => {
-            match state.token_manager.get_user_info(&refresh_token).await {
-                Ok(user_info) => {
-                    let email = user_info.email;
-                    if let Err(e) = state
-                        .token_manager
-                        .add_account(&email, &refresh_token)
-                        .await
-                    {
-                        error!("Failed to add account: {}", e);
-                        return Ok(Html(format!(
-                            r#"<html><body><h1>Authorization Failed</h1><p>Failed to save account: {}</p></body></html>"#,
-                            e
-                        )));
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to get user info: {}", e);
-                    return Ok(Html(format!(
-                        r#"<html><body><h1>Authorization Failed</h1><p>Failed to get user info: {}</p></body></html>"#,
-                        e
-                    )));
-                }
+    match crate::modules::oauth::exchange_code(&code, &redirect_uri).await {
+        Ok(token_resp) => {
+            if let Err(e) = state
+                .token_manager
+                .add_account_from_token_response(token_resp)
+                .await
+            {
+                error!("Failed to add account: {}", e);
+                return Ok(Html(format!(
+                    r#"<html><body><h1>Authorization Failed</h1><p>Failed to save account: {}</p></body></html>"#,
+                    e
+                )));
             }
 
             // Success HTML
@@ -3775,36 +3759,23 @@ async fn admin_prepare_oauth_url_web(
                 // 为 Web 回调提供简化的后端处理流程
                 match crate::modules::oauth::exchange_code(&code, &redirect_uri_clone).await {
                     Ok(token_resp) => {
-                        // Success! Now add/upsert account
-                        if let Some(refresh_token) = &token_resp.refresh_token {
-                            match token_manager.get_user_info(refresh_token).await {
-                                Ok(user_info) => {
-                                    if let Err(e) = token_manager
-                                        .add_account(&user_info.email, refresh_token)
-                                        .await
-                                    {
-                                        crate::modules::logger::log_error(&format!(
-                                            "Failed to save account in background OAuth: {}",
-                                            e
-                                        ));
-                                    } else {
-                                        crate::modules::logger::log_info(&format!(
-                                            "Successfully added account {} via background OAuth",
-                                            user_info.email
-                                        ));
-                                    }
-                                }
-                                Err(e) => {
-                                    crate::modules::logger::log_error(&format!(
-                                        "Failed to fetch user info in background OAuth: {}",
-                                        e
-                                    ));
-                                }
+                        // 直接复用本次换出的 access_token + refresh_token 入库，严禁重复调 oauth2/token
+                        match token_manager
+                            .add_account_from_token_response(token_resp)
+                            .await
+                        {
+                            Ok(email) => {
+                                crate::modules::logger::log_info(&format!(
+                                    "Successfully added account {} via background OAuth",
+                                    email
+                                ));
                             }
-                        } else {
-                            crate::modules::logger::log_error(
-                                "Background OAuth error: Google did not return a refresh_token.",
-                            );
+                            Err(e) => {
+                                crate::modules::logger::log_error(&format!(
+                                    "Failed to save account in background OAuth: {}",
+                                    e
+                                ));
+                            }
                         }
                     }
                     Err(e) => {
@@ -4668,6 +4639,7 @@ async fn admin_sync_batch_import_with_proxies(
         .unwrap_or_default();
 
     // d. Iterate through payload.items
+    let mut oauth_probe_count: usize = 0;
     for (idx, item) in payload.items.into_iter().enumerate() {
         let resolved_proxy_id = &items_proxy_ids[idx];
 
@@ -4676,10 +4648,40 @@ async fn admin_sync_batch_import_with_proxies(
                 // 如果前端提供了确定邮箱，使用免校验直接入库，避免远端网络无法直连 Google 时导致导入失败
                 state.account_service.add_account_direct(email, &item.refresh_token)
             } else {
-                state.account_service.add_account(&item.refresh_token).await
+                if oauth_probe_count > 0 {
+                    let jitter_ms = {
+                        use rand::Rng;
+                        rand::thread_rng().gen_range(1500..=3000)
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                }
+                oauth_probe_count += 1;
+                state
+                    .account_service
+                    .add_account_with_options(
+                        &item.refresh_token,
+                        resolved_proxy_id.as_deref(),
+                        true,
+                    )
+                    .await
             }
         } else {
-            state.account_service.add_account(&item.refresh_token).await
+            if oauth_probe_count > 0 {
+                let jitter_ms = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(1500..=3000)
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+            }
+            oauth_probe_count += 1;
+            state
+                .account_service
+                .add_account_with_options(
+                    &item.refresh_token,
+                    resolved_proxy_id.as_deref(),
+                    true,
+                )
+                .await
         };
 
         match import_result {

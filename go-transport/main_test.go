@@ -450,3 +450,56 @@ func TestRelayIsolatesConnectionsByAccountID(t *testing.T) {
 		t.Fatalf("anonymous requests must not share TCP connections: first=%s second=%s", addrAnon1, addrAnon2)
 	}
 }
+
+func TestRelayClosesOldProxyConnectionsOnAccountSwitch(t *testing.T) {
+	mkProxy := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		}))
+	}
+	proxyA := mkProxy()
+	defer proxyA.Close()
+	proxyB := mkProxy()
+	defer proxyB.Close()
+
+	pool := newTransportPool()
+	handler := newRelayHandler(pool)
+
+	send := func(proxyURL, proto string) {
+		req := httptest.NewRequest(http.MethodPost, "/relay", strings.NewReader(`{}`))
+		req.Header.Set(hdrTargetURL, "http://example.com/v1internal:loadCodeAssist")
+		req.Header.Set(hdrProxyURL, proxyURL)
+		req.Header.Set(hdrProto, proto)
+		req.Header.Set(hdrAccountID, "acc_switch")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	// Account uses proxyA on both h1 and h2
+	send(proxyA.URL, "h1")
+	send(proxyA.URL, "h2")
+	pool.mu.RLock()
+	beforeCount := len(pool.entries)
+	pool.mu.RUnlock()
+	if beforeCount != 2 {
+		t.Fatalf("expected 2 entries for proxyA (h1+h2), got %d", beforeCount)
+	}
+
+	// Account switches to proxyB: both old proxyA entries must be evicted immediately
+	send(proxyB.URL, "h1")
+	pool.mu.RLock()
+	afterCount := len(pool.entries)
+	_, hasOldH1 := pool.entries["h1|acc_switch|"+proxyA.URL]
+	_, hasOldH2 := pool.entries["h2|acc_switch|"+proxyA.URL]
+	_, hasNewH1 := pool.entries["h1|acc_switch|"+proxyB.URL]
+	pool.mu.RUnlock()
+
+	if afterCount != 1 || hasOldH1 || hasOldH2 || !hasNewH1 {
+		t.Fatalf("expected old proxyA entries evicted on switch: count=%d oldH1=%v oldH2=%v newH1=%v",
+			afterCount, hasOldH1, hasOldH2, hasNewH1)
+	}
+}

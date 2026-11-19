@@ -1690,6 +1690,42 @@ pub fn extract_v1internal_primary_text(gemini_response: &Value) -> Option<String
     }
 }
 
+/// Aggregate non-thought text from a `v1internal:streamGenerateContent?alt=sse` response body
+/// (also falls back cleanly if the body is a single non-SSE JSON object).
+pub fn extract_v1internal_sse_text(raw_body: &str) -> Option<String> {
+    let mut collected = String::new();
+    let mut saw_sse_data = false;
+
+    for line in raw_body.lines() {
+        let trimmed = line.trim();
+        let Some(data) = trimmed.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = data.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        saw_sse_data = true;
+        if let Ok(val) = serde_json::from_str::<Value>(payload) {
+            if let Some(chunk_text) = extract_v1internal_primary_text(&val) {
+                collected.push_str(&chunk_text);
+            }
+        }
+    }
+
+    if saw_sse_data {
+        return if collected.is_empty() {
+            None
+        } else {
+            Some(collected)
+        };
+    }
+
+    serde_json::from_str::<Value>(raw_body)
+        .ok()
+        .and_then(|v| extract_v1internal_primary_text(&v))
+}
+
 #[cfg(test)]
 mod extract_text_tests {
     use super::*;
@@ -1713,6 +1749,20 @@ mod extract_text_tests {
         assert_eq!(
             extract_v1internal_primary_text(&resp).as_deref(),
             Some("<state_snapshot>ok</state_snapshot>")
+        );
+    }
+
+    #[test]
+    fn test_extract_v1internal_sse_text_concatenates_non_thought_chunks() {
+        let sse = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"thinking\"}]}}]}}\n\n",
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"<state_snapshot>\"}]}}]}}\n\n",
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello</state_snapshot>\"}]}}]}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert_eq!(
+            extract_v1internal_sse_text(sse).as_deref(),
+            Some("<state_snapshot>hello</state_snapshot>")
         );
     }
 }
