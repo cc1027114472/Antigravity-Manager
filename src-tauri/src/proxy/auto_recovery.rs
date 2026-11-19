@@ -66,29 +66,31 @@ pub struct RecoveryTask {
     pub initial_reason: String,
 }
 
-/// Build standard lightweight probe payload targeting gemini-2.5-flash.
-pub fn build_probe_payload(project_id: &str) -> serde_json::Value {
+/// Build lightweight probe payload targeting an official flash model with the account's own
+/// isolated `sessionId` (never sharing a hardcoded `"probe"` sessionId across different accounts).
+pub fn build_probe_payload_for_account(project_id: &str, account_id: &str) -> serde_json::Value {
     let base_request = serde_json::json!({
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3-flash",
         "contents": [{
             "role": "user",
             "parts": [{
-                "text": "ping"
+                "text": "hi"
             }]
-        }],
-        "generationConfig": {
-            "maxOutputTokens": 1,
-            "temperature": 0
-        }
+        }]
     });
     crate::proxy::mappers::gemini::wrapper::wrap_request(
         &base_request,
         project_id,
-        "gemini-2.5-flash",
-        Some("probe"),
+        "gemini-3-flash",
+        Some(account_id),
         None,
         None,
     )
+}
+
+/// Legacy compatibility wrapper (prefer [`build_probe_payload_for_account`] for real accounts).
+pub fn build_probe_payload(project_id: &str) -> serde_json::Value {
+    build_probe_payload_for_account(project_id, "probe")
 }
 
 /// Scheduler for tracking and driving 429 auto-recovery tasks.
@@ -131,7 +133,12 @@ impl AutoRecoveryScheduler {
         *up = Some(upstream);
     }
 
-    /// Build standard lightweight probe payload targeting gemini-2.5-flash.
+    /// Build lightweight probe payload for a specific account (per-account isolated sessionId).
+    pub fn build_probe_payload_for_account(project_id: &str, account_id: &str) -> serde_json::Value {
+        build_probe_payload_for_account(project_id, account_id)
+    }
+
+    /// Build standard lightweight probe payload (legacy test helper).
     pub fn build_probe_payload(project_id: &str) -> serde_json::Value {
         build_probe_payload(project_id)
     }
@@ -179,6 +186,12 @@ impl AutoRecoveryScheduler {
                                 account.token.access_token = token_resp.access_token.clone();
                                 account.token.expires_in = token_resp.expires_in;
                                 account.token.expiry_timestamp = now + token_resp.expires_in;
+                                if let Some(rt) = token_resp.refresh_token.clone() {
+                                    account.token.refresh_token = rt;
+                                }
+                                if token_resp.oauth_client_key.is_some() {
+                                    account.token.oauth_client_key = token_resp.oauth_client_key.clone();
+                                }
                                 let _ = crate::modules::account::save_account(&account);
                                 token_resp.access_token
                             } else {
@@ -206,13 +219,19 @@ impl AutoRecoveryScheduler {
             project_id = "aicode-consumers".to_string();
         }
 
-        // 2. Build lightweight probe payload
-        let probe_payload = Self::build_probe_payload(&project_id);
+        // 2. Build lightweight probe payload with this account's own isolated sessionId
+        let probe_payload = Self::build_probe_payload_for_account(&project_id, account_id);
 
-        // 3. Send via upstream.call_v1_internal with 15-second timeout (relaxed for cross-region proxy networks)
+        // 3. Send via upstream.call_v1_internal using official SSE streaming endpoint (requestType="agent")
         let call_res = tokio::time::timeout(
             Duration::from_secs(15),
-            upstream.call_v1_internal("generateContent", &access_token, probe_payload, None, Some(account_id)),
+            upstream.call_v1_internal(
+                "streamGenerateContent",
+                &access_token,
+                probe_payload,
+                Some("alt=sse"),
+                Some(account_id),
+            ),
         )
         .await;
 

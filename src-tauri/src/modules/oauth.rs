@@ -622,8 +622,9 @@ async fn refresh_access_token_once(
     client_cfg: &OAuthClientConfig,
 ) -> Result<TokenResponse, (Option<reqwest::StatusCode>, String)> {
     // [PHASE 2] 根据 account_id 使用与 AI 反代相同的代理选择（bound → pool → upstream → direct；OAuth Token 允许 H2）
+    // 超时收敛至 10s（低于 acquire_token_with_lease 的 25s 外层兜底），确保卡死代理在被外层取消前触发 X-Ag-Proxy-Error 标红并切号
     let (client, egress) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_oauth_client_with_route(account_id, 60)
+        pool.get_effective_oauth_client_with_route(account_id, 10)
             .await
     } else {
         (
@@ -676,7 +677,7 @@ async fn refresh_access_token_once(
         account_id,
         "h2",
         false,
-        Some(60_000),
+        Some(10_000),
     )
     .await
     .map_err(|e| (None, e))?;

@@ -691,6 +691,29 @@ impl ProxyPoolManager {
         Self::egress_key_from_proxy(&proxy)
     }
 
+    /// Pin a transient in-memory proxy override by proxy_id (does NOT touch gui_config.json
+    /// and is NOT blocked by `max_accounts = 1` when re-importing an existing bound account).
+    pub async fn pin_transient_proxy_by_id(
+        &self,
+        temp_id: &str,
+        proxy_id: &str,
+    ) -> Result<bool, String> {
+        let config = self.config.read().await;
+        if let Some(entry) = config.proxies.iter().find(|p| p.id == proxy_id) {
+            if entry.enabled && entry.is_healthy {
+                let cfg = self.build_proxy_config(entry)?;
+                self.forced_egress.insert(temp_id.to_string(), Some(cfg));
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Remove a transient in-memory proxy override created by [`Self::pin_transient_proxy_by_id`].
+    pub fn unpin_transient_proxy(&self, temp_id: &str) {
+        self.forced_egress.remove(temp_id);
+    }
+
     /// 为账号获取代理（与 AI 反代相同：bound → 未绑定池选择）
     pub async fn get_proxy_for_account(
         &self,

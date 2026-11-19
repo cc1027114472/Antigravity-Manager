@@ -24,14 +24,17 @@ impl AccountService {
         preferred_proxy_id: Option<&str>,
         skip_initial_quota: bool,
     ) -> Result<Account, String> {
-        // 仅在指定了专属代理时创建临时绑定 ID，否则传 None 让 Go Sidecar 走一次性匿名短连接（不留孤儿连接池条目）
+        // 仅在指定了专属代理时使用纯内存临时路由覆盖（不写盘 gui_config.json，不受 max_accounts=1 阻塞）；
+        // 否则传 None 让 Go Sidecar 走一次性匿名短连接（不留孤儿连接池条目）
         let temp_bound_id = if let (Some(pid), Some(pool)) = (
             preferred_proxy_id.map(str::trim).filter(|s| !s.is_empty()),
             crate::proxy::proxy_pool::get_global_proxy_pool(),
         ) {
             let tid = format!("tmp_import_{}", uuid::Uuid::new_v4());
-            let _ = pool.bind_account_to_proxy(tid.clone(), pid.to_string()).await;
-            Some(tid)
+            match pool.pin_transient_proxy_by_id(&tid, pid).await {
+                Ok(true) => Some(tid),
+                _ => None,
+            }
         } else {
             None
         };
@@ -42,7 +45,7 @@ impl AccountService {
             Ok(v) => v,
             Err(e) => {
                 if let (Some(tid), Some(pool)) = (&temp_bound_id, crate::proxy::proxy_pool::get_global_proxy_pool()) {
-                    pool.unbind_account_proxy(tid.clone()).await;
+                    pool.unpin_transient_proxy(tid);
                 }
                 return Err(e);
             }
@@ -53,7 +56,7 @@ impl AccountService {
             Ok(v) => v,
             Err(e) => {
                 if let (Some(tid), Some(pool)) = (&temp_bound_id, crate::proxy::proxy_pool::get_global_proxy_pool()) {
-                    pool.unbind_account_proxy(tid.clone()).await;
+                    pool.unpin_transient_proxy(tid);
                 }
                 return Err(e);
             }
@@ -68,7 +71,7 @@ impl AccountService {
         .ok();
 
         if let (Some(tid), Some(pool)) = (&temp_bound_id, crate::proxy::proxy_pool::get_global_proxy_pool()) {
-            pool.unbind_account_proxy(tid.clone()).await;
+            pool.unpin_transient_proxy(tid);
         }
 
         // 4. 构造 TokenData

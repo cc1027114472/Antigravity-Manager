@@ -66,6 +66,11 @@ enum OnDiskAccountState {
 static ACCOUNT_OAUTH_CLIENT_KEYS: once_cell::sync::Lazy<DashMap<String, String>> =
     once_cell::sync::Lazy::new(DashMap::new);
 
+/// Tracks recent successful `loadCodeAssist` timestamps per account so inline WarmupPad
+/// immediately following `refresh_and_resolve_token` does not fire a duplicate `loadCodeAssist` within 30s.
+static RECENT_LOAD_CODE_ASSIST_TS: once_cell::sync::Lazy<DashMap<String, i64>> =
+    once_cell::sync::Lazy::new(DashMap::new);
+
 fn get_account_oauth_client_key(account_id: &str) -> Option<String> {
     ACCOUNT_OAUTH_CLIENT_KEYS
         .get(account_id)
@@ -410,37 +415,50 @@ impl TokenManager {
                                         refreshed_in_tick + 1
                                     );
                                     let pref_key = get_account_oauth_client_key(&t.account_id);
-                                    if let Ok(token_response) = crate::modules::oauth::refresh_access_token_with_client(
+                                    match crate::modules::oauth::refresh_access_token_with_client(
                                         &t.refresh_token,
                                         Some(&t.account_id),
                                         pref_key.as_deref(),
                                     )
                                     .await
                                     {
-                                        set_account_oauth_client_key(
-                                            &t.account_id,
-                                            token_response.oauth_client_key.as_deref(),
-                                        );
-                                        let refreshed_at = chrono::Utc::now().timestamp();
-                                        if let Some(mut entry) = tokens_map.get_mut(&t.account_id) {
-                                            entry.access_token = token_response.access_token.clone();
-                                            entry.expires_in = token_response.expires_in;
-                                            entry.timestamp = refreshed_at + token_response.expires_in;
-                                            if let Some(rt) = token_response.refresh_token.clone() {
-                                                entry.refresh_token = rt;
+                                        Ok(token_response) => {
+                                            set_account_oauth_client_key(
+                                                &t.account_id,
+                                                token_response.oauth_client_key.as_deref(),
+                                            );
+                                            let refreshed_at = chrono::Utc::now().timestamp();
+                                            if let Some(mut entry) = tokens_map.get_mut(&t.account_id) {
+                                                entry.access_token = token_response.access_token.clone();
+                                                entry.expires_in = token_response.expires_in;
+                                                entry.timestamp = refreshed_at + token_response.expires_in;
+                                                if let Some(rt) = token_response.refresh_token.clone() {
+                                                    entry.refresh_token = rt;
+                                                }
+                                            }
+                                            if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                                                let _ = tm.save_refreshed_token(&t.account_id, &token_response).await;
+                                            }
+                                            pacer.note_oauth_refreshed(&t.account_id);
+                                            refreshed_in_tick += 1;
+                                            tracing::info!("✅ [BackgroundWorker] 账号 {} 静默换发完成", t.email);
+                                            let jitter_ms = {
+                                                use rand::Rng;
+                                                rand::thread_rng().gen_range(1500..=3500)
+                                            };
+                                            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("⚠️ [BackgroundWorker] 账号 {} 静默换发失败: {}", t.email, e);
+                                            if e.contains("invalid_grant") {
+                                                tokens_map.remove(&t.account_id);
+                                                if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                                                    let _ = tm
+                                                        .disable_account(&t.account_id, &format!("invalid_grant: {}", e))
+                                                        .await;
+                                                }
                                             }
                                         }
-                                        if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
-                                            let _ = tm.save_refreshed_token(&t.account_id, &token_response).await;
-                                        }
-                                        pacer.note_oauth_refreshed(&t.account_id);
-                                        refreshed_in_tick += 1;
-                                        tracing::info!("✅ [BackgroundWorker] 账号 {} 静默换发完成", t.email);
-                                        let jitter_ms = {
-                                            use rand::Rng;
-                                            rand::thread_rng().gen_range(1500..=3500)
-                                        };
-                                        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                                     }
                                 }
                             }
@@ -515,34 +533,63 @@ impl TokenManager {
                                                     Err(_) => return,
                                                 };
                                                 let pref_key = get_account_oauth_client_key(&target_acc.account_id);
-                                                if let Ok(token_response) = crate::modules::oauth::refresh_access_token_with_client(
+                                                match crate::modules::oauth::refresh_access_token_with_client(
                                                     &target_acc.refresh_token,
                                                     Some(&target_acc.account_id),
                                                     pref_key.as_deref(),
                                                 )
                                                 .await
                                                 {
-                                                    set_account_oauth_client_key(
-                                                        &target_acc.account_id,
-                                                        token_response.oauth_client_key.as_deref(),
-                                                    );
-                                                    let refreshed_at = chrono::Utc::now().timestamp();
-                                                    access_tok = token_response.access_token.clone();
-                                                    if let Some(mut entry) = tokens_map_clone.get_mut(&target_acc.account_id) {
-                                                        entry.access_token = token_response.access_token.clone();
-                                                        entry.expires_in = token_response.expires_in;
-                                                        entry.timestamp = refreshed_at + token_response.expires_in;
-                                                        if let Some(rt) = token_response.refresh_token.clone() {
-                                                            entry.refresh_token = rt;
+                                                    Ok(token_response) => {
+                                                        set_account_oauth_client_key(
+                                                            &target_acc.account_id,
+                                                            token_response.oauth_client_key.as_deref(),
+                                                        );
+                                                        let refreshed_at = chrono::Utc::now().timestamp();
+                                                        access_tok = token_response.access_token.clone();
+                                                        if let Some(mut entry) = tokens_map_clone.get_mut(&target_acc.account_id) {
+                                                            entry.access_token = token_response.access_token.clone();
+                                                            entry.expires_in = token_response.expires_in;
+                                                            entry.timestamp = refreshed_at + token_response.expires_in;
+                                                            if let Some(rt) = token_response.refresh_token.clone() {
+                                                                entry.refresh_token = rt;
+                                                            }
                                                         }
+                                                        if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                                                            let _ = tm.save_refreshed_token(&target_acc.account_id, &token_response).await;
+                                                        }
+                                                        pacer_clone.note_oauth_refreshed(&target_acc.account_id);
+                                                        // 拟人化沉淀延迟 (400..=800ms)，避免换完 Token 0ms 瞬发 loadCodeAssist
+                                                        let settle_ms: u64 = {
+                                                            use rand::Rng;
+                                                            rand::thread_rng().gen_range(400..=800)
+                                                        };
+                                                        tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
                                                     }
-                                                    if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
-                                                        let _ = tm.save_refreshed_token(&target_acc.account_id, &token_response).await;
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "⚠️ [PrewarmingWorker] 账号 {} 预热前 OAuth 刷新失败: {}",
+                                                            target_acc.email,
+                                                            e
+                                                        );
+                                                        if e.contains("invalid_grant") {
+                                                            tokens_map_clone.remove(&target_acc.account_id);
+                                                            if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                                                                let _ = tm
+                                                                    .disable_account(
+                                                                        &target_acc.account_id,
+                                                                        &format!("invalid_grant: {}", e),
+                                                                    )
+                                                                    .await;
+                                                            }
+                                                        } else {
+                                                            crate::proxy::account_selector::record_warmup_failure_backoff(
+                                                                &target_acc.account_id,
+                                                                900,
+                                                            );
+                                                        }
+                                                        return;
                                                     }
-                                                    pacer_clone.note_oauth_refreshed(&target_acc.account_id);
-                                                } else {
-                                                    crate::proxy::account_selector::record_warmup_failure_backoff(&target_acc.account_id, 900);
-                                                    return;
                                                 }
                                             }
                                             let proj = target_acc.project_id.clone().unwrap_or_default();
@@ -2526,100 +2573,111 @@ impl TokenManager {
 
         let ua = crate::constants::get_account_user_agent(Some(account_id));
         let start = std::time::Instant::now();
-
-        // 步骤 1: POST /v1internal:loadCodeAssist {"metadata":{"ideType":"ANTIGRAVITY"}}
-        let step1_url = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
-        let step1_body = serde_json::json!({
-            "metadata": {
-                "ideType": "ANTIGRAVITY"
-            }
-        });
-
-        let (rb1, go_egress1, via_go1) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
-            &client,
-            step1_url,
-            Some(account_id),
-            "h1",
-            false,
-            Some(15_000),
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("⚠️ [WarmupPad] Cold account {} strict proxy/transport error: {}", email, e);
-                crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
-                return false;
-            }
-        };
-
         let fallback_pid = match &route {
             crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
             _ => None,
         };
-        let effective_pid1 = go_egress1.as_deref().or(fallback_pid);
 
-        let resp1 = crate::utils::go_transport::send_checked(
-            rb1.bearer_auth(access_token)
-                .header("User-Agent", ua.as_str())
-                .header("Content-Type", "application/json")
-                .json(&step1_body)
-                .timeout(std::time::Duration::from_secs(15)),
-            via_go1,
-            effective_pid1,
-        )
-        .await;
+        // 若该账号在最近 30 秒内刚刚由 refresh_and_resolve_token 成功执行过 loadCodeAssist，
+        // 直接跳过步骤 1，避免 1ms 内向 Google 重复打两次 loadCodeAssist
+        let now_ts = chrono::Utc::now().timestamp();
+        let recently_loaded = RECENT_LOAD_CODE_ASSIST_TS
+            .get(account_id)
+            .map(|ts| now_ts.saturating_sub(*ts.value()) < 30)
+            .unwrap_or(false);
 
         let mut discovered_project_id: Option<String> = None;
-        match resp1 {
-            Ok(res) if res.status().is_success() => {
-                if let Ok(bytes_res) = tokio::time::timeout(std::time::Duration::from_secs(10), res.bytes()).await {
-                    if let Ok(b) = bytes_res {
-                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&b) {
-                            if let Some(pid) = val.get("cloudaicompanionProject").and_then(|v| v.as_str()) {
-                                if !pid.is_empty() {
-                                    discovered_project_id = Some(pid.to_string());
+        if !recently_loaded {
+            // 步骤 1: POST /v1internal:loadCodeAssist {"metadata":{"ideType":"ANTIGRAVITY"}}
+            let step1_url = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+            let step1_body = serde_json::json!({
+                "metadata": {
+                    "ideType": "ANTIGRAVITY"
+                }
+            });
+
+            let (rb1, go_egress1, via_go1) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
+                &client,
+                step1_url,
+                Some(account_id),
+                "h1",
+                false,
+                Some(15_000),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("⚠️ [WarmupPad] Cold account {} strict proxy/transport error: {}", email, e);
+                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
+                    return false;
+                }
+            };
+
+            let effective_pid1 = go_egress1.as_deref().or(fallback_pid);
+
+            let resp1 = crate::utils::go_transport::send_checked(
+                rb1.bearer_auth(access_token)
+                    .header("User-Agent", ua.as_str())
+                    .header("Content-Type", "application/json")
+                    .json(&step1_body)
+                    .timeout(std::time::Duration::from_secs(15)),
+                via_go1,
+                effective_pid1,
+            )
+            .await;
+
+            match resp1 {
+                Ok(res) if res.status().is_success() => {
+                    RECENT_LOAD_CODE_ASSIST_TS.insert(account_id.to_string(), chrono::Utc::now().timestamp());
+                    if let Ok(bytes_res) = tokio::time::timeout(std::time::Duration::from_secs(10), res.bytes()).await {
+                        if let Ok(b) = bytes_res {
+                            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&b) {
+                                if let Some(pid) = val.get("cloudaicompanionProject").and_then(|v| v.as_str()) {
+                                    if !pid.is_empty() {
+                                        discovered_project_id = Some(pid.to_string());
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            Ok(res) => {
-                let status_code = res.status().as_u16();
-                let err_body = res.text().await.unwrap_or_default();
-                if status_code == 403 {
-                    tracing::warn!(
-                        "🚫 [WarmupPad] Cold account {} returned HTTP 403 during loadCodeAssist. Marking forbidden & removing from active pool!",
-                        email
-                    );
-                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 86400);
-                    let _ = crate::modules::account::mark_account_forbidden(account_id, &err_body);
-                    if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
-                        tm.remove_account(account_id);
+                Ok(res) => {
+                    let status_code = res.status().as_u16();
+                    let err_body = res.text().await.unwrap_or_default();
+                    if status_code == 403 {
+                        tracing::warn!(
+                            "🚫 [WarmupPad] Cold account {} returned HTTP 403 during loadCodeAssist. Marking forbidden & removing from active pool!",
+                            email
+                        );
+                        crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 86400);
+                        let _ = crate::modules::account::mark_account_forbidden(account_id, &err_body);
+                        if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+                            tm.remove_account(account_id);
+                        }
+                        return false;
+                    } else if status_code == 429 {
+                        tracing::warn!(
+                            "⚠️ [WarmupPad] Cold account {} returned HTTP 429 during loadCodeAssist. Backing off 30m.",
+                            email
+                        );
+                        crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 1800);
+                        return false;
+                    } else {
+                        tracing::warn!(
+                            "⚠️ [WarmupPad] Cold account {} loadCodeAssist returned HTTP {}. Backing off 15m.",
+                            email,
+                            status_code
+                        );
+                        crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
+                        return false;
                     }
-                    return false;
-                } else if status_code == 429 {
-                    tracing::warn!(
-                        "⚠️ [WarmupPad] Cold account {} returned HTTP 429 during loadCodeAssist. Backing off 30m.",
-                        email
-                    );
-                    crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 1800);
-                    return false;
-                } else {
-                    tracing::warn!(
-                        "⚠️ [WarmupPad] Cold account {} loadCodeAssist returned HTTP {}. Backing off 15m.",
-                        email,
-                        status_code
-                    );
+                }
+                Err(e) => {
+                    tracing::warn!("⚠️ [WarmupPad] Cold account {} loadCodeAssist network error: {}", email, e);
                     crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
                     return false;
                 }
-            }
-            Err(e) => {
-                tracing::warn!("⚠️ [WarmupPad] Cold account {} loadCodeAssist network error: {}", email, e);
-                crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
-                return false;
             }
         }
 
@@ -3156,8 +3214,8 @@ impl TokenManager {
             });
         }
 
-        // 3. 选号 + 刷新鉴权阶段使用 15s 死锁保护超时（与后续槽位微等睡眠解耦）
-        let timeout_duration = std::time::Duration::from_secs(15);
+        // 3. 选号 + 刷新鉴权阶段使用 25s 死锁保护超时（高于单次 10s OAuth/loadCodeAssist 超时，确保卡死代理先标红再切号）
+        let timeout_duration = std::time::Duration::from_secs(25);
         let mut acquired = match tokio::time::timeout(
             timeout_duration,
             self.acquire_token_with_lease_internal(
@@ -3174,7 +3232,7 @@ impl TokenManager {
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(TokenAcquireError::Unavailable(
-                    "Token acquisition timeout (15s) - system too busy or OAuth refresh stalled"
+                    "Token acquisition timeout (25s) - system too busy or OAuth refresh stalled"
                         .to_string(),
                 ));
             }
@@ -3205,13 +3263,33 @@ impl TokenManager {
                 footprint.prompt_tokens,
                 footprint.raw_body_len
             );
-            let _ = Self::execute_account_warmup_pad(
+            let warmup_ok = Self::execute_account_warmup_pad(
                 &acquired.account_id,
                 &acquired.access_token,
                 &acquired.project_id,
                 &acquired.email,
             )
             .await;
+            if !warmup_ok {
+                let failed_email = acquired.email.clone();
+                drop(acquired);
+                tracing::warn!(
+                    "🚫 [CapacityAware] Inline warmup pad failed for cold account {}; aborting large request on this account",
+                    failed_email
+                );
+                return Err(TokenAcquireError::Unavailable(format!(
+                    "Cold account {} inline warmup pad failed before large request",
+                    failed_email
+                )));
+            }
+            #[cfg(not(test))]
+            {
+                let jitter_ms: u64 = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(2500..=5000)
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+            }
         }
 
         Ok(acquired)
@@ -3338,11 +3416,22 @@ impl TokenManager {
             .await
             {
                 Ok(pid) => {
+                    RECENT_LOAD_CODE_ASSIST_TS
+                        .insert(token.account_id.clone(), chrono::Utc::now().timestamp());
                     token.project_id = Some(pid.clone());
                     if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
                         entry.project_id = Some(pid.clone());
                     }
                     let _ = self.save_project_id(&token.account_id, &pid).await;
+                    #[cfg(not(test))]
+                    {
+                        // 消除新号首次 loadCodeAssist 与紧随其后的首条小包 streamGenerateContent 之间的 0ms 连击
+                        let settle_ms: u64 = {
+                            use rand::Rng;
+                            rand::thread_rng().gen_range(300..=700)
+                        };
+                        tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+                    }
                     pid
                 }
                 Err(e) => {
@@ -5502,6 +5591,14 @@ impl TokenManager {
         // 如果获取到了新的 refresh_token（Token 轮转），也一并保存
         if let Some(ref rt) = token_response.refresh_token {
             content["token"]["refresh_token"] = serde_json::Value::String(rt.clone());
+        }
+
+        // 持久化本次成功换发所使用的 oauth_client_key，防止 API 免校验导入的账号重启后丢失 client_key
+        if let Some(ref client_key) = token_response.oauth_client_key {
+            if !client_key.trim().is_empty() {
+                content["token"]["oauth_client_key"] =
+                    serde_json::Value::String(client_key.clone());
+            }
         }
 
         std::fs::write(path, serde_json::to_string_pretty(&content).unwrap())

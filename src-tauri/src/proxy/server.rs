@@ -1388,12 +1388,21 @@ async fn admin_refresh_all_quotas(
         )
     })?;
 
-    // 人为触发全部刷新后：对处于 429 禁用的账号执行真实探针探测，探测通了方可自愈解禁
+    // 人为触发全部刷新后：对处于 429 禁用的账号执行真实探针探测（错峰 1.5~3s），探测通了方可自愈解禁
     if let Ok(accounts) = crate::modules::account::list_accounts() {
+        let mut probed_count: usize = 0;
         for acc in accounts {
             if acc.proxy_disabled && !acc.disabled {
                 let reason = acc.proxy_disabled_reason.as_deref().unwrap_or("");
                 if crate::proxy::auto_recovery::is_eligible_for_auto_recovery(reason) {
+                    if probed_count > 0 {
+                        let jitter_ms = {
+                            use rand::Rng;
+                            rand::thread_rng().gen_range(1500..=3000)
+                        };
+                        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                    }
+                    probed_count += 1;
                     if let Ok(true) = state.auto_recovery.probe_account(&acc.id, &acc.email).await {
                         tracing::info!(
                             "🎉 [Batch Refresh] Account {} probe succeeded (200 OK)! Recovering account!",

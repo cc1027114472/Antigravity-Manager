@@ -110,7 +110,8 @@ fn test_get_due_tasks() {
 
 #[test]
 fn test_build_probe_payload() {
-    let payload = AutoRecoveryScheduler::build_probe_payload("test-project-123");
+    let payload = AutoRecoveryScheduler::build_probe_payload_for_account("test-project-123", "acc-alpha");
+    let payload_b = AutoRecoveryScheduler::build_probe_payload_for_account("test-project-123", "acc-beta");
 
     // Verify root fields
     assert_eq!(
@@ -119,7 +120,7 @@ fn test_build_probe_payload() {
     );
     assert_eq!(
         payload.get("model").and_then(|v| v.as_str()),
-        Some("gemini-2.5-flash")
+        Some("gemini-3-flash")
     );
 
     // Verify inner request fields
@@ -139,19 +140,14 @@ fn test_build_probe_payload() {
         .get("parts")
         .and_then(|v| v.as_array())
         .expect("contents must have parts array");
-    assert_eq!(parts[0].get("text").and_then(|v| v.as_str()), Some("ping"));
+    assert_eq!(parts[0].get("text").and_then(|v| v.as_str()), Some("hi"));
 
-    // Generation config: maxOutputTokens: 1; official agent generationConfig omits temperature
-    let gen_config = req
-        .get("generationConfig")
-        .expect("request must have generationConfig");
-    assert_eq!(
-        gen_config.get("maxOutputTokens").and_then(|v| v.as_i64()),
-        Some(1)
-    );
-    assert!(gen_config.get("temperature").is_none());
+    // Official agent generationConfig omits temperature and non-official maxOutputTokens=1
+    if let Some(gen_config) = req.get("generationConfig") {
+        assert!(gen_config.get("temperature").is_none());
+    }
 
-    // Session ID uses standard camelCase sessionId (negative integer string) and never leaks snake_case session_id
+    // Session ID uses standard camelCase sessionId (negative integer string) and is isolated per account
     assert!(
         req.get("session_id").is_none(),
         "request must not leak non-official snake_case session_id"
@@ -160,6 +156,13 @@ fn test_build_probe_payload() {
         .get("sessionId")
         .and_then(|v| v.as_str())
         .expect("request must have official camelCase sessionId");
+    let session_id_b = payload_b["request"]["sessionId"]
+        .as_str()
+        .expect("second account probe must have sessionId");
+    assert_ne!(
+        session_id, session_id_b,
+        "different accounts must never share the same probe sessionId"
+    );
     assert!(
         session_id.parse::<i64>().is_ok(),
         "sessionId should be a signed 64-bit integer string, got: {}",

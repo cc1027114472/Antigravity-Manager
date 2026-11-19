@@ -2427,6 +2427,13 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     let tasks: Vec<_> = accounts
         .into_iter()
         .filter(|account| {
+            if account.disabled {
+                crate::modules::logger::log_info(&format!(
+                    "  - Skipping {} (account disabled, no OAuth/quota probe)",
+                    account.email
+                ));
+                return false;
+            }
             if account.is_hard_forbidden() {
                 crate::modules::logger::log_info(&format!(
                     "  - Skipping {} (403 Forbidden, no probe)",

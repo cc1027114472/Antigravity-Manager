@@ -95,10 +95,45 @@ pub fn start_scheduler(
             let mut skipped_cooldown = 0;
 
             // Scan each active model for each non-disabled, non-forbidden account
+            let mut online_checked_count: usize = 0;
             for account in &accounts {
                 if account.disabled || account.proxy_disabled || account.is_hard_forbidden() {
                     continue;
                 }
+
+                // 前置冷却期预检：若该账号所有受监控模型均处于 4 小时 WARMUP_HISTORY 冷却期内，
+                // 直接跳过，0 网络请求（不再每 10 分钟空刷 OAuth + 在线配额！）
+                if !app_config.scheduled_warmup.monitored_models.is_empty() {
+                    let check_ts = Utc::now().timestamp();
+                    let all_in_cooldown = {
+                        let history = WARMUP_HISTORY.lock().unwrap();
+                        app_config
+                            .scheduled_warmup
+                            .monitored_models
+                            .iter()
+                            .all(|m| {
+                                let key = format!("{}:{}:100", account.email, m);
+                                history
+                                    .get(&key)
+                                    .map(|&ts| check_ts - ts < 14400)
+                                    .unwrap_or(false)
+                            })
+                    };
+                    if all_in_cooldown {
+                        skipped_cooldown += app_config.scheduled_warmup.monitored_models.len();
+                        continue;
+                    }
+                }
+
+                // 错峰随机抖动 (2~5s)，防止定时扫描零间隔并发扫全库
+                if online_checked_count > 0 {
+                    let jitter_ms = {
+                        use rand::Rng;
+                        rand::thread_rng().gen_range(2000..=5000)
+                    };
+                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                }
+                online_checked_count += 1;
 
                 // Get valid token
                 let Ok((token, pid)) = quota::get_valid_token_for_warmup(account).await else {

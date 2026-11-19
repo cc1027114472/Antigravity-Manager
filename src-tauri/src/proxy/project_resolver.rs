@@ -27,9 +27,9 @@ pub async fn fetch_project_id(
         }
     });
 
-    // [STRICT PROXY] 使用带 route 信息的接口，Direct 路由必须拒绝
+    // [STRICT PROXY] 使用带 route 信息的接口，Direct 路由必须拒绝（10s 超时低于外层选号兜底，确保坏代理先标红切号）
     let (client, route) = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client_with_route(account_id, 15).await
+        pool.get_effective_standard_client_with_route(account_id, 10).await
     } else {
         // 池未初始化：检查全局上游代理，未启用则拒绝
         if let Ok(app_cfg) = crate::modules::config::load_app_config() {
@@ -57,7 +57,7 @@ pub async fn fetch_project_id(
         account_id,
         "h1",
         false,
-        Some(15_000),
+        Some(10_000),
     )
     .await?;
 
