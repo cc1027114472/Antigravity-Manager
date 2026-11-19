@@ -57,8 +57,12 @@ pub fn start_scheduler(
     tauri::async_runtime::spawn(async move {
         logger::log_info("Smart Warmup Scheduler started. Monitoring quota at 100%...");
 
-        // Scan every 10 minutes
-        let mut interval = time::interval(Duration::from_secs(600));
+        // Delay first scan 90s after boot so restarts don't trigger immediate OAuth/quota bursts;
+        // scan every 10 minutes thereafter.
+        let mut interval = time::interval_at(
+            time::Instant::now() + Duration::from_secs(90),
+            Duration::from_secs(600),
+        );
 
         loop {
             interval.tick().await;

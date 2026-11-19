@@ -656,8 +656,18 @@ async fn refresh_access_token_once(
         crate::constants::NATIVE_OAUTH_USER_AGENT.as_str()
     );
 
-    let response = client
-        .post(TOKEN_URL)
+    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+        &client,
+        TOKEN_URL,
+        account_id,
+        "h2",
+        false,
+        Some(60_000),
+    )
+    .await
+    .map_err(|e| (None, e))?;
+
+    let response = rb
         .header(
             rquest::header::USER_AGENT,
             crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
@@ -807,8 +817,16 @@ pub async fn get_user_info(
         return Err(err_msg);
     }
 
-    let response = client
-        .get(USERINFO_URL)
+    let (rb, _, _) = crate::utils::go_transport::get_with_sidecar_or_fallback(
+        &client,
+        USERINFO_URL,
+        account_id,
+        "h1",
+        Some(15_000),
+    )
+    .await?;
+
+    let response = rb
         .header(
             rquest::header::USER_AGENT,
             crate::constants::NATIVE_USERINFO_USER_AGENT.as_str(),

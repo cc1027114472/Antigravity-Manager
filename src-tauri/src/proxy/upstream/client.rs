@@ -545,12 +545,26 @@ impl UpstreamClient {
 
                 let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
 
-                let mut req_builder = client.post(&url).headers(headers.clone());
+                let is_streaming = method == "streamGenerateContent";
+                let (mut req_builder, via_go) = if crate::utils::go_transport::relay_url().is_some() {
+                    let (rb, _go_egress, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+                        &client,
+                        &url,
+                        account_id,
+                        "h1",
+                        is_streaming,
+                        None,
+                    )
+                    .await?;
+                    (rb.headers(headers.clone()), true)
+                } else {
+                    (client.post(&url).headers(headers.clone()), false)
+                };
 
                 // [FIX] 仅对流式接口 (streamGenerateContent) 使用分块传输仿真
                 // 对其他接口 (如 generateContent, loadCodeAssist) 发送正常的固定长度 Body
                 // 否则图像生成会因为缺少 Content-Length 而被 Google 服务端拒绝或限流 (429)
-                if method == "streamGenerateContent" {
+                if is_streaming && !via_go {
                     let stream_bytes = body_bytes.clone();
                     req_builder = req_builder.body(rquest::Body::wrap_stream(
                         futures::stream::once(async move { Ok::<_, std::io::Error>(stream_bytes) }),

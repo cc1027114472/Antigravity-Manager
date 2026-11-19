@@ -225,17 +225,29 @@ async fn fetch_project_id(
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
 
     let account_ua = crate::constants::get_account_user_agent(account_id);
-    let res = client
-        .post(format!("{}/v1internal:loadCodeAssist", CLOUD_CODE_BASE_URL))
+    let load_url = format!("{}/v1internal:loadCodeAssist", CLOUD_CODE_BASE_URL);
+    let Ok((rb, _, _)) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+        &client,
+        &load_url,
+        account_id,
+        "h1",
+        false,
+        Some(15_000),
+    )
+    .await else {
+        return (None, None);
+    };
+
+    let res = rb
+        .header(
+            rquest::header::USER_AGENT,
+            account_ua.as_str(),
+        )
         .header(
             rquest::header::AUTHORIZATION,
             format!("Bearer {}", access_token),
         )
         .header(rquest::header::CONTENT_TYPE, "application/json")
-        .header(
-            rquest::header::USER_AGENT,
-            account_ua.as_str(),
-        )
         .json(&meta)
         .send()
         .await;
@@ -392,14 +404,30 @@ pub async fn fetch_quota_with_cache(
 
     for (ep_idx, ep_url) in QUOTA_API_ENDPOINTS.iter().enumerate() {
         let has_next = ep_idx + 1 < QUOTA_API_ENDPOINTS.len();
+        let (rb, _, _) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
+            &client,
+            *ep_url,
+            account_id,
+            "h1",
+            false,
+            Some(15_000),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                last_error = Some(AppError::Network(e, None));
+                continue;
+            }
+        };
 
-        match client
-            .post(*ep_url)
-            .bearer_auth(access_token)
+        match rb
             .header(
                 rquest::header::USER_AGENT,
                 crate::constants::get_account_user_agent(account_id).as_str(),
             )
+            .bearer_auth(access_token)
+            .header(rquest::header::CONTENT_TYPE, "application/json")
             .json(&payload)
             .send()
             .await
@@ -592,13 +620,24 @@ async fn fetch_quota_summary(
     let payload = build_quota_project_payload(project_id);
 
     for ep_url in QUOTA_SUMMARY_ENDPOINTS.iter() {
-        let res = client
-            .post(*ep_url)
-            .bearer_auth(access_token)
+        let Ok((rb, _, _)) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+            &client,
+            *ep_url,
+            account_id,
+            "h1",
+            false,
+            Some(15_000),
+        )
+        .await else {
+            continue;
+        };
+        let res = rb
             .header(
                 rquest::header::USER_AGENT,
                 crate::constants::get_account_user_agent(account_id).as_str(),
             )
+            .bearer_auth(access_token)
+            .header(rquest::header::CONTENT_TYPE, "application/json")
             .json(&payload)
             .send()
             .await;

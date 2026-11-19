@@ -87,6 +87,11 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cargo build --release --bin antigravity_tools && \
     cp target/release/antigravity_tools /tmp/antigravity_tools
 
+# Build the Go native TLS/HTTP sidecar
+COPY go-transport /app/go-transport
+WORKDIR /app/go-transport
+RUN go build -ldflags="-s -w" -o /tmp/go-aidev-transport .
+
 # --- Final Runtime Stage ---
 FROM debian:bookworm-slim
 ARG USE_MIRROR=auto
@@ -114,6 +119,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy binary from builder
 COPY --from=backend-builder /tmp/antigravity_tools /app/antigravity-tools
+COPY --from=backend-builder /tmp/go-aidev-transport /app/go-aidev-transport
 
 # Copy frontend dist from builder
 COPY --from=frontend-builder /app/dist /app/dist

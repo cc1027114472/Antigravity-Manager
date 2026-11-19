@@ -51,10 +51,18 @@ pub async fn fetch_project_id(
         return Err("严格代理策略拦截：未匹配到健康代理且上游代理未启用 (Direct)，禁止直连探测 Project ID".to_string());
     }
 
-    let response = client
-        .post(url)
+    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+        &client,
+        url,
+        account_id,
+        "h1",
+        false,
+        Some(15_000),
+    )
+    .await?;
+
+    let response = rb
         .bearer_auth(access_token)
-        // .header("Host", "cloudcode-pa.googleapis.com") // 移除 Host header，因为已切换域名
         .header("User-Agent", crate::constants::get_account_user_agent(account_id).as_str())
         .header("Content-Type", "application/json")
         .json(&request_body)

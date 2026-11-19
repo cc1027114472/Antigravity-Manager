@@ -1,10 +1,13 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use axum::http::StatusCode;
 use once_cell::sync::Lazy;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToxicEntry {
     pub status: u16,
     pub error_body: String,
@@ -20,8 +23,60 @@ pub struct Request503State {
     pub last_error_body: String,
 }
 
-pub static TOXIC_CACHE: Lazy<Arc<DashMap<String, ToxicEntry>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
+fn toxic_cache_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    crate::modules::account::get_data_dir()
+        .ok()
+        .map(|d| d.join("toxic_cache.json"))
+}
+
+pub fn load_toxic_cache_from_path(path: &Path, target: &DashMap<String, ToxicEntry>, now: i64) -> usize {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(map) = serde_json::from_str::<HashMap<String, ToxicEntry>>(&raw) else {
+        return 0;
+    };
+    let mut restored = 0usize;
+    for (k, v) in map {
+        if v.expired_at > now {
+            target.insert(k, v);
+            restored += 1;
+        }
+    }
+    restored
+}
+
+pub fn save_toxic_cache_to_path(path: &Path, source: &DashMap<String, ToxicEntry>, now: i64) {
+    let snapshot: HashMap<String, ToxicEntry> = source
+        .iter()
+        .filter(|e| e.value().expired_at > now)
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    if let Ok(json) = serde_json::to_string(&snapshot) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            if std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::write(path, json);
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+}
+
+pub static TOXIC_CACHE: Lazy<Arc<DashMap<String, ToxicEntry>>> = Lazy::new(|| {
+    let map = DashMap::new();
+    if let Some(path) = toxic_cache_path() {
+        let now = chrono::Utc::now().timestamp();
+        let restored = load_toxic_cache_from_path(&path, &map, now);
+        if restored > 0 {
+            tracing::info!("[ToxicCache] Restored {} unexpired toxic payload fingerprint(s) from disk", restored);
+        }
+    }
+    Arc::new(map)
+});
 
 pub static REQUEST_503_TRACKER: Lazy<Arc<DashMap<String, Request503State>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
@@ -97,6 +152,9 @@ pub fn record_toxic(fingerprint: &str, status: u16, error_body: String, ttl_secs
             expired_at,
         },
     );
+    if let Some(path) = toxic_cache_path() {
+        save_toxic_cache_to_path(&path, &TOXIC_CACHE, now);
+    }
 }
 
 /// 检查同一请求指纹是否因累计 4 次 503 处于本地冷却拦截窗口中
@@ -263,5 +321,37 @@ mod tests {
         // 成功后清理
         clear_request_503(fp);
         assert_eq!(check_request_503_cooldown(fp), None);
+    }
+
+    #[test]
+    fn test_toxic_cache_disk_roundtrip_filters_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("toxic_cache.json");
+        let now = 1_700_000_000i64;
+
+        let src = DashMap::new();
+        src.insert(
+            "active_fp".to_string(),
+            ToxicEntry {
+                status: 403,
+                error_body: "TOS_VIOLATION".to_string(),
+                expired_at: now + 600,
+            },
+        );
+        src.insert(
+            "expired_fp".to_string(),
+            ToxicEntry {
+                status: 403,
+                error_body: "Old".to_string(),
+                expired_at: now - 10,
+            },
+        );
+
+        save_toxic_cache_to_path(&path, &src, now);
+        let dst = DashMap::new();
+        let restored = load_toxic_cache_from_path(&path, &dst, now);
+        assert_eq!(restored, 1);
+        assert!(dst.contains_key("active_fp"));
+        assert!(!dst.contains_key("expired_fp"));
     }
 }

@@ -26,8 +26,10 @@
 //!    - 苏醒后平稳运行超过 4 小时未再触顶，阶梯惩罚计数自动重置。
 //!    - 疲劳期账号坚决排除，绝不兜底放行！
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Once};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use rand::Rng;
@@ -232,6 +234,159 @@ static GLOBAL_WARMUP_BACKOFF: Lazy<Arc<DashMap<String, i64>>> =
 /// 同一账号两次后台预热之间的最小安全冷却间隔（秒）：至少间隔 240s（4 分钟），杜绝 30~40s 连打 2 次
 pub const MIN_BACKGROUND_WARMUP_INTERVAL_SECS: i64 = 240;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedSelectorState {
+    #[serde(default)]
+    fatigue: HashMap<String, FatigueRecord>,
+    #[serde(default)]
+    fatigue_strikes: HashMap<String, (u32, i64)>,
+    #[serde(default)]
+    rolling_buckets: HashMap<String, Vec<HourlyBucket>>,
+    #[serde(default)]
+    warmth: HashMap<String, AccountWarmthState>,
+}
+
+fn selector_state_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    crate::modules::account::get_data_dir()
+        .ok()
+        .map(|d| d.join("runtime_selector_state.json"))
+}
+
+fn load_selector_state_from_path(path: &Path, now_ts: i64) -> usize {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(state) = serde_json::from_str::<PersistedSelectorState>(&raw) else {
+        return 0;
+    };
+    let min_hour = (now_ts / 3600) - 23;
+    let mut count = 0usize;
+
+    for (k, v) in state.fatigue {
+        if v.fatigue_until > now_ts {
+            GLOBAL_FATIGUE_REGISTRY.insert(k, v);
+            count += 1;
+        }
+    }
+    for (k, v) in state.fatigue_strikes {
+        if now_ts.saturating_sub(v.1) <= FATIGUE_STRIKE_COOLDOWN_SECS + TIER3_NAP_MAX_SECS {
+            GLOBAL_FATIGUE_STRIKES.insert(k, v);
+        }
+    }
+    for (k, buckets) in state.rolling_buckets {
+        let valid: VecDeque<HourlyBucket> = buckets
+            .into_iter()
+            .filter(|b| b.epoch_hour >= min_hour)
+            .collect();
+        if !valid.is_empty() {
+            GLOBAL_ROLLING_BUCKETS.insert(k, valid);
+            count += 1;
+        }
+    }
+    for (k, v) in state.warmth {
+        if v.last_active_at > 0
+            && now_ts.saturating_sub(v.last_active_at) <= WARMTH_RETENTION_WINDOW_SECS
+        {
+            GLOBAL_WARMTH_TRACKER.insert(k, v);
+            count += 1;
+        }
+    }
+    count
+}
+
+fn save_selector_state_to_path(path: &Path, now_ts: i64) {
+    let min_hour = (now_ts / 3600) - 23;
+    let fatigue: HashMap<String, FatigueRecord> = GLOBAL_FATIGUE_REGISTRY
+        .iter()
+        .filter(|e| e.value().fatigue_until > now_ts)
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    let fatigue_strikes: HashMap<String, (u32, i64)> = GLOBAL_FATIGUE_STRIKES
+        .iter()
+        .filter(|e| now_ts.saturating_sub(e.value().1) <= FATIGUE_STRIKE_COOLDOWN_SECS + TIER3_NAP_MAX_SECS)
+        .map(|e| (e.key().clone(), *e.value()))
+        .collect();
+    let rolling_buckets: HashMap<String, Vec<HourlyBucket>> = GLOBAL_ROLLING_BUCKETS
+        .iter()
+        .filter_map(|e| {
+            let valid: Vec<HourlyBucket> = e
+                .value()
+                .iter()
+                .filter(|b| b.epoch_hour >= min_hour)
+                .copied()
+                .collect();
+            if valid.is_empty() {
+                None
+            } else {
+                Some((e.key().clone(), valid))
+            }
+        })
+        .collect();
+    let warmth: HashMap<String, AccountWarmthState> = GLOBAL_WARMTH_TRACKER
+        .iter()
+        .filter(|e| {
+            e.value().last_active_at > 0
+                && now_ts.saturating_sub(e.value().last_active_at) <= WARMTH_RETENTION_WINDOW_SECS
+        })
+        .map(|e| (e.key().clone(), *e.value()))
+        .collect();
+
+    let state = PersistedSelectorState {
+        fatigue,
+        fatigue_strikes,
+        rolling_buckets,
+        warmth,
+    };
+    if let Ok(json) = serde_json::to_string(&state) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            if std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::write(path, json);
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+}
+
+fn ensure_selector_state_loaded() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if let Some(path) = selector_state_path() {
+            let now_ts = chrono::Utc::now().timestamp();
+            let restored = load_selector_state_from_path(&path, now_ts);
+            if restored > 0 {
+                tracing::info!(
+                    "[AccountSelector] Restored {} persisted runtime state entries from disk",
+                    restored
+                );
+            }
+        }
+    });
+}
+
+fn persist_selector_state(force: bool) {
+    let Some(path) = selector_state_path() else {
+        return;
+    };
+    static LAST_SAVE_TS: AtomicI64 = AtomicI64::new(0);
+    let now_ts = chrono::Utc::now().timestamp();
+    let prev = LAST_SAVE_TS.load(Ordering::Relaxed);
+    if !force && now_ts.saturating_sub(prev) < 15 {
+        return;
+    }
+    if LAST_SAVE_TS
+        .compare_exchange(prev, now_ts, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+        || force
+    {
+        LAST_SAVE_TS.store(now_ts, Ordering::Relaxed);
+        save_selector_state_to_path(&path, now_ts);
+    }
+}
+
 /// 可参与调度的账号候选对象 Trait
 pub trait AccountCandidate {
     fn account_id(&self) -> &str;
@@ -339,6 +494,7 @@ impl AccountSelector {
 
     /// 获取真实滑动窗口消耗统计：(hourly_output, daily_rolling_output, hourly_input, hourly_requests)
     pub fn get_rolling_usage_extended(&self, account_id: &str, now_ts: i64) -> (u64, u64, u64, u32) {
+        ensure_selector_state_loaded();
         let current_hour = now_ts / 3600;
         let min_retained_hour = current_hour - 23;
 
@@ -409,6 +565,7 @@ impl AccountSelector {
 
     /// 获取账号当前慢启动容量等级（超 2h 无活动自动衰减为冷号）
     pub fn get_capacity_tier(&self, account_id: &str, now_ts: i64) -> CapacityTier {
+        ensure_selector_state_loaded();
         if let Some(entry) = GLOBAL_WARMTH_TRACKER.get(account_id) {
             if now_ts.saturating_sub(entry.last_active_at) > WARMTH_RETENTION_WINDOW_SECS {
                 return CapacityTier::Tier1Cold;
@@ -425,6 +582,7 @@ impl AccountSelector {
 
     /// 记录一次成功的温热请求交互（推进慢启动阶梯）
     pub fn record_warm_interaction(&self, account_id: &str, now_ts: i64) {
+        ensure_selector_state_loaded();
         let mut entry = GLOBAL_WARMTH_TRACKER
             .entry(account_id.to_string())
             .or_insert_with(AccountWarmthState::default);
@@ -434,6 +592,8 @@ impl AccountSelector {
             entry.recent_success_count = entry.recent_success_count.saturating_add(1);
         }
         entry.last_active_at = now_ts;
+        drop(entry);
+        persist_selector_state(false);
     }
 
     /// 判断账号是否处于当前小时“黄金承重区”（Output/Input/Requests 均 < 小时动态软上限的 60%）
@@ -544,6 +704,7 @@ impl AccountSelector {
         };
 
         GLOBAL_FATIGUE_REGISTRY.insert(account_id.to_string(), record.clone());
+        persist_selector_state(true);
 
         tracing::warn!(
             "😴 [AccountSelector] Account {} ({}) triggered fatigue sleep! Strike #{}, sleeping for {}s (~{:.1}h) until {}. (hourly: {}/{}, rolling_24h: {}/{}, in_flight: {})",
@@ -641,11 +802,16 @@ impl AccountSelector {
         }
 
         // 3. 检查并触发疲劳熔断
-        self.check_and_update_fatigue(account_id, email, now_ts)
+        let fatigue_res = self.check_and_update_fatigue(account_id, email, now_ts);
+        if fatigue_res.is_none() {
+            persist_selector_state(false);
+        }
+        fatigue_res
     }
 
     /// 检查指定账号是否正处于疲劳休眠期（超时自动苏醒，休眠中坚决排除）
     pub fn is_account_fatigued(&self, account_id: &str) -> bool {
+        ensure_selector_state_loaded();
         let now = chrono::Utc::now().timestamp();
         if let Some(entry) = GLOBAL_FATIGUE_REGISTRY.get(account_id) {
             if now < entry.fatigue_until {
@@ -703,7 +869,12 @@ impl AccountSelector {
 
     /// 清除疲劳休眠状态
     pub fn clear_fatigue(&self, account_id: &str) -> bool {
-        GLOBAL_FATIGUE_REGISTRY.remove(account_id).is_some()
+        ensure_selector_state_loaded();
+        let removed = GLOBAL_FATIGUE_REGISTRY.remove(account_id).is_some();
+        if removed {
+            persist_selector_state(true);
+        }
+        removed
     }
 
     /// 获取所有处于休眠期的账号列表
@@ -1176,6 +1347,64 @@ mod tests {
         assert!(selector.is_account_fatigued(acc_id));
 
         selector.clear_fatigue(acc_id);
+    }
+
+    #[test]
+    fn test_selector_state_persistence_roundtrip_and_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime_selector_state.json");
+        let now = chrono::Utc::now().timestamp();
+
+        let acc_warm = "acc_persist_warm_test";
+        let acc_cold = "acc_persist_expired_warm_test";
+        let acc_fatigued = "acc_persist_fatigue_test";
+
+        GLOBAL_WARMTH_TRACKER.insert(
+            acc_warm.to_string(),
+            AccountWarmthState {
+                recent_success_count: 3,
+                last_active_at: now - 60,
+            },
+        );
+        GLOBAL_WARMTH_TRACKER.insert(
+            acc_cold.to_string(),
+            AccountWarmthState {
+                recent_success_count: 2,
+                last_active_at: now - WARMTH_RETENTION_WINDOW_SECS - 10,
+            },
+        );
+        GLOBAL_FATIGUE_REGISTRY.insert(
+            acc_fatigued.to_string(),
+            FatigueRecord {
+                account_id: acc_fatigued.to_string(),
+                email: "fat@example.com".to_string(),
+                fatigue_until: now + 3600,
+                entered_at: now - 60,
+                nap_duration_secs: 3660,
+                reason: FatigueReason::HourlyOutputLimitExceeded,
+                hourly_output_tokens: 60000,
+                daily_output_tokens: 60000,
+                consecutive_strikes: 1,
+            },
+        );
+
+        save_selector_state_to_path(&path, now);
+
+        GLOBAL_WARMTH_TRACKER.remove(acc_warm);
+        GLOBAL_WARMTH_TRACKER.remove(acc_cold);
+        GLOBAL_FATIGUE_REGISTRY.remove(acc_fatigued);
+
+        let restored = load_selector_state_from_path(&path, now);
+        assert!(restored >= 2);
+        assert_eq!(
+            GLOBAL_WARMTH_TRACKER.get(acc_warm).map(|v| v.recent_success_count),
+            Some(3)
+        );
+        assert!(!GLOBAL_WARMTH_TRACKER.contains_key(acc_cold));
+        assert!(GLOBAL_FATIGUE_REGISTRY.contains_key(acc_fatigued));
+
+        GLOBAL_WARMTH_TRACKER.remove(acc_warm);
+        GLOBAL_FATIGUE_REGISTRY.remove(acc_fatigued);
     }
 }
 

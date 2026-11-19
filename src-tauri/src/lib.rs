@@ -332,6 +332,9 @@ pub fn run() {
                         }
                     }
 
+                    // Start Go native TLS/HTTP sidecar if present
+                    crate::utils::go_transport::ensure_started();
+
                     // Start proxy service
                     if let Err(e) = commands::proxy::internal_start_proxy_service(
                         config.proxy,

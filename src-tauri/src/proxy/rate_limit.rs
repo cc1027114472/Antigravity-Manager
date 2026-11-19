@@ -1823,6 +1823,42 @@ impl RateLimitTracker {
         // 或者我们可以引入索引，但为了简单，暂时只清除 Account 级锁。
     }
 
+    /// 启动加载时从磁盘 `live_limited_models` 恢复未过期的限流锁，避免重启“越狱”
+    pub fn restore_persisted_limit(
+        &self,
+        account_id: &str,
+        model: Option<&str>,
+        until_unix: i64,
+        reason_str: &str,
+    ) {
+        let now_unix = chrono::Utc::now().timestamp();
+        let remaining_secs = until_unix - now_unix;
+        if remaining_secs <= 0 {
+            return;
+        }
+        let reason = match reason_str {
+            "QuotaExhausted" => RateLimitReason::QuotaExhausted,
+            "RateLimitExceeded" => RateLimitReason::RateLimitExceeded,
+            "ModelCapacityExhausted" => RateLimitReason::ModelCapacityExhausted,
+            "ServerError" => RateLimitReason::ServerError,
+            _ => RateLimitReason::Unknown,
+        };
+        let now_sys = SystemTime::now();
+        let reset_time = now_sys + Duration::from_secs(remaining_secs as u64);
+        let model_opt = model.filter(|m| !m.is_empty()).map(|m| m.to_string());
+        let key = self.get_limit_key(account_id, model_opt.as_deref());
+        self.limits.insert(
+            key,
+            RateLimitInfo {
+                reset_time,
+                retry_after_sec: remaining_secs as u64,
+                detected_at: now_sys,
+                reason,
+                model: model_opt,
+            },
+        );
+    }
+
     /// 精确锁定账号到指定时间点
     ///
     /// 使用账号配额中的 reset_time 来精确锁定账号,
@@ -2999,5 +3035,19 @@ mod tests {
         let (s_after_ok, trip_after_ok) = pacer.record_503_and_check_breaker(acc2, false);
         assert_eq!(s_after_ok, 1);
         assert_eq!(trip_after_ok, None);
+    }
+
+    #[test]
+    fn test_restore_persisted_limit() {
+        let tracker = RateLimitTracker::new();
+        let now = chrono::Utc::now().timestamp();
+
+        // Future limit should restore
+        tracker.restore_persisted_limit("acc_r1", Some("claude-sonnet-4-6"), now + 120, "RateLimitExceeded");
+        assert!(tracker.get_remaining_wait("acc_r1", Some("claude-sonnet-4-6")) > 0);
+
+        // Expired limit should be ignored
+        tracker.restore_persisted_limit("acc_r1", Some("gemini-3-flash"), now - 10, "QuotaExhausted");
+        assert_eq!(tracker.get_remaining_wait("acc_r1", Some("gemini-3-flash")), 0);
     }
 }

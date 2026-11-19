@@ -44,6 +44,7 @@ pub fn init_global_proxy_pool(config: Arc<RwLock<ProxyPoolConfig>>) -> Arc<Proxy
 pub struct PoolProxyConfig {
     pub proxy: rquest::Proxy,
     pub entry_id: String,
+    pub url: String,
 }
 
 /// Actual HTTP egress used for a request (pool node / app upstream / direct).
@@ -861,18 +862,36 @@ impl ProxyPoolManager {
         let mut proxy = rquest::Proxy::all(&url_for_proxy)
             .map_err(|e| format!("Invalid proxy URL: {}", e))?;
 
+        let mut full_url = url_for_proxy.clone();
         if let Some(auth) = &entry.auth {
             if !auth.username.is_empty() {
                 proxy = proxy.basic_auth(&auth.username, &auth.password);
+                if let Ok(mut parsed) = url::Url::parse(&url_for_proxy) {
+                    let _ = parsed.set_username(&auth.username);
+                    let _ = parsed.set_password(Some(&auth.password));
+                    full_url = parsed.to_string();
+                }
             }
         } else if let Some(user) = url_user {
             proxy = proxy.basic_auth(&user, url_pass.as_deref().unwrap_or(""));
+            full_url = raw_url.clone();
         }
 
         Ok(PoolProxyConfig {
             proxy,
             entry_id: entry.id.clone(),
+            url: full_url,
         })
+    }
+
+    /// Select a healthy pool proxy for generic requests without an account_id (when pool enabled).
+    pub async fn select_generic_proxy(&self) -> Result<Option<PoolProxyConfig>, String> {
+        let config = self.config.read().await;
+        if config.enabled {
+            self.select_proxy_from_pool(&config).await
+        } else {
+            Ok(None)
+        }
     }
 
     /// 绑定账号到代理（内存校验 + 可选写盘）

@@ -300,7 +300,11 @@ impl TokenManager {
         let pacer = Arc::clone(&self.pacer);
 
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            let period = std::time::Duration::from_secs(15);
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + period,
+                period,
+            );
             let mut tick_count: u32 = 0;
             loop {
                 tokio::select! {
@@ -318,8 +322,8 @@ impl TokenManager {
                         }
 
                         tick_count = tick_count.wrapping_add(1);
-                        // 启动后第 15s (tick == 1) 立即首次巡检，之后每 60 秒 (4 * 15s) 执行一次后台主动巡检（提前预刷新 + 黄金老兵动态储备池预热）
-                        if tick_count == 1 || tick_count % 4 == 0 {
+                        // 启动后前 75s (tick 1..4) 仅清理过期记录，避开 60s 冷启动缓冲后再开始后台主动巡检（之后每 60s 一次）
+                        if tick_count >= 5 && (tick_count - 5) % 4 == 0 {
                             let now = chrono::Utc::now().timestamp();
                             let raw_list: Vec<ProxyToken> = tokens_map.iter().map(|r| r.value().clone()).collect();
 
@@ -1180,6 +1184,29 @@ impl TokenManager {
                 Some(new_dp)
             }
         };
+
+        // [NEW] 启动时从磁盘 live_limited_models 恢复未过期的模型/账号限流锁，防止重启越狱
+        if let Some(live_limits) = account
+            .get("live_limited_models")
+            .and_then(|v| v.as_object())
+        {
+            let now_ts = chrono::Utc::now().timestamp();
+            for (model_key, entry) in live_limits {
+                let until = entry.get("until").and_then(|v| v.as_i64()).unwrap_or(0);
+                if until > now_ts {
+                    let reason_str = entry
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown");
+                    self.rate_limit_tracker.restore_persisted_limit(
+                        &account_id,
+                        Some(model_key.as_str()),
+                        until,
+                        reason_str,
+                    );
+                }
+            }
+        }
 
         Ok(Some(ProxyToken {
             account_id,
@@ -2460,8 +2487,25 @@ impl TokenManager {
             }
         });
 
-        let resp1 = client
-            .post(step1_url)
+        let (rb1, _, _) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
+            &client,
+            step1_url,
+            Some(account_id),
+            "h1",
+            false,
+            Some(15_000),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("⚠️ [WarmupPad] Cold account {} strict proxy/transport error: {}", email, e);
+                crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
+                return false;
+            }
+        };
+
+        let resp1 = rb1
             .bearer_auth(access_token)
             .header("User-Agent", ua.as_str())
             .header("Content-Type", "application/json")
@@ -2561,8 +2605,25 @@ impl TokenManager {
             "project": effective_project
         });
 
-        let resp2 = client
-            .post(step2_url)
+        let (rb2, _, _) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
+            &client,
+            step2_url,
+            Some(account_id),
+            "h1",
+            false,
+            Some(15_000),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("⚠️ [WarmupPad] Cold account {} strict proxy/transport error: {}", email, e);
+                crate::proxy::account_selector::record_warmup_failure_backoff(account_id, 900);
+                return false;
+            }
+        };
+
+        let resp2 = rb2
             .bearer_auth(access_token)
             .header("User-Agent", ua.as_str())
             .header("Content-Type", "application/json")
@@ -2577,10 +2638,13 @@ impl TokenManager {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(10), res.bytes()).await;
                 let elapsed_ms = start.elapsed().as_millis();
                 tracing::info!(
-                    "✨ [WarmupPad] Successfully warmed up cold account {} via zero-token handshake in {}ms. Marking warm.",
+                    "✨ [WarmupPad] Successfully warmed up cold account {} via zero-token handshake in {}ms. Marking warm (Tier3 ready).",
                     email,
                     elapsed_ms
                 );
+                // loadCodeAssist + fetchUserInfo 双步官方握手均已成功，记满 2 次成功交互直接晋升 Tier3SweetSpot，
+                // 避免 240s 后后台因仍处 Tier2Warming 对同一账号重打第二轮无意义握手
+                crate::proxy::account_selector::record_warm_interaction(account_id);
                 crate::proxy::account_selector::record_warm_interaction(account_id);
                 true
             }
