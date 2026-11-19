@@ -1139,7 +1139,7 @@ async fn try_compress_gemini_with_summary(
         .map(|t| t.access_token.clone())
         .ok_or_else(|| "No access token available".to_string())?;
 
-    let wrapped_summary_body = wrap_request(
+    let mut wrapped_summary_body = wrap_request(
         &summary_request,
         project_id,
         INTERNAL_BACKGROUND_TASK,
@@ -1147,6 +1147,11 @@ async fn try_compress_gemini_with_summary(
         Some(session_id_str),
         token_obj.as_ref(),
     );
+
+    if let Some(inner) = wrapped_summary_body.get_mut("request") {
+        crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(inner);
+        crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(inner);
+    }
 
     let pool = crate::proxy::proxy_pool::get_global_proxy_pool()
         .ok_or_else(|| "Proxy pool not initialized".to_string())?;
@@ -1165,7 +1170,7 @@ async fn try_compress_gemini_with_summary(
     let _ = project_id; // project_id is already embedded in wrapped_summary_body
     let upstream_url = "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
 
-    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+    let (rb, go_egress, via_go) = crate::utils::go_transport::post_with_sidecar_or_fallback(
         &client,
         upstream_url,
         Some(account_id),
@@ -1175,26 +1180,25 @@ async fn try_compress_gemini_with_summary(
     )
     .await?;
 
-    let response = rb
-        .header(
+    let fallback_pid = match &route {
+        crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+        _ => None,
+    };
+    let effective_pid = go_egress.as_deref().or(fallback_pid);
+
+    let response = crate::utils::go_transport::send_checked(
+        rb.header(
             "User-Agent",
             crate::constants::get_account_user_agent(Some(account_id)),
         )
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
-        .json(&wrapped_summary_body)
-        .send()
-        .await
-        .map_err(|e| {
-            if let crate::proxy::proxy_pool::EgressRoute::Pool { ref entry_id } = route {
-                let pool_clone = std::sync::Arc::clone(&pool);
-                let pid = entry_id.clone();
-                tokio::spawn(async move {
-                    pool_clone.mark_proxy_unhealthy(&pid).await;
-                });
-            }
-            format!("API call failed: {}", e)
-        })?;
+        .json(&wrapped_summary_body),
+        via_go,
+        effective_pid,
+    )
+    .await
+    .map_err(|e| format!("API call failed: {}", e))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -1209,17 +1213,9 @@ async fn try_compress_gemini_with_summary(
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-    let payload = gemini_response.get("response").unwrap_or(&gemini_response);
-    let xml_summary = payload
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.get(0))
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "Failed to extract text from response".to_string())?;
+    let xml_summary =
+        crate::proxy::mappers::common_utils::extract_v1internal_primary_text(&gemini_response)
+            .ok_or_else(|| "Failed to extract text from response".to_string())?;
 
     info!(
         "[{}] [Layer-3] [Gemini] Generated XML summary (len: {} chars)",
@@ -2261,7 +2257,7 @@ mod tests {
         assert_eq!(ws["request"]["tools"].as_array().unwrap().len(), 1);
         assert!(ws["request"]["tools"][0].get("googleSearch").is_some());
 
-        // Bare Gemini agent request without tools gets 14 official default tools + <tool_availability>
+        // Bare Gemini agent request without tools gets 14 official default tools without fabricated <tool_availability>
         let bare = wrap_request(
             &json!({ "contents": [{ "role": "user", "parts": [{ "text": "Explain HTTP keepalive" }] }] }),
             "test-proj",
@@ -2271,7 +2267,7 @@ mod tests {
             None,
         );
         assert_eq!(bare["request"]["tools"].as_array().unwrap().len(), 14);
-        assert!(bare["request"]["systemInstruction"]["parts"][0]["text"]
+        assert!(!bare["request"]["systemInstruction"]["parts"][0]["text"]
             .as_str()
             .unwrap()
             .contains("<tool_availability>"));

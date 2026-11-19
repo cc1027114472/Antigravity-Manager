@@ -2507,15 +2507,16 @@ async fn call_gemini_sync(
     request: &ClaudeRequest,
     token_manager: &Arc<crate::proxy::TokenManager>,
     trace_id: &str,
+    session_id: Option<&str>,
 ) -> Result<String, String> {
-    // Get token and transform request
+    // Get token and transform request (preserve sticky session_id to avoid cross-account borrowing)
     let (access_token, project_id, _, account_id, _wait_ms) = token_manager
-        .get_token("gemini", false, None, model)
+        .get_token("gemini", false, session_id, model)
         .await
         .map_err(|e| format!("Failed to get account: {}", e))?;
 
     let token_obj = token_manager.get_token_by_id(&account_id);
-    let gemini_body = crate::proxy::mappers::claude::transform_claude_request_in(
+    let mut gemini_body = crate::proxy::mappers::claude::transform_claude_request_in(
         request,
         &project_id,
         false,
@@ -2524,6 +2525,11 @@ async fn call_gemini_sync(
         token_obj.as_ref(),
     )
     .map_err(|e| format!("Failed to transform request: {}", e))?;
+
+    if let Some(inner) = gemini_body.get_mut("request") {
+        crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(inner);
+        crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(inner);
+    }
 
     // Call Gemini API via account proxy
     let pool = crate::proxy::proxy_pool::get_global_proxy_pool()
@@ -2547,7 +2553,7 @@ async fn call_gemini_sync(
         trace_id, route, model
     );
 
-    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+    let (rb, go_egress, via_go) = crate::utils::go_transport::post_with_sidecar_or_fallback(
         &client,
         upstream_url,
         Some(account_id.as_str()),
@@ -2557,26 +2563,25 @@ async fn call_gemini_sync(
     )
     .await?;
 
-    let response = rb
-        .header(
+    let fallback_pid = match &route {
+        crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+        _ => None,
+    };
+    let effective_pid = go_egress.as_deref().or(fallback_pid);
+
+    let response = crate::utils::go_transport::send_checked(
+        rb.header(
             "User-Agent",
             crate::constants::get_account_user_agent(Some(&account_id)),
         )
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
-        .json(&gemini_body)
-        .send()
-        .await
-        .map_err(|e| {
-            if let crate::proxy::proxy_pool::EgressRoute::Pool { ref entry_id } = route {
-                let pool_clone = std::sync::Arc::clone(&pool);
-                let pid = entry_id.clone();
-                tokio::spawn(async move {
-                    pool_clone.mark_proxy_unhealthy(&pid).await;
-                });
-            }
-            format!("API call failed: {}", e)
-        })?;
+        .json(&gemini_body),
+        via_go,
+        effective_pid,
+    )
+    .await
+    .map_err(|e| format!("API call failed: {}", e))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -2591,17 +2596,8 @@ async fn call_gemini_sync(
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-    // Extract text from v1internal response wrapper (fallback to top-level candidates)
-    let payload = gemini_response.get("response").unwrap_or(&gemini_response);
-    payload
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.get(0))
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
+    // Extract primary non-thought text from v1internal response wrapper (skips thought/functionCall parts)
+    crate::proxy::mappers::common_utils::extract_v1internal_primary_text(&gemini_response)
         .ok_or_else(|| "Failed to extract text from response".to_string())
 }
 
@@ -2681,12 +2677,15 @@ async fn try_compress_with_summary(
         trace_id, INTERNAL_BACKGROUND_TASK
     );
 
-    // 3. Call upstream using helper function (reuse existing infrastructure)
+    // 3. Call upstream using helper function (preserve sticky session binding)
+    let sticky_session_id =
+        crate::proxy::session_manager::SessionManager::extract_session_id(original_request);
     let xml_summary = call_gemini_sync(
         INTERNAL_BACKGROUND_TASK,
         &summary_request,
         token_manager,
         trace_id,
+        Some(sticky_session_id.as_str()),
     )
     .await?;
 

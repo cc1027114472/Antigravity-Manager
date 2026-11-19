@@ -546,20 +546,39 @@ impl UpstreamClient {
                 let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
 
                 let is_streaming = method == "streamGenerateContent";
-                let (mut req_builder, via_go) = if crate::utils::go_transport::relay_url().is_some() {
-                    let (rb, _go_egress, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
-                        &client,
-                        &url,
-                        account_id,
-                        "h1",
-                        is_streaming,
-                        None,
-                    )
-                    .await?;
-                    (rb.headers(headers.clone()), true)
+
+                // [WATCHDOG] 端点级自适应防假死超时：流式接口保底 120s 满足大模型思维链与长上下文冷推理 (TTFT ~35s)，
+                // 普通轻量请求保底 15s 快速探活，兼顾防上游静默挂起与避免长思考被误判假死导致 429 假阳性
+                let watchdog_secs = if is_streaming {
+                    std::cmp::max(120, (body_bytes.len() as u64) / (64 * 1024) + 120)
                 } else {
-                    (client.post(&url).headers(headers.clone()), false)
+                    std::cmp::max(15, (body_bytes.len() as u64) / (256 * 1024) + 15)
                 };
+
+                let (mut req_builder, effective_egress_id, via_go) =
+                    if crate::utils::go_transport::relay_url().is_some() {
+                        let (rb, go_egress, _) =
+                            crate::utils::go_transport::post_with_sidecar_header_timeout(
+                                &client,
+                                &url,
+                                account_id,
+                                "h1",
+                                is_streaming,
+                                Some(watchdog_secs * 1000),
+                            )
+                            .await?;
+                        (
+                            rb.headers(headers.clone()),
+                            go_egress.or_else(|| egress_proxy_id.clone()),
+                            true,
+                        )
+                    } else {
+                        (
+                            client.post(&url).headers(headers.clone()),
+                            egress_proxy_id.clone(),
+                            false,
+                        )
+                    };
 
                 // [FIX] 仅对流式接口 (streamGenerateContent) 使用分块传输仿真
                 // 对其他接口 (如 generateContent, loadCodeAssist) 发送正常的固定长度 Body
@@ -573,71 +592,116 @@ impl UpstreamClient {
                     req_builder = req_builder.body(body_bytes.clone());
                 }
 
-                // [WATCHDOG] 端点级自适应防假死超时：流式接口保底 120s 满足大模型思维链与长上下文冷推理 (TTFT ~35s)，
-                // 普通轻量请求保底 15s 快速探活，兼顾防上游静默挂起与避免长思考被误判假死导致 429 假阳性
-                let watchdog_secs = if method == "streamGenerateContent" {
-                    std::cmp::max(120, (body_bytes.len() as u64) / (64 * 1024) + 120)
+                // 无论单端点还是多端点，等待响应头阶段一律受 watchdog 硬超时兜底（Go 侧先于 Rust 5s 触发并返回精确错误）
+                let rust_timeout_secs = if via_go {
+                    watchdog_secs + 5
                 } else {
-                    std::cmp::max(15, (body_bytes.len() as u64) / (256 * 1024) + 15)
+                    watchdog_secs
                 };
                 let send_future = req_builder.send();
-                let response = if has_next {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(watchdog_secs),
-                        send_future,
-                    )
-                    .await
-                    {
-                        Ok(res) => res,
-                        Err(_) => {
-                            let err_msg = format!(
-                                "HTTP request timed out after {}s waiting for response headers at {} (method={}, body_len={})",
-                                watchdog_secs, base_url, method, body_bytes.len()
-                            );
-                            tracing::warn!(
-                                account_id = %account_id.unwrap_or("generic"),
-                                proxy_id = %egress_proxy_id.as_deref().unwrap_or("upstream"),
-                                endpoint = %base_url,
-                                method = %method,
-                                err_kind = "timeout",
-                                endpoint_idx = idx,
-                                "[NET-OBS] endpoint timeout, failing over: {}",
-                                err_msg
-                            );
-                            fallback_attempts.push(FallbackAttemptLog {
-                                endpoint_url: base_url.to_string(),
-                                status: None,
-                                error: err_msg.clone(),
-                            });
-                            last_err = Some(err_msg);
+                let response = match tokio::time::timeout(
+                    std::time::Duration::from_secs(rust_timeout_secs),
+                    send_future,
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_) => {
+                        let err_msg = format!(
+                            "HTTP request timed out after {}s waiting for response headers at {} (method={}, body_len={})",
+                            rust_timeout_secs, base_url, method, body_bytes.len()
+                        );
+                        tracing::warn!(
+                            account_id = %account_id.unwrap_or("generic"),
+                            proxy_id = %effective_egress_id.as_deref().unwrap_or("upstream"),
+                            endpoint = %base_url,
+                            method = %method,
+                            err_kind = "timeout",
+                            endpoint_idx = idx,
+                            "[NET-OBS] endpoint timeout, failing over: {}",
+                            err_msg
+                        );
+                        fallback_attempts.push(FallbackAttemptLog {
+                            endpoint_url: base_url.to_string(),
+                            status: None,
+                            error: err_msg.clone(),
+                        });
+                        last_err = Some(err_msg);
 
-                            if egress_proxy_id.is_some() {
-                                self.record_egress_outcome(
-                                    egress_proxy_id.as_deref(),
-                                    crate::proxy::proxy_pool::EgressUsageStatus::Failed,
-                                );
-                                if let (Some(pool), Some(ref id)) = (&self.proxy_pool, &egress_proxy_id) {
-                                    let pool_clone = Arc::clone(pool);
-                                    let proxy_id_str = id.clone();
-                                    tokio::spawn(async move {
-                                        pool_clone.mark_proxy_unhealthy(&proxy_id_str).await;
-                                    });
-                                }
-                                // 专属代理超时：立即熔断退出端点循环，严禁在同一条卡死代理上继续重试 sandbox 端点！
-                                break;
+                        if effective_egress_id.is_some() {
+                            self.record_egress_outcome(
+                                effective_egress_id.as_deref(),
+                                crate::proxy::proxy_pool::EgressUsageStatus::Failed,
+                            );
+                            if let (Some(pool), Some(ref id)) =
+                                (&self.proxy_pool, &effective_egress_id)
+                            {
+                                let pool_clone = Arc::clone(pool);
+                                let proxy_id_str = id.clone();
+                                tokio::spawn(async move {
+                                    pool_clone.mark_proxy_unhealthy(&proxy_id_str).await;
+                                });
                             }
-                            continue;
+                            // 专属代理超时：立即熔断退出端点循环
+                            break;
                         }
+                        if !has_next {
+                            break;
+                        }
+                        continue;
                     }
-                } else {
-                    send_future.await
                 };
 
                 match response {
                     Ok(resp) => {
-                        // Any HTTP response means the egress path worked.
+                        // Distinguish Go sidecar proxy/transport error (X-Ag-Proxy-Error: 1) from real Google HTTP responses
+                        if via_go && crate::utils::go_transport::is_sidecar_proxy_error(&resp) {
+                            let status = resp.status();
+                            let err_body = resp.text().await.unwrap_or_default();
+                            let msg = format!(
+                                "Go sidecar proxy transport error at {} ({}): {}",
+                                base_url,
+                                status,
+                                err_body.trim()
+                            );
+                            tracing::warn!(
+                                account_id = %account_id.unwrap_or("generic"),
+                                proxy_id = %effective_egress_id.as_deref().unwrap_or("upstream"),
+                                endpoint = %base_url,
+                                method = %method,
+                                err_kind = "go_sidecar_proxy_error",
+                                endpoint_idx = idx,
+                                "[NET-OBS] egress transport failure (Go sidecar): {}",
+                                msg
+                            );
+                            self.record_egress_outcome(
+                                effective_egress_id.as_deref(),
+                                crate::proxy::proxy_pool::EgressUsageStatus::Failed,
+                            );
+                            if let (Some(pool), Some(ref id)) =
+                                (&self.proxy_pool, &effective_egress_id)
+                            {
+                                let pool_clone = Arc::clone(pool);
+                                let proxy_id_str = id.clone();
+                                tokio::spawn(async move {
+                                    pool_clone.mark_proxy_unhealthy(&proxy_id_str).await;
+                                });
+                            }
+                            fallback_attempts.push(FallbackAttemptLog {
+                                endpoint_url: url.clone(),
+                                status: None,
+                                error: msg.clone(),
+                            });
+                            last_err = Some(msg);
+                            if effective_egress_id.is_some() || !has_next {
+                                break;
+                            }
+                            continue;
+                        }
+
+                        // Any real HTTP response from Google means the egress path worked.
                         self.record_egress_outcome(
-                            egress_proxy_id.as_deref(),
+                            effective_egress_id.as_deref(),
                             crate::proxy::proxy_pool::EgressUsageStatus::Ok,
                         );
 
@@ -705,12 +769,20 @@ impl UpstreamClient {
                         });
                     }
                     Err(e) => {
-                        if Self::is_egress_transport_error(&e) {
+                        if via_go && e.is_connect() {
+                            // Local Go sidecar loopback connection failed: trigger self-heal restart,
+                            // do NOT blame the remote proxy node.
+                            tracing::warn!(
+                                "[GoTransport] Loopback connection to Go sidecar failed ({}); triggering restart",
+                                e
+                            );
+                            crate::utils::go_transport::notify_loopback_failure();
+                        } else if Self::is_egress_transport_error(&e) {
                             // [NET-OBS] 网络波动观察日志：传输层失败（连接/超时/DNS/TLS/代理握手/连接重置）
                             // 统一前缀便于在 logs/app.log 中 grep。仅观察，不改任何行为。
                             tracing::warn!(
                                 account_id = %account_id.unwrap_or("generic"),
-                                proxy_id = %egress_proxy_id.as_deref().unwrap_or("upstream"),
+                                proxy_id = %effective_egress_id.as_deref().unwrap_or("upstream"),
                                 endpoint = %base_url,
                                 method = %method,
                                 err_kind = Self::classify_egress_error(&e),
@@ -720,10 +792,12 @@ impl UpstreamClient {
                             );
 
                             self.record_egress_outcome(
-                                egress_proxy_id.as_deref(),
+                                effective_egress_id.as_deref(),
                                 crate::proxy::proxy_pool::EgressUsageStatus::Failed,
                             );
-                            if let (Some(pool), Some(ref id)) = (&self.proxy_pool, &egress_proxy_id) {
+                            if let (Some(pool), Some(ref id)) =
+                                (&self.proxy_pool, &effective_egress_id)
+                            {
                                 let pool_clone = Arc::clone(pool);
                                 let proxy_id_str = id.clone();
                                 tokio::spawn(async move {
@@ -734,7 +808,7 @@ impl UpstreamClient {
                             // [NET-OBS] 非传输层错误（例如连接建立成功但协议层失败），也记录以便对比
                             tracing::warn!(
                                 account_id = %account_id.unwrap_or("generic"),
-                                proxy_id = %egress_proxy_id.as_deref().unwrap_or("upstream"),
+                                proxy_id = %effective_egress_id.as_deref().unwrap_or("upstream"),
                                 endpoint = %base_url,
                                 method = %method,
                                 err_kind = Self::classify_egress_error(&e),
@@ -754,7 +828,7 @@ impl UpstreamClient {
                         last_err = Some(msg);
 
                         // 若是专属代理传输层故障，该代理已被置为 RED，严禁在同一条故障代理上继续重试 sandbox 端点
-                        if egress_proxy_id.is_some() && Self::is_egress_transport_error(&e) {
+                        if !via_go && effective_egress_id.is_some() && Self::is_egress_transport_error(&e) {
                             break;
                         }
 

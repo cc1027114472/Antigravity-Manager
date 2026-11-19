@@ -3,24 +3,38 @@ use rquest::{Client, RequestBuilder};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const HDR_TARGET_URL: &str = "X-Ag-Target-Url";
 pub const HDR_PROXY_URL: &str = "X-Ag-Proxy";
 pub const HDR_PROTO: &str = "X-Ag-Proto";
 pub const HDR_CHUNKED: &str = "X-Ag-Chunked";
 pub const HDR_TIMEOUT_MS: &str = "X-Ag-Timeout-Ms";
+pub const HDR_HEADER_TIMEOUT_MS: &str = "X-Ag-Header-Timeout-Ms";
 pub const HDR_EVICT_GEN: &str = "X-Ag-Evict-Gen";
+pub const HDR_ACCOUNT_ID: &str = "X-Ag-Account-Id";
+pub const HDR_PROXY_ERROR: &str = "X-Ag-Proxy-Error";
 
 struct GoSidecar {
-    _child: Child,
+    child: Child,
     _stdin: ChildStdin,
     relay_url: String,
 }
 
 static SIDECAR: OnceLock<Mutex<Option<GoSidecar>>> = OnceLock::new();
 static RELAY_URL_CACHE: Lazy<RwLock<Option<String>>> = Lazy::new(|| RwLock::new(None));
+static BINARY_MISSING: AtomicBool = AtomicBool::new(false);
+static LAST_LIVENESS_CHECK_SECS: AtomicU64 = AtomicU64::new(0);
+static LAST_SPAWN_ATTEMPT_SECS: AtomicU64 = AtomicU64::new(0);
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 static LOOPBACK_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
@@ -98,22 +112,22 @@ fn spawn_sidecar() -> Option<GoSidecar> {
     tracing::info!("[GoTransport] Go native TLS/HTTP sidecar ready at {}", relay_url);
 
     Some(GoSidecar {
-        _child: child,
+        child,
         _stdin: stdin,
         relay_url,
     })
 }
 
-/// Start the Go native TLS/HTTP transport sidecar if available (no-op in tests or if ABV_GO_TRANSPORT=0).
-pub fn ensure_started() {
-    if cfg!(test) {
-        return;
-    }
-    if std::env::var("ABV_GO_TRANSPORT")
+fn is_disabled_by_env() -> bool {
+    std::env::var("ABV_GO_TRANSPORT")
         .map(|v| v.trim() == "0" || v.trim().eq_ignore_ascii_case("false"))
         .unwrap_or(false)
-    {
-        tracing::info!("[GoTransport] Disabled via ABV_GO_TRANSPORT=0; using Rust rquest fallback");
+}
+
+/// Start (or self-heal restart) the Go native TLS/HTTP transport sidecar if available
+/// (no-op in tests or if ABV_GO_TRANSPORT=0).
+pub fn ensure_started() {
+    if cfg!(test) || is_disabled_by_env() {
         return;
     }
     if let Ok(ext_url) = std::env::var("ABV_GO_TRANSPORT_URL") {
@@ -122,32 +136,94 @@ pub fn ensure_started() {
             if let Ok(mut w) = RELAY_URL_CACHE.write() {
                 *w = Some(trimmed.to_string());
             }
-            tracing::info!("[GoTransport] Using external Go sidecar URL: {}", trimmed);
             return;
         }
     }
 
+    let now = now_unix_secs();
+    LAST_LIVENESS_CHECK_SECS.store(now, Ordering::Relaxed);
+
     let lock = SIDECAR.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = lock.lock() {
+        if let Some(sidecar) = guard.as_mut() {
+            match sidecar.child.try_wait() {
+                Ok(None) => return, // Still alive
+                Ok(Some(status)) => {
+                    tracing::warn!(
+                        "[GoTransport] Sidecar exited unexpectedly ({}); restarting...",
+                        status
+                    );
+                    *guard = None;
+                    if let Ok(mut w) = RELAY_URL_CACHE.write() {
+                        *w = None;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[GoTransport] Failed to poll sidecar liveness ({}); restarting...", e);
+                    *guard = None;
+                    if let Ok(mut w) = RELAY_URL_CACHE.write() {
+                        *w = None;
+                    }
+                }
+            }
+        }
+
         if guard.is_none() {
+            if candidate_binary_paths().iter().all(|p| !p.is_file()) {
+                if !BINARY_MISSING.swap(true, Ordering::Relaxed) {
+                    tracing::debug!("[GoTransport] Sidecar binary not found; using Rust rquest fallback");
+                }
+                return;
+            }
+            BINARY_MISSING.store(false, Ordering::Relaxed);
+
+            // Throttle respawn attempts to at most once every 2 seconds to prevent crash-loop spin
+            let prev = LAST_SPAWN_ATTEMPT_SECS.load(Ordering::Relaxed);
+            if prev != 0 && now.saturating_sub(prev) < 2 {
+                return;
+            }
+            LAST_SPAWN_ATTEMPT_SECS.store(now, Ordering::Relaxed);
+
             if let Some(sidecar) = spawn_sidecar() {
                 if let Ok(mut w) = RELAY_URL_CACHE.write() {
                     *w = Some(sidecar.relay_url.clone());
                 }
                 *guard = Some(sidecar);
-            } else {
-                tracing::debug!("[GoTransport] Sidecar binary not found; using Rust rquest fallback");
             }
         }
     }
 }
 
-/// Returns `Some("http://127.0.0.1:<port>/relay")` when the Go sidecar is active.
-pub fn relay_url() -> Option<String> {
+/// Immediately check sidecar liveness and restart if a loopback connection failed.
+pub fn notify_loopback_failure() {
     if cfg!(test) {
+        return;
+    }
+    LAST_LIVENESS_CHECK_SECS.store(0, Ordering::Relaxed);
+    ensure_started();
+}
+
+/// Returns `Some("http://127.0.0.1:<port>/relay")` when the Go sidecar is active,
+/// lazily starting or periodically verifying liveness (every 5s) with zero hot-path locks.
+pub fn relay_url() -> Option<String> {
+    if cfg!(test) || is_disabled_by_env() {
         return None;
     }
-    RELAY_URL_CACHE.read().ok().and_then(|g| g.clone())
+    let cached = RELAY_URL_CACHE.read().ok().and_then(|g| g.clone());
+    if cached.is_none() {
+        if !BINARY_MISSING.load(Ordering::Relaxed) {
+            ensure_started();
+            return RELAY_URL_CACHE.read().ok().and_then(|g| g.clone());
+        }
+        return None;
+    }
+    let now = now_unix_secs();
+    let last_check = LAST_LIVENESS_CHECK_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last_check) >= 5 {
+        ensure_started();
+        return RELAY_URL_CACHE.read().ok().and_then(|g| g.clone());
+    }
+    cached
 }
 
 pub fn loopback_client() -> Client {
@@ -162,6 +238,7 @@ pub fn prepare_relay_request(
     chunked: bool,
     timeout_ms: Option<u64>,
     evict_gen: Option<u64>,
+    account_id: Option<&str>,
 ) -> RequestBuilder {
     let mut b = builder
         .header(HDR_TARGET_URL, target_url)
@@ -175,6 +252,9 @@ pub fn prepare_relay_request(
     }
     if let Some(gen_val) = evict_gen {
         b = b.header(HDR_EVICT_GEN, gen_val.to_string());
+    }
+    if let Some(acc_id) = account_id.filter(|s| !s.trim().is_empty()) {
+        b = b.header(HDR_ACCOUNT_ID, acc_id);
     }
     b
 }
@@ -222,6 +302,104 @@ pub async fn resolve_strict_proxy_url(
     ))
 }
 
+/// Returns true when the response came from the Go sidecar reporting an upstream/proxy transport error
+/// (as opposed to an actual HTTP response returned by Google).
+pub fn is_sidecar_proxy_error(resp: &rquest::Response) -> bool {
+    resp.headers().get(HDR_PROXY_ERROR).is_some()
+}
+
+/// Inspect a `rquest::Response` returned from a Go sidecar relay call.
+/// If `X-Ag-Proxy-Error: 1` is present, marks `go_egress_id` unhealthy in the global proxy pool
+/// and converts the synthetic 502 into a transport `Err(String)`.
+pub async fn check_sidecar_proxy_error(
+    resp: rquest::Response,
+    via_go: bool,
+    go_egress_id: Option<&str>,
+) -> Result<rquest::Response, String> {
+    if via_go && is_sidecar_proxy_error(&resp) {
+        if let Some(pid) = go_egress_id {
+            if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                let pid_owned = pid.to_string();
+                tokio::spawn(async move {
+                    pool.mark_proxy_unhealthy(&pid_owned).await;
+                });
+            }
+        }
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Go sidecar proxy transport error ({}): {}",
+            status,
+            body.trim()
+        ));
+    }
+    Ok(resp)
+}
+
+/// Execute `rb.send().await` with unified Go sidecar error handling:
+/// - Loopback connect failure -> triggers sidecar self-heal restart (does NOT blame remote proxy)
+/// - `X-Ag-Proxy-Error: 1` -> marks `egress_id` unhealthy in proxy pool and returns `Err(String)`
+/// - Direct Rust fallback `Err(e)` -> marks `egress_id` unhealthy in proxy pool and returns `Err(String)`
+pub async fn send_checked(
+    rb: RequestBuilder,
+    via_go: bool,
+    egress_id: Option<&str>,
+) -> Result<rquest::Response, String> {
+    match rb.send().await {
+        Ok(resp) => check_sidecar_proxy_error(resp, via_go, egress_id).await,
+        Err(e) => {
+            if via_go && e.is_connect() {
+                tracing::warn!(
+                    "[GoTransport] Loopback connection to Go sidecar failed ({}); triggering restart",
+                    e
+                );
+                notify_loopback_failure();
+            } else if !via_go {
+                if let Some(pid) = egress_id {
+                    if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                        let pid_owned = pid.to_string();
+                        tokio::spawn(async move {
+                            pool.mark_proxy_unhealthy(&pid_owned).await;
+                        });
+                    }
+                }
+            }
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Build a POST RequestBuilder routed through the Go native TLS/HTTP sidecar when active,
+/// using response-header-only timeout (`X-Ag-Header-Timeout-Ms`) so long SSE streams are never truncated.
+pub async fn post_with_sidecar_header_timeout(
+    fallback_client: &Client,
+    target_url: &str,
+    account_id: Option<&str>,
+    proto: &str,
+    chunked: bool,
+    header_timeout_ms: Option<u64>,
+) -> Result<(RequestBuilder, Option<String>, bool), String> {
+    if let Some(relay) = relay_url() {
+        let (proxy_url, egress_id, evict_gen) = resolve_strict_proxy_url(account_id).await?;
+        let mut rb = prepare_relay_request(
+            loopback_client().post(&relay),
+            target_url,
+            &proxy_url,
+            proto,
+            chunked,
+            None,
+            evict_gen,
+            account_id,
+        );
+        if let Some(ms) = header_timeout_ms {
+            rb = rb.header(HDR_HEADER_TIMEOUT_MS, ms.to_string());
+        }
+        Ok((rb, egress_id, true))
+    } else {
+        Ok((fallback_client.post(target_url), None, false))
+    }
+}
+
 /// Build a POST RequestBuilder routed through the Go native TLS/HTTP sidecar when active,
 /// or falling back to the given Rust `rquest::Client` directly.
 pub async fn post_with_sidecar_or_fallback(
@@ -242,6 +420,7 @@ pub async fn post_with_sidecar_or_fallback(
             chunked,
             timeout_ms,
             evict_gen,
+            account_id,
         );
         Ok((rb, egress_id, true))
     } else {
@@ -268,6 +447,7 @@ pub async fn get_with_sidecar_or_fallback(
             false,
             timeout_ms,
             evict_gen,
+            account_id,
         );
         Ok((rb, egress_id, true))
     } else {
@@ -306,6 +486,7 @@ mod tests {
             false,
             Some(60_000),
             Some(1),
+            Some("acc-test-1"),
         )
         .header("User-Agent", "antigravity/hub/2.31.0 (aidev_client; os_type=windows; arch=amd64; cl=1017595969)")
         .header("Authorization", "Bearer test-token")
@@ -321,5 +502,39 @@ mod tests {
         assert!(!lower.contains("\naccept:"), "unexpected Accept header emitted: {}", headers_section);
         assert!(!lower.contains("\ncookie:"), "unexpected Cookie header emitted: {}", headers_section);
         assert!(!lower.contains("\nsec-"), "unexpected Sec-* browser header emitted: {}", headers_section);
+    }
+
+    #[tokio::test]
+    async fn test_check_sidecar_proxy_error_distinguishes_real_502() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Connection 1: synthetic Go sidecar proxy error (502 + X-Ag-Proxy-Error: 1)
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let _ = s1.read(&mut buf).await;
+            let _ = s1
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nX-Ag-Proxy-Error: 1\r\nContent-Length: 10\r\n\r\nproxy down")
+                .await;
+
+            // Connection 2: real upstream Google HTTP 502 (no X-Ag-Proxy-Error)
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let _ = s2.read(&mut buf).await;
+            let _ = s2
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 10\r\n\r\ngoogle 502")
+                .await;
+        });
+
+        let url = format!("http://{}/relay", addr);
+        let res1 = send_checked(loopback_client().post(&url), true, None).await;
+        assert!(res1.is_err(), "X-Ag-Proxy-Error: 1 must become Err");
+        assert!(res1.unwrap_err().contains("proxy down"));
+
+        let res2 = send_checked(loopback_client().post(&url), true, None).await;
+        assert!(res2.is_ok(), "Real upstream 502 must stay Ok(Response)");
+        assert_eq!(res2.unwrap().status(), 502);
+
+        server.await.unwrap();
     }
 }

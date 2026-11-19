@@ -5856,16 +5856,24 @@ async fn call_openai_gemini_sync(
     request: &OpenAIRequest,
     token_manager: &std::sync::Arc<crate::proxy::TokenManager>,
     trace_id: &str,
+    session_id: Option<&str>,
 ) -> Result<String, String> {
     let (access_token, project_id, _, account_id, _wait_ms) = token_manager
-        .get_token("gemini", false, None, model)
+        .get_token("gemini", false, session_id, model)
         .await
         .map_err(|e| format!("Failed to get account: {}", e))?;
 
     let token_obj = token_manager.get_token_by_id(&account_id);
-    let session_id = format!("bg_sid_{}", chrono::Utc::now().timestamp_subsec_millis());
-    let (gemini_body, _, _, _) =
-        transform_openai_request(request, &project_id, &session_id, token_obj.as_ref());
+    let effective_sid = session_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("bg_sid_{}", chrono::Utc::now().timestamp_subsec_millis()));
+    let (mut gemini_body, _, _, _) =
+        transform_openai_request(request, &project_id, &effective_sid, token_obj.as_ref());
+
+    if let Some(inner) = gemini_body.get_mut("request") {
+        crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(inner);
+        crate::proxy::mappers::common_utils::enforce_tool_mutual_exclusion(inner);
+    }
 
     let pool = crate::proxy::proxy_pool::get_global_proxy_pool()
         .ok_or_else(|| "Proxy pool not initialized".to_string())?;
@@ -5888,7 +5896,7 @@ async fn call_openai_gemini_sync(
         trace_id, route, model
     );
 
-    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+    let (rb, go_egress, via_go) = crate::utils::go_transport::post_with_sidecar_or_fallback(
         &client,
         upstream_url,
         Some(account_id.as_str()),
@@ -5898,26 +5906,25 @@ async fn call_openai_gemini_sync(
     )
     .await?;
 
-    let response = rb
-        .header(
+    let fallback_pid = match &route {
+        crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+        _ => None,
+    };
+    let effective_pid = go_egress.as_deref().or(fallback_pid);
+
+    let response = crate::utils::go_transport::send_checked(
+        rb.header(
             "User-Agent",
             crate::constants::get_account_user_agent(Some(&account_id)),
         )
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
-        .json(&gemini_body)
-        .send()
-        .await
-        .map_err(|e| {
-            if let crate::proxy::proxy_pool::EgressRoute::Pool { ref entry_id } = route {
-                let pool_clone = std::sync::Arc::clone(&pool);
-                let pid = entry_id.clone();
-                tokio::spawn(async move {
-                    pool_clone.mark_proxy_unhealthy(&pid).await;
-                });
-            }
-            format!("API call failed: {}", e)
-        })?;
+        .json(&gemini_body),
+        via_go,
+        effective_pid,
+    )
+    .await
+    .map_err(|e| format!("API call failed: {}", e))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -5932,16 +5939,7 @@ async fn call_openai_gemini_sync(
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-    let payload = gemini_response.get("response").unwrap_or(&gemini_response);
-    payload
-        .get("candidates")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("content"))
-        .and_then(|c| c.get("parts"))
-        .and_then(|p| p.get(0))
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
+    crate::proxy::mappers::common_utils::extract_v1internal_primary_text(&gemini_response)
         .ok_or_else(|| "Failed to extract text from response".to_string())
 }
 
@@ -5998,6 +5996,8 @@ async fn try_compress_openai_with_summary(
     summary_request.stream = false;
     summary_request.max_tokens = Some(8000);
     summary_request.temperature = Some(0.3);
+    summary_request.tools = None;
+    summary_request.tool_choice = None;
 
     debug!(
         "[{}] [Layer-3] [OpenAI] Calling {} for summary generation",
@@ -6009,6 +6009,7 @@ async fn try_compress_openai_with_summary(
         &summary_request,
         token_manager,
         trace_id,
+        Some(session_id_str),
     )
     .await?;
 

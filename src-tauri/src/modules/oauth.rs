@@ -464,7 +464,7 @@ async fn exchange_code_once(
         crate::constants::NATIVE_OAUTH_USER_AGENT.as_str()
     );
 
-    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+    let (rb, go_egress, via_go) = crate::utils::go_transport::post_with_sidecar_or_fallback(
         &client,
         TOKEN_URL,
         None,
@@ -475,30 +475,31 @@ async fn exchange_code_once(
     .await
     .map_err(|e| (None, e))?;
 
-    let response = rb
-        .header(
+    let fallback_pid = match &egress {
+        crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+        _ => None,
+    };
+    let effective_pid = go_egress.as_deref().or(fallback_pid);
+
+    let response = crate::utils::go_transport::send_checked(
+        rb.header(
             rquest::header::USER_AGENT,
             crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
         )
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_connect() || e.is_timeout() {
-                (
-                    None,
-                    format!(
-                        "{} Token exchange request failed: {}. 请检查你的网络代理设置，确保可以稳定连接 Google 服务。",
-                        prefix, e
-                    ),
-                )
-            } else {
-                (
-                    None,
-                    format!("{} Token exchange request failed: {}", prefix, e),
-                )
-            }
-        })?;
+        .form(&params),
+        via_go,
+        effective_pid,
+    )
+    .await
+    .map_err(|e| {
+        (
+            None,
+            format!(
+                "{} Token exchange request failed: {}. 请检查你的网络代理设置，确保可以稳定连接 Google 服务。",
+                prefix, e
+            ),
+        )
+    })?;
 
     if response.status().is_success() {
         let mut token_res = response
@@ -669,7 +670,7 @@ async fn refresh_access_token_once(
         crate::constants::NATIVE_OAUTH_USER_AGENT.as_str()
     );
 
-    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+    let (rb, go_egress, via_go) = crate::utils::go_transport::post_with_sidecar_or_fallback(
         &client,
         TOKEN_URL,
         account_id,
@@ -680,38 +681,31 @@ async fn refresh_access_token_once(
     .await
     .map_err(|e| (None, e))?;
 
-    let response = rb
-        .header(
+    let fallback_pid = match &egress {
+        crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+        _ => None,
+    };
+    let effective_pid = go_egress.as_deref().or(fallback_pid);
+
+    let response = crate::utils::go_transport::send_checked(
+        rb.header(
             rquest::header::USER_AGENT,
             crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
         )
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| {
-            if let crate::proxy::proxy_pool::EgressRoute::Pool { ref entry_id } = egress {
-                if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                    let pid = entry_id.clone();
-                    tokio::spawn(async move {
-                        pool.mark_proxy_unhealthy(&pid).await;
-                    });
-                }
-            }
-            if e.is_connect() || e.is_timeout() {
-                (
-                    None,
-                    format!(
-                        "{} Refresh request failed: {}. 无法连接 Google 授权服务器，代理已标记为异常 (RED)。",
-                        prefix, e
-                    ),
-                )
-            } else {
-                (
-                    None,
-                    format!("{} Refresh request failed: {}", prefix, e),
-                )
-            }
-        })?;
+        .form(&params),
+        via_go,
+        effective_pid,
+    )
+    .await
+    .map_err(|e| {
+        (
+            None,
+            format!(
+                "{} Refresh request failed: {}. 无法连接 Google 授权服务器，代理已标记为异常 (RED)。",
+                prefix, e
+            ),
+        )
+    })?;
 
     if response.status().is_success() {
         let mut token_data = response
@@ -830,7 +824,7 @@ pub async fn get_user_info(
         return Err(err_msg);
     }
 
-    let (rb, _, _) = crate::utils::go_transport::get_with_sidecar_or_fallback(
+    let (rb, go_egress, via_go) = crate::utils::go_transport::get_with_sidecar_or_fallback(
         &client,
         USERINFO_URL,
         account_id,
@@ -839,15 +833,23 @@ pub async fn get_user_info(
     )
     .await?;
 
-    let response = rb
-        .header(
+    let fallback_pid = match &egress {
+        crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+        _ => None,
+    };
+    let effective_pid = go_egress.as_deref().or(fallback_pid);
+
+    let response = crate::utils::go_transport::send_checked(
+        rb.header(
             rquest::header::USER_AGENT,
             crate::constants::NATIVE_USERINFO_USER_AGENT.as_str(),
         )
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .map_err(|e| format!("User info request failed: {}", e))?;
+        .bearer_auth(access_token),
+        via_go,
+        effective_pid,
+    )
+    .await
+    .map_err(|e| format!("User info request failed: {}", e))?;
 
     if response.status().is_success() {
         response

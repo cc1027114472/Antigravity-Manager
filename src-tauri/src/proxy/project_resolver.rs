@@ -51,7 +51,7 @@ pub async fn fetch_project_id(
         return Err("严格代理策略拦截：未匹配到健康代理且上游代理未启用 (Direct)，禁止直连探测 Project ID".to_string());
     }
 
-    let (rb, _, _) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+    let (rb, go_egress, via_go) = crate::utils::go_transport::post_with_sidecar_or_fallback(
         &client,
         url,
         account_id,
@@ -61,14 +61,22 @@ pub async fn fetch_project_id(
     )
     .await?;
 
-    let response = rb
-        .bearer_auth(access_token)
-        .header("User-Agent", crate::constants::get_account_user_agent(account_id).as_str())
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("loadCodeAssist 请求失败: {}", e))?;
+    let fallback_pid = match &route {
+        crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+        _ => None,
+    };
+    let effective_pid = go_egress.as_deref().or(fallback_pid);
+
+    let response = crate::utils::go_transport::send_checked(
+        rb.bearer_auth(access_token)
+            .header("User-Agent", crate::constants::get_account_user_agent(account_id).as_str())
+            .header("Content-Type", "application/json")
+            .json(&request_body),
+        via_go,
+        effective_pid,
+    )
+    .await
+    .map_err(|e| format!("loadCodeAssist 请求失败: {}", e))?;
 
     if !response.status().is_success() {
         let status = response.status();

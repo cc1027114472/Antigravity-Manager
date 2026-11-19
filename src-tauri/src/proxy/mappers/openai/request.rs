@@ -2224,7 +2224,7 @@ mod tests {
         assert_eq!(inner["toolConfig"]["functionCallingConfig"]["mode"], "VALIDATED");
 
         // 4. tool_choice = "none" strips client tools, omits toolConfig without mode="NONE",
-        // and auto-fills official fallback agent tools with <tool_availability>
+        // and auto-fills official fallback agent tools without fabricated <tool_availability>
         let mut req_none = req.clone();
         req_none.tool_choice = Some(json!("none"));
         let (res_none, _, _, _) =
@@ -2234,7 +2234,7 @@ mod tests {
             .expect("agent request without client tools must receive fallback official tools");
         assert_eq!(fallback_tools.len(), 14);
         assert_ne!(fallback_tools[0]["functionDeclarations"][0]["name"], "t1");
-        assert!(res_none["request"]["systemInstruction"]["parts"][0]["text"]
+        assert!(!res_none["request"]["systemInstruction"]["parts"][0]["text"]
             .as_str()
             .unwrap()
             .contains("<tool_availability>"));
@@ -2460,7 +2460,7 @@ mod tests {
             14,
             "agent request without client tools must inject 14 official default tools"
         );
-        assert!(tiered_res["request"]["systemInstruction"]["parts"][0]["text"]
+        assert!(!tiered_res["request"]["systemInstruction"]["parts"][0]["text"]
             .as_str()
             .unwrap()
             .contains("<tool_availability>"));

@@ -3739,7 +3739,7 @@ mod tests {
             14
         );
         assert!(
-            no_tools_out["request"]["systemInstruction"]["parts"][0]["text"]
+            !no_tools_out["request"]["systemInstruction"]["parts"][0]["text"]
                 .as_str()
                 .unwrap()
                 .contains("<tool_availability>")

@@ -2487,7 +2487,7 @@ impl TokenManager {
             }
         });
 
-        let (rb1, _, _) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
+        let (rb1, go_egress1, via_go1) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
             &client,
             step1_url,
             Some(account_id),
@@ -2505,14 +2505,22 @@ impl TokenManager {
             }
         };
 
-        let resp1 = rb1
-            .bearer_auth(access_token)
-            .header("User-Agent", ua.as_str())
-            .header("Content-Type", "application/json")
-            .json(&step1_body)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await;
+        let fallback_pid = match &route {
+            crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+            _ => None,
+        };
+        let effective_pid1 = go_egress1.as_deref().or(fallback_pid);
+
+        let resp1 = crate::utils::go_transport::send_checked(
+            rb1.bearer_auth(access_token)
+                .header("User-Agent", ua.as_str())
+                .header("Content-Type", "application/json")
+                .json(&step1_body)
+                .timeout(std::time::Duration::from_secs(15)),
+            via_go1,
+            effective_pid1,
+        )
+        .await;
 
         let mut discovered_project_id: Option<String> = None;
         match resp1 {
@@ -2605,7 +2613,7 @@ impl TokenManager {
             "project": effective_project
         });
 
-        let (rb2, _, _) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
+        let (rb2, go_egress2, via_go2) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
             &client,
             step2_url,
             Some(account_id),
@@ -2623,14 +2631,18 @@ impl TokenManager {
             }
         };
 
-        let resp2 = rb2
-            .bearer_auth(access_token)
-            .header("User-Agent", ua.as_str())
-            .header("Content-Type", "application/json")
-            .json(&step2_body)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await;
+        let effective_pid2 = go_egress2.as_deref().or(fallback_pid);
+
+        let resp2 = crate::utils::go_transport::send_checked(
+            rb2.bearer_auth(access_token)
+                .header("User-Agent", ua.as_str())
+                .header("Content-Type", "application/json")
+                .json(&step2_body)
+                .timeout(std::time::Duration::from_secs(15)),
+            via_go2,
+            effective_pid2,
+        )
+        .await;
 
         match resp2 {
             Ok(res) if res.status().is_success() => {

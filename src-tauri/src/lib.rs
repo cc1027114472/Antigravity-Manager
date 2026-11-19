@@ -396,6 +396,9 @@ pub fn run() {
         .setup(|app| {
             info!("Setup starting...");
 
+            // Start Go native TLS/HTTP sidecar if present (same as headless mode)
+            crate::utils::go_transport::ensure_started();
+
             // Initialize log bridge with app handle for debug console
             modules::log_bridge::init_log_bridge(app.handle().clone());
 

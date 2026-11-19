@@ -14,22 +14,30 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	hdrTargetURL = "X-Ag-Target-Url"
-	hdrProxyURL  = "X-Ag-Proxy"
-	hdrProto     = "X-Ag-Proto"
-	hdrChunked   = "X-Ag-Chunked"
-	hdrTimeoutMs = "X-Ag-Timeout-Ms"
-	hdrEvictGen  = "X-Ag-Evict-Gen"
+	hdrTargetURL       = "X-Ag-Target-Url"
+	hdrProxyURL        = "X-Ag-Proxy"
+	hdrProto           = "X-Ag-Proto"
+	hdrChunked         = "X-Ag-Chunked"
+	hdrTimeoutMs       = "X-Ag-Timeout-Ms"
+	hdrHeaderTimeoutMs = "X-Ag-Header-Timeout-Ms"
+	hdrEvictGen        = "X-Ag-Evict-Gen"
+	hdrAccountID       = "X-Ag-Account-Id"
+	hdrProxyError      = "X-Ag-Proxy-Error"
+
+	maxTransportPoolEntries = 512
+	transportIdleEvictSecs  = 300
 )
 
 type transportEntry struct {
-	client    *http.Client
-	transport *http.Transport
-	evictGen  string
+	client       *http.Client
+	transport    *http.Transport
+	evictGen     string
+	lastUsedUnix atomic.Int64
 }
 
 type transportPool struct {
@@ -62,7 +70,7 @@ func normalizeProxyURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-func buildTransport(proxyURL *url.URL, proto string) *http.Transport {
+func buildTransport(proxyURL *url.URL, proto string, ephemeral bool) *http.Transport {
 	dialer := &net.Dialer{
 		Timeout:   20 * time.Second,
 		KeepAlive: 60 * time.Second,
@@ -70,11 +78,12 @@ func buildTransport(proxyURL *url.URL, proto string) *http.Transport {
 	tr := &http.Transport{
 		Proxy:                 http.ProxyURL(proxyURL),
 		DialContext:           dialer.DialContext,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
+		MaxIdleConns:          16,
+		MaxIdleConnsPerHost:   4,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   20 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		DisableKeepAlives:     ephemeral,
 	}
 	if proto == "h2" {
 		// Native Go HTTP/2 (matches Go-http-client/2.0 against oauth2.googleapis.com)
@@ -90,20 +99,29 @@ func buildTransport(proxyURL *url.URL, proto string) *http.Transport {
 	return tr
 }
 
-func (p *transportPool) getClient(proxyRaw, proto, evictGen string) (*http.Client, error) {
+func (p *transportPool) getClient(proxyRaw, proto, accountID, evictGen string) (*http.Client, func(), error) {
 	if proto != "h2" {
 		proto = "h1"
 	}
 	proxyURL, err := normalizeProxyURL(proxyRaw)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	key := proto + "|" + proxyURL.String()
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		// Anonymous / pre-login request (e.g. OAuth exchange_code): never share TCP/TLS connections across callers
+		tr := buildTransport(proxyURL, proto, true)
+		return &http.Client{Transport: tr}, tr.CloseIdleConnections, nil
+	}
+
+	key := proto + "|" + accountID + "|" + proxyURL.String()
+	now := time.Now().Unix()
 
 	p.mu.RLock()
 	if ent, ok := p.entries[key]; ok && ent.evictGen == evictGen {
+		ent.lastUsedUnix.Store(now)
 		p.mu.RUnlock()
-		return ent.client, nil
+		return ent.client, nil, nil
 	}
 	p.mu.RUnlock()
 
@@ -111,21 +129,33 @@ func (p *transportPool) getClient(proxyRaw, proto, evictGen string) (*http.Clien
 	defer p.mu.Unlock()
 	if ent, ok := p.entries[key]; ok {
 		if ent.evictGen == evictGen {
-			return ent.client, nil
+			ent.lastUsedUnix.Store(now)
+			return ent.client, nil, nil
 		}
 		ent.transport.CloseIdleConnections()
 	}
 
-	tr := buildTransport(proxyURL, proto)
+	if len(p.entries) >= maxTransportPoolEntries {
+		for k, ent := range p.entries {
+			if now-ent.lastUsedUnix.Load() > transportIdleEvictSecs {
+				ent.transport.CloseIdleConnections()
+				delete(p.entries, k)
+			}
+		}
+	}
+
+	tr := buildTransport(proxyURL, proto, false)
 	client := &http.Client{
 		Transport: tr,
 	}
-	p.entries[key] = &transportEntry{
+	entry := &transportEntry{
 		client:    client,
 		transport: tr,
 		evictGen:  evictGen,
 	}
-	return client, nil
+	entry.lastUsedUnix.Store(now)
+	p.entries[key] = entry
+	return client, nil, nil
 }
 
 func isInternalHeader(name string) bool {
@@ -134,7 +164,10 @@ func isInternalHeader(name string) bool {
 		strings.EqualFold(name, hdrProto) ||
 		strings.EqualFold(name, hdrChunked) ||
 		strings.EqualFold(name, hdrTimeoutMs) ||
-		strings.EqualFold(name, hdrEvictGen)
+		strings.EqualFold(name, hdrHeaderTimeoutMs) ||
+		strings.EqualFold(name, hdrEvictGen) ||
+		strings.EqualFold(name, hdrAccountID) ||
+		strings.EqualFold(name, hdrProxyError)
 }
 
 func isHopByHopHeader(name string) bool {
@@ -157,7 +190,9 @@ func newRelayHandler(pool *transportPool) http.Handler {
 		proto := strings.ToLower(strings.TrimSpace(r.Header.Get(hdrProto)))
 		chunked := r.Header.Get(hdrChunked) == "1"
 		timeoutMsStr := r.Header.Get(hdrTimeoutMs)
+		headerTimeoutMsStr := r.Header.Get(hdrHeaderTimeoutMs)
 		evictGen := r.Header.Get(hdrEvictGen)
+		accountID := r.Header.Get(hdrAccountID)
 
 		if targetRaw == "" {
 			http.Error(w, "missing "+hdrTargetURL, http.StatusBadRequest)
@@ -170,19 +205,41 @@ func newRelayHandler(pool *transportPool) http.Handler {
 		}
 
 		// Strict proxy policy: refuse direct egress if proxy header is missing/invalid
-		client, err := pool.getClient(proxyRaw, proto, evictGen)
+		client, cleanup, err := pool.getClient(proxyRaw, proto, accountID, evictGen)
 		if err != nil {
 			http.Error(w, "strict proxy error: "+err.Error(), http.StatusBadGateway)
 			return
 		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+
+		var totalTimeoutMs int
+		if timeoutMsStr != "" {
+			if ms, err := strconv.Atoi(timeoutMsStr); err == nil && ms > 0 {
+				totalTimeoutMs = ms
+			}
+		}
+		var headerTimeoutMs int
+		if headerTimeoutMsStr != "" {
+			if ms, err := strconv.Atoi(headerTimeoutMsStr); err == nil && ms > 0 {
+				headerTimeoutMs = ms
+			}
+		} else if chunked && totalTimeoutMs > 0 {
+			// For streaming/chunked requests, apply timeout only while waiting for response headers
+			// so long SSE outputs are never truncated mid-stream.
+			headerTimeoutMs = totalTimeoutMs
+			totalTimeoutMs = 0
+		}
 
 		ctx := r.Context()
 		var cancel func()
-		if timeoutMsStr != "" {
-			if ms, err := strconv.Atoi(timeoutMsStr); err == nil && ms > 0 {
-				ctx, cancel = context.WithTimeout(ctx, time.Duration(ms)*time.Millisecond)
-				defer cancel()
-			}
+		if totalTimeoutMs > 0 {
+			ctx, cancel = context.WithTimeout(ctx, time.Duration(totalTimeoutMs)*time.Millisecond)
+			defer cancel()
+		} else if headerTimeoutMs > 0 {
+			ctx, cancel = context.WithCancel(ctx)
+			defer cancel()
 		}
 
 		var body io.Reader
@@ -209,15 +266,32 @@ func newRelayHandler(pool *transportPool) http.Handler {
 			outReq.ContentLength = r.ContentLength
 		}
 
+		var headerMu sync.Mutex
+		headersDone := false
+		if headerTimeoutMs > 0 && cancel != nil {
+			timer := time.AfterFunc(time.Duration(headerTimeoutMs)*time.Millisecond, func() {
+				headerMu.Lock()
+				if !headersDone {
+					cancel()
+				}
+				headerMu.Unlock()
+			})
+			defer timer.Stop()
+		}
+
 		resp, err := client.Do(outReq)
+		headerMu.Lock()
+		headersDone = true
+		headerMu.Unlock()
 		if err != nil {
+			w.Header().Set(hdrProxyError, "1")
 			http.Error(w, "upstream transport error: "+err.Error(), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
 
 		for k, vals := range resp.Header {
-			if isHopByHopHeader(k) {
+			if isHopByHopHeader(k) || strings.EqualFold(k, hdrProxyError) {
 				continue
 			}
 			for _, v := range vals {

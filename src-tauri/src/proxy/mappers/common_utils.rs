@@ -307,13 +307,6 @@ pub fn reorder_inner_request_official(inner: &mut Value) {
     *old_obj = ordered;
 }
 
-const DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK: &str = concat!(
-    "<tool_availability>\n",
-    "Direct conversational mode: no interactive workspace or external tool execution runtime is attached to this turn. ",
-    "Answer the user's request directly in text and do not invoke any declared tools or functions.\n",
-    "</tool_availability>"
-);
-
 /// Official 14-tool Antigravity IDE schema captured verbatim from `v1internal` `agent` traffic (`3,024/3,024` captures).
 pub fn official_default_agent_tools() -> &'static Value {
     static DEFAULT_TOOLS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
@@ -323,64 +316,8 @@ pub fn official_default_agent_tools() -> &'static Value {
     })
 }
 
-fn append_direct_chat_tool_availability(inner: &mut Value) {
-    let Some(obj) = inner.as_object_mut() else {
-        return;
-    };
-    let si = obj
-        .entry("systemInstruction".to_string())
-        .or_insert_with(|| json!({ "role": "user", "parts": [] }));
-    let Some(si_obj) = si.as_object_mut() else {
-        return;
-    };
-    si_obj
-        .entry("role".to_string())
-        .or_insert_with(|| json!("user"));
-    let parts = si_obj
-        .entry("parts".to_string())
-        .or_insert_with(|| json!([]));
-    let Some(parts_arr) = parts.as_array_mut() else {
-        return;
-    };
-
-    if parts_arr.iter().any(|p| {
-        p.get("text")
-            .and_then(Value::as_str)
-            .map_or(false, |t| t.contains("<tool_availability>"))
-    }) {
-        return;
-    }
-
-    if let Some(first_text_val) = parts_arr.iter_mut().find_map(|p| p.get_mut("text")) {
-        if let Some(existing) = first_text_val.as_str() {
-            let updated = if let Some(idx) = existing.find("</identity>") {
-                let split = idx + "</identity>".len();
-                let (head, tail) = existing.split_at(split);
-                if tail.trim().is_empty() {
-                    format!("{}\n\n{}{}", head.trim_end(), DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK, tail)
-                } else {
-                    format!(
-                        "{}\n\n{}\n\n{}",
-                        head.trim_end(),
-                        DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK,
-                        tail.trim_start_matches('\n')
-                    )
-                }
-            } else if existing.trim().is_empty() {
-                DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK.to_string()
-            } else {
-                format!("{}\n\n{}", DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK, existing)
-            };
-            *first_text_val = json!(updated);
-            return;
-        }
-    }
-
-    parts_arr.push(json!({ "text": DIRECT_CHAT_TOOL_AVAILABILITY_BLOCK }));
-}
-
 /// Inject official Antigravity IDE default `tools` when an `agent` request arrives without any client tools
-/// (`3,024/3,024` official `agent` captures carry `tools`), plus `<tool_availability>` to keep direct text replies.
+/// (`3,024/3,024` official `agent` captures carry `tools`), without injecting fabricated XML tags into `systemInstruction`.
 pub fn inject_fallback_agent_tools_if_missing(
     inner: &mut Value,
     request_type: &str,
@@ -410,7 +347,6 @@ pub fn inject_fallback_agent_tools_if_missing(
         return false;
     }
     obj.insert("tools".to_string(), official_default_agent_tools().clone());
-    append_direct_chat_tool_availability(inner);
     true
 }
 
@@ -1723,5 +1659,60 @@ pub fn ensure_upstream_thought_signature(sig: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(sig.as_bytes())
     } else {
         sig.to_string()
+    }
+}
+
+/// Extract the first non-thought text part from a `v1internal:generateContent` (or raw Gemini) JSON response.
+/// Skips `{"thought": true, ...}` parts and non-text parts (e.g. `functionCall`), falling back to
+/// joining non-thought text parts if multiple text chunks exist.
+pub fn extract_v1internal_primary_text(gemini_response: &Value) -> Option<String> {
+    let payload = gemini_response.get("response").unwrap_or(gemini_response);
+    let parts = payload
+        .get("candidates")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())?;
+
+    let mut collected = String::new();
+    for part in parts {
+        if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+            collected.push_str(text);
+        }
+    }
+    if collected.is_empty() {
+        None
+    } else {
+        Some(collected)
+    }
+}
+
+#[cfg(test)]
+mod extract_text_tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_v1internal_primary_text_skips_thought_and_function_call() {
+        let resp = json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            { "thought": true, "text": "internal reasoning..." },
+                            { "functionCall": { "name": "read_file", "args": {} } },
+                            { "text": "<state_snapshot>ok</state_snapshot>" }
+                        ]
+                    }
+                }]
+            }
+        });
+        assert_eq!(
+            extract_v1internal_primary_text(&resp).as_deref(),
+            Some("<state_snapshot>ok</state_snapshot>")
+        );
     }
 }

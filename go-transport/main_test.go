@@ -195,13 +195,13 @@ func TestRelayTLSALPNAndProtocolModes(t *testing.T) {
 
 	pool := newTransportPool()
 	// Allow self-signed cert from httptest TLS server in this test
-	c1, err := pool.getClient(proxy.URL, "h1", "")
+	c1, _, err := pool.getClient(proxy.URL, "h1", "acc-tls-test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	c1.Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify = true
 
-	c2, err := pool.getClient(proxy.URL, "h2", "")
+	c2, _, err := pool.getClient(proxy.URL, "h2", "acc-tls-test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,6 +216,7 @@ func TestRelayTLSALPNAndProtocolModes(t *testing.T) {
 	req1.Header.Set(hdrTargetURL, upstream.URL+"/v1internal:streamGenerateContent?alt=sse")
 	req1.Header.Set(hdrProxyURL, proxy.URL)
 	req1.Header.Set(hdrProto, "h1")
+	req1.Header.Set(hdrAccountID, "acc-tls-test")
 	req1.Header.Set(hdrChunked, "1")
 	rec1 := httptest.NewRecorder()
 	handler.ServeHTTP(rec1, req1)
@@ -234,6 +235,7 @@ func TestRelayTLSALPNAndProtocolModes(t *testing.T) {
 	req2.Header.Set(hdrTargetURL, upstream.URL+"/token")
 	req2.Header.Set(hdrProxyURL, proxy.URL)
 	req2.Header.Set(hdrProto, "h2")
+	req2.Header.Set(hdrAccountID, "acc-tls-test")
 	rec2 := httptest.NewRecorder()
 	handler.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusOK {
@@ -241,5 +243,210 @@ func TestRelayTLSALPNAndProtocolModes(t *testing.T) {
 	}
 	if seenProto != "HTTP/2.0" || seenALPN != "h2" {
 		t.Fatalf("expected HTTP/2.0 + h2 ALPN, got proto=%s alpn=%s", seenProto, seenALPN)
+	}
+}
+
+func TestRelayProxyErrorHeaderDistinguishesUpstream502(t *testing.T) {
+	handler := newRelayHandler(newTransportPool())
+
+	// Case 1: unreachable proxy -> 502 WITH X-Ag-Proxy-Error: 1
+	deadLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := deadLn.Addr().String()
+	deadLn.Close()
+
+	req1 := httptest.NewRequest(http.MethodPost, "/relay", strings.NewReader(`{}`))
+	req1.Header.Set(hdrTargetURL, "http://example.com/v1internal:generateContent")
+	req1.Header.Set(hdrProxyURL, "http://"+deadAddr)
+	req1.Header.Set(hdrProto, "h1")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 for dead proxy, got %d", rec1.Code)
+	}
+	if rec1.Header().Get(hdrProxyError) != "1" {
+		t.Fatalf("expected %s=1 for dead proxy, got %q", hdrProxyError, rec1.Header().Get(hdrProxyError))
+	}
+
+	// Case 2: real upstream HTTP 502 (even attempting to spoof header) -> 502 WITHOUT X-Ag-Proxy-Error
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(hdrProxyError, "1")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("google upstream 502"))
+	}))
+	defer upstream.Close()
+
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		outReq, _ := http.NewRequestWithContext(context.Background(), r.Method, upstream.URL+r.URL.Path, r.Body)
+		resp, err := http.DefaultClient.Do(outReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer proxy.Close()
+
+	req2 := httptest.NewRequest(http.MethodPost, "/relay", strings.NewReader(`{}`))
+	req2.Header.Set(hdrTargetURL, upstream.URL+"/v1internal:generateContent")
+	req2.Header.Set(hdrProxyURL, proxy.URL)
+	req2.Header.Set(hdrProto, "h1")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 from upstream, got %d", rec2.Code)
+	}
+	if rec2.Header().Get(hdrProxyError) != "" {
+		t.Fatalf("expected empty %s for real upstream 502, got %q", hdrProxyError, rec2.Header().Get(hdrProxyError))
+	}
+}
+
+func TestRelayHeaderTimeoutDoesNotTruncateLongStream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "slow-headers") {
+			select {
+			case <-time.After(600 * time.Millisecond):
+				w.WriteHeader(http.StatusOK)
+			case <-r.Context().Done():
+			}
+			return
+		}
+		// Fast headers, slow multi-chunk SSE body (> header timeout)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: part1\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		time.Sleep(350 * time.Millisecond)
+		_, _ = w.Write([]byte("data: part2\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		outReq, _ := http.NewRequestWithContext(r.Context(), r.Method, upstream.URL+r.URL.Path, r.Body)
+		resp, err := http.DefaultClient.Do(outReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		flusher, _ := w.(http.Flusher)
+		buf := make([]byte, 1024)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				_, _ = w.Write(buf[:n])
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}))
+	defer proxy.Close()
+
+	handler := newRelayHandler(newTransportPool())
+
+	// 1) Long SSE body exceeding 200ms header timeout MUST NOT be truncated
+	req1 := httptest.NewRequest(http.MethodPost, "/relay", strings.NewReader(`{}`))
+	req1.Header.Set(hdrTargetURL, upstream.URL+"/v1internal:streamGenerateContent?alt=sse")
+	req1.Header.Set(hdrProxyURL, proxy.URL)
+	req1.Header.Set(hdrProto, "h1")
+	req1.Header.Set(hdrChunked, "1")
+	req1.Header.Set(hdrHeaderTimeoutMs, "200")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200 for long SSE stream, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	if rec1.Body.String() != "data: part1\n\ndata: part2\n\n" {
+		t.Fatalf("stream was truncated or corrupted: %q", rec1.Body.String())
+	}
+
+	// 2) Hung upstream before response headers MUST time out with X-Ag-Proxy-Error: 1
+	req2 := httptest.NewRequest(http.MethodPost, "/relay", strings.NewReader(`{}`))
+	req2.Header.Set(hdrTargetURL, upstream.URL+"/slow-headers")
+	req2.Header.Set(hdrProxyURL, proxy.URL)
+	req2.Header.Set(hdrProto, "h1")
+	req2.Header.Set(hdrHeaderTimeoutMs, "150")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 for header timeout, got %d", rec2.Code)
+	}
+	if rec2.Header().Get(hdrProxyError) != "1" {
+		t.Fatalf("expected %s=1 for header timeout, got %q", hdrProxyError, rec2.Header().Get(hdrProxyError))
+	}
+}
+
+func TestRelayIsolatesConnectionsByAccountID(t *testing.T) {
+	// Mock HTTP proxy that returns the client's remote TCP address directly so we can observe socket reuse
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(hdrAccountID) != "" {
+			t.Fatalf("internal header %s leaked to proxy/upstream", hdrAccountID)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(r.RemoteAddr))
+	}))
+	defer proxy.Close()
+
+	handler := newRelayHandler(newTransportPool())
+
+	send := func(accountID string) string {
+		req := httptest.NewRequest(http.MethodPost, "/relay", strings.NewReader(`{}`))
+		req.Header.Set(hdrTargetURL, "http://example.com/v1internal:generateContent")
+		req.Header.Set(hdrProxyURL, proxy.URL)
+		req.Header.Set(hdrProto, "h1")
+		if accountID != "" {
+			req.Header.Set(hdrAccountID, accountID)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("account %q expected 200, got %d: %s", accountID, rec.Code, rec.Body.String())
+		}
+		return rec.Body.String()
+	}
+
+	addrA1 := send("acc_A")
+	addrB1 := send("acc_B")
+	addrA2 := send("acc_A")
+	addrAnon1 := send("")
+	addrAnon2 := send("")
+
+	if addrA1 == addrB1 {
+		t.Fatalf("different accounts shared TCP connection: acc_A=%s acc_B=%s", addrA1, addrB1)
+	}
+	if addrA1 != addrA2 {
+		t.Fatalf("same account should reuse keep-alive connection: first=%s second=%s", addrA1, addrA2)
+	}
+	if addrAnon1 == addrAnon2 {
+		t.Fatalf("anonymous requests must not share TCP connections: first=%s second=%s", addrAnon1, addrAnon2)
 	}
 }

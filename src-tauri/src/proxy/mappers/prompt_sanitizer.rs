@@ -1628,7 +1628,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(bare_si.starts_with(fallback));
-        assert!(bare_si.contains("<tool_availability>"));
+        assert!(!bare_si.contains("<tool_availability>"));
         assert!(!bare_si.contains("<identity>\n\n</identity>"));
         assert_eq!(
             wrapped_bare["request"]["tools"].as_array().unwrap().len(),
@@ -1669,7 +1669,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(agent_si.starts_with(fallback));
-        assert!(agent_si.contains("<tool_availability>"));
+        assert!(!agent_si.contains("<tool_availability>"));
         assert!(agent_si.ends_with("## Progress\n- Keep concise."));
         assert!(!agent_si.contains("<identity>\n\n</identity>"));
         assert!(!agent_si.to_lowercase().contains("deepseek harness"));

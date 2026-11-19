@@ -226,7 +226,7 @@ async fn fetch_project_id(
 
     let account_ua = crate::constants::get_account_user_agent(account_id);
     let load_url = format!("{}/v1internal:loadCodeAssist", CLOUD_CODE_BASE_URL);
-    let Ok((rb, _, _)) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+    let Ok((rb, go_egress, via_go)) = crate::utils::go_transport::post_with_sidecar_or_fallback(
         &client,
         &load_url,
         account_id,
@@ -238,8 +238,14 @@ async fn fetch_project_id(
         return (None, None);
     };
 
-    let res = rb
-        .header(
+    let fallback_pid = match &route {
+        crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+        _ => None,
+    };
+    let effective_pid = go_egress.as_deref().or(fallback_pid);
+
+    let res = crate::utils::go_transport::send_checked(
+        rb.header(
             rquest::header::USER_AGENT,
             account_ua.as_str(),
         )
@@ -248,9 +254,11 @@ async fn fetch_project_id(
             format!("Bearer {}", access_token),
         )
         .header(rquest::header::CONTENT_TYPE, "application/json")
-        .json(&meta)
-        .send()
-        .await;
+        .json(&meta),
+        via_go,
+        effective_pid,
+    )
+    .await;
 
     match res {
         Ok(res) => {
@@ -404,7 +412,7 @@ pub async fn fetch_quota_with_cache(
 
     for (ep_idx, ep_url) in QUOTA_API_ENDPOINTS.iter().enumerate() {
         let has_next = ep_idx + 1 < QUOTA_API_ENDPOINTS.len();
-        let (rb, _, _) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
+        let (rb, go_egress, via_go) = match crate::utils::go_transport::post_with_sidecar_or_fallback(
             &client,
             *ep_url,
             account_id,
@@ -421,16 +429,24 @@ pub async fn fetch_quota_with_cache(
             }
         };
 
-        match rb
-            .header(
+        let fallback_pid = match &route {
+            crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+            _ => None,
+        };
+        let effective_pid = go_egress.as_deref().or(fallback_pid);
+
+        match crate::utils::go_transport::send_checked(
+            rb.header(
                 rquest::header::USER_AGENT,
                 crate::constants::get_account_user_agent(account_id).as_str(),
             )
             .bearer_auth(access_token)
             .header(rquest::header::CONTENT_TYPE, "application/json")
-            .json(&payload)
-            .send()
-            .await
+            .json(&payload),
+            via_go,
+            effective_pid,
+        )
+        .await
             {
                 Ok(response) => {
                     // Convert HTTP error status to AppError
@@ -573,9 +589,9 @@ pub async fn fetch_quota_with_cache(
                             pool.mark_proxy_unhealthy(entry_id).await;
                         }
                         // 代理隧道网络报错时已将该节点置 RED，不再在死隧道上重试备用端点
-                        return Err(AppError::from(e));
+                        return Err(AppError::Network(e, None));
                     }
-                    last_error = Some(AppError::from(e));
+                    last_error = Some(AppError::Network(e, None));
                     if has_next {
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
@@ -607,7 +623,7 @@ async fn fetch_quota_summary(
         }
     }
 
-    let (client, _route) = match create_standard_client(account_id, 15).await {
+    let (client, route) = match create_standard_client(account_id, 15).await {
         Ok(res) => res,
         Err(e) => {
             crate::modules::logger::log_warn(&format!(
@@ -620,7 +636,7 @@ async fn fetch_quota_summary(
     let payload = build_quota_project_payload(project_id);
 
     for ep_url in QUOTA_SUMMARY_ENDPOINTS.iter() {
-        let Ok((rb, _, _)) = crate::utils::go_transport::post_with_sidecar_or_fallback(
+        let Ok((rb, go_egress, via_go)) = crate::utils::go_transport::post_with_sidecar_or_fallback(
             &client,
             *ep_url,
             account_id,
@@ -631,16 +647,24 @@ async fn fetch_quota_summary(
         .await else {
             continue;
         };
-        let res = rb
-            .header(
+        let fallback_pid = match &route {
+            crate::proxy::proxy_pool::EgressRoute::Pool { entry_id } => Some(entry_id.as_str()),
+            _ => None,
+        };
+        let effective_pid = go_egress.as_deref().or(fallback_pid);
+
+        let res = crate::utils::go_transport::send_checked(
+            rb.header(
                 rquest::header::USER_AGENT,
                 crate::constants::get_account_user_agent(account_id).as_str(),
             )
             .bearer_auth(access_token)
             .header(rquest::header::CONTENT_TYPE, "application/json")
-            .json(&payload)
-            .send()
-            .await;
+            .json(&payload),
+            via_go,
+            effective_pid,
+        )
+        .await;
 
         match res {
             Ok(response) => {
