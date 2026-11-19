@@ -4799,11 +4799,18 @@ async fn admin_sync_batch_import_with_proxies(
                         error: None,
                     });
                 } else {
-                    // No proxy provided: unbind and mark as direct_warning
-                    state
+                    // 仅当该账号原先确实存在静态专属绑定时才解绑，避免对刚通过公用池导入的新号
+                    // 无条件调用 unbind_account_proxy 抹掉刚继承的 sticky_pool_egress 并多余写盘。
+                    if state
                         .proxy_pool_manager
-                        .unbind_account_proxy(account.id.clone())
-                        .await;
+                        .get_account_binding(&account.id)
+                        .is_some()
+                    {
+                        state
+                            .proxy_pool_manager
+                            .unbind_account_proxy(account.id.clone())
+                            .await;
+                    }
                     binding_stats.skipped_direct += 1;
                     details.push(BatchImportDetailItem {
                         email: account.email.clone(),

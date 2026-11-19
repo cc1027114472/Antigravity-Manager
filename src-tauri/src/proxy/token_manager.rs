@@ -87,6 +87,21 @@ fn clear_account_oauth_client_key(account_id: &str) {
     ACCOUNT_OAUTH_CLIENT_KEYS.remove(account_id);
 }
 
+/// 判断 OAuth 刷新错误是否属于凭证本身永久失效（所有已配置 Client 均被 Google 拒绝），
+/// 此类账号应禁用移出活跃池，绝不可继续留池轮流把健康代理标红。
+fn is_permanent_oauth_credential_error(err: &str) -> bool {
+    err.contains("invalid_grant")
+        || err.contains("unauthorized_client")
+        || err.contains("invalid_client")
+}
+
+/// 判断 OAuth 刷新错误是否属于代理/传输层网络故障（而非 Google 上游已返回的 HTTP 状态码）。
+/// 当 Google OAuth 服务器已返回 HTTP 响应（包含 `"Refresh failed:"`）时，说明代理隧道完全健康，
+/// 严禁误将代理标为 RED 导致同代理所有正常账号集体切 IP。
+fn is_oauth_transport_error(err: &str) -> bool {
+    !err.contains("Refresh failed:")
+}
+
 #[derive(Debug, Clone)]
 pub struct ProxyToken {
     pub account_id: String,
@@ -3007,16 +3022,18 @@ impl TokenManager {
                     token.email,
                     e
                 );
-                if e.contains("invalid_grant") {
+                if is_permanent_oauth_credential_error(&e) {
                     let _ = self
                         .disable_account(
                             &token.account_id,
-                            &format!("invalid_grant: {}", e),
+                            &format!("oauth_credential_error: {}", e),
                         )
                         .await;
-                } else if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                    if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
-                        pool.mark_proxy_unhealthy(&cfg.entry_id).await;
+                } else if is_oauth_transport_error(&e) {
+                    if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                        if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
+                            pool.mark_proxy_unhealthy(&cfg.entry_id).await;
+                        }
                     }
                 }
                 Err(format!("Token refresh failed: {}", e))
@@ -3333,10 +3350,13 @@ impl TokenManager {
             )
             .await;
             if !warmup_ok {
+                let failed_account_id = acquired.account_id.clone();
                 let failed_email = acquired.email.clone();
+                self.session_accounts.retain(|_, v| v != &failed_account_id);
+                self.unbind_account_session(&failed_account_id);
                 drop(acquired);
                 tracing::warn!(
-                    "🚫 [CapacityAware] Inline warmup pad failed for cold account {}; aborting large request on this account",
+                    "🚫 [CapacityAware] Inline warmup pad failed for cold account {}; unbound session and aborting large request on this account",
                     failed_email
                 );
                 return Err(TokenAcquireError::Unavailable(format!(
@@ -3449,16 +3469,18 @@ impl TokenManager {
                         token.email,
                         e
                     );
-                    if e.contains("\"invalid_grant\"") || e.contains("invalid_grant") {
+                    if is_permanent_oauth_credential_error(&e) {
                         let _ = self
                             .disable_account(
                                 &token.account_id,
-                                &format!("invalid_grant: {}", e),
+                                &format!("oauth_credential_error: {}", e),
                             )
                             .await;
-                    } else if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-                        if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
-                            pool.mark_proxy_unhealthy(&cfg.entry_id).await;
+                    } else if is_oauth_transport_error(&e) {
+                        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                            if let Ok(Some(cfg)) = pool.get_proxy_for_account(&token.account_id).await {
+                                pool.mark_proxy_unhealthy(&cfg.entry_id).await;
+                            }
                         }
                     }
                     return Err(format!("Token refresh failed: {}", e));
@@ -9734,5 +9756,27 @@ mod tests {
         // Cleanup static map entry
         manager.remove_account(&account_id);
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn test_oauth_error_classification_protects_healthy_proxies() {
+        let unauth_err = "[代理池:p1] Refresh failed: {\"error\": \"unauthorized_client\"}";
+        assert!(is_permanent_oauth_credential_error(unauth_err));
+        assert!(
+            !is_oauth_transport_error(unauth_err),
+            "HTTP 400 from Google OAuth must never mark a healthy proxy RED"
+        );
+
+        let invalid_req_err = "[代理池:p1] Refresh failed: {\"error\": \"invalid_request\"}";
+        assert!(!is_permanent_oauth_credential_error(invalid_req_err));
+        assert!(!is_oauth_transport_error(invalid_req_err));
+
+        let invalid_grant_err = "[代理池:p1] Refresh failed: {\"error\": \"invalid_grant\"}";
+        assert!(is_permanent_oauth_credential_error(invalid_grant_err));
+        assert!(!is_oauth_transport_error(invalid_grant_err));
+
+        let transport_err = "[代理池:p1] Refresh request failed: Go sidecar proxy transport error (502 Bad Gateway)";
+        assert!(!is_permanent_oauth_credential_error(transport_err));
+        assert!(is_oauth_transport_error(transport_err));
     }
 }

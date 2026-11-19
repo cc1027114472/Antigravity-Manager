@@ -572,7 +572,13 @@ pub async fn fetch_quota_with_cache(
                     quota_data.subscription_tier = subscription_tier.clone();
 
                     // Best-effort: fetch grouped quota summary (weekly + 5h windows).
-                    // Failure here must not block the primary quota result.
+                    // 在 fetchAvailableModels 与 retrieveUserQuotaSummary 之间插入 150..=350ms 微抖动，
+                    // 避免两条配额元数据接口 0ms 瞬发连击；失败不阻塞主配额返回。
+                    let micro_jitter_ms: u64 = {
+                        use rand::Rng;
+                        rand::thread_rng().gen_range(150..=350)
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(micro_jitter_ms)).await;
                     quota_data.quota_groups =
                         fetch_quota_summary(access_token, email, project_id.as_deref(), account_id)
                             .await;
@@ -619,6 +625,11 @@ async fn fetch_quota_summary(
         if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
             if !pool.is_account_proxy_available(id).await {
                 return None;
+            }
+            if let Some(elapsed) = pool.dedicated_recovery_elapsed_secs(id) {
+                if elapsed < crate::proxy::rate_limit::EGRESS_SETTLE_ALL_TRAFFIC_SECS {
+                    return None;
+                }
             }
         }
     }

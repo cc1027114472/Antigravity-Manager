@@ -1044,9 +1044,19 @@ impl ProxyPoolManager {
             }
         }
 
-        // 更新内存中的绑定
+        // 更新内存中的绑定，并清理该账号自身及其他未绑定账号指向此新独占节点的公用池粘性记录
         self.account_bindings
             .insert(account_id.clone(), proxy_id.clone());
+        self.sticky_pool_egress.remove(&account_id);
+        let displaced: Vec<String> = self
+            .sticky_pool_egress
+            .iter()
+            .filter(|kv| kv.value() == &proxy_id)
+            .map(|kv| kv.key().clone())
+            .collect();
+        for displaced_id in displaced {
+            self.sticky_pool_egress.remove(&displaced_id);
+        }
 
         if persist {
             self.persist_bindings().await;

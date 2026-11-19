@@ -2461,6 +2461,7 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
 
     let global_sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let egress_sems: Arc<DashMap<String, Arc<Semaphore>>> = Arc::new(DashMap::new());
+    let egress_used: Arc<DashMap<String, bool>> = Arc::new(DashMap::new());
 
     let tasks: Vec<_> = accounts
         .into_iter()
@@ -2486,6 +2487,7 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
             let account_id = account.id.clone();
             let global_sem = global_sem.clone();
             let egress_sems = egress_sems.clone();
+            let egress_used = egress_used.clone();
             async move {
                 let (egress_key, _egress_pin) =
                     if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
@@ -2503,6 +2505,16 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
 
                 let _global = global_sem.acquire().await.unwrap();
                 let _egress = per_egress.acquire().await.unwrap();
+
+                // 同一出口 IP 处理后续排队账号时加入 500..=1200ms 错峰抖动，消除同 IP 背靠背 0ms 连续刷配额
+                let had_prior_on_egress = egress_used.insert(egress_key.clone(), true).is_some();
+                if had_prior_on_egress {
+                    let jitter_ms: u64 = {
+                        use rand::Rng;
+                        rand::thread_rng().gen_range(500..=1200)
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                }
 
                 // 获锁后重新从磁盘读取最新 Account 快照，避免排队等待期间在途请求已刷新过 Token 却仍使用旧快照重复刷新
                 if let Ok(latest_acc) = load_account(&account_id) {
