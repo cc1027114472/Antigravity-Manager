@@ -1040,10 +1040,10 @@ pub fn upsert_account(
                 if !merged_token.is_gcp_tos && old_is_gcp_tos {
                     merged_token.is_gcp_tos = true;
                 }
-                if merged_token.id_token.is_none() {
+                if merged_token.id_token.is_none() && same_refresh_token {
                     merged_token.id_token = old_id_token;
                 }
-                if merged_token.oauth_client_key.is_none() {
+                if merged_token.oauth_client_key.is_none() && same_refresh_token {
                     merged_token.oauth_client_key = old_oauth_client_key;
                 }
 
@@ -2126,6 +2126,7 @@ pub async fn fetch_quota_with_retry_opts(
         ));
     }
 
+    let mut refreshed_token_now = false;
     // 0. [ANTI-RACE SYNC] 优先与内存 TokenManager 同步最新 Token 与 Project ID，并复用单账号刷新互斥锁：
     // 防止后台配额刷新与在途业务请求/预热协程并发向 Google OAuth 重复换发多个 Token。
     if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
@@ -2153,21 +2154,41 @@ pub async fn fetch_quota_with_retry_opts(
             if now >= account.token.expiry_timestamp - oauth::TOKEN_REFRESH_SKEW_SECONDS
                 || account.token.access_token.is_empty()
             {
-                if let Ok(refreshed_mem) = tm
+                match tm
                     .ensure_token_valid_with_skew(mem_tok, oauth::TOKEN_REFRESH_SKEW_SECONDS)
                     .await
                 {
-                    account.token.access_token = refreshed_mem.access_token;
-                    account.token.expires_in = refreshed_mem.expires_in;
-                    account.token.expiry_timestamp = refreshed_mem.timestamp;
-                    account.token.refresh_token = refreshed_mem.refresh_token;
-                    if account
-                        .token
-                        .project_id
-                        .as_deref()
-                        .map_or(true, |s| s.trim().is_empty())
-                    {
-                        account.token.project_id = refreshed_mem.project_id;
+                    Ok(refreshed_mem) => {
+                        if refreshed_mem.access_token != account.token.access_token {
+                            refreshed_token_now = true;
+                        }
+                        account.token.access_token = refreshed_mem.access_token;
+                        account.token.expires_in = refreshed_mem.expires_in;
+                        account.token.expiry_timestamp = refreshed_mem.timestamp;
+                        account.token.refresh_token = refreshed_mem.refresh_token;
+                        if account
+                            .token
+                            .project_id
+                            .as_deref()
+                            .map_or(true, |s| s.trim().is_empty())
+                        {
+                            account.token.project_id = refreshed_mem.project_id;
+                        }
+                    }
+                    Err(e) => {
+                        // TokenManager 已经尝试过 OAuth 刷新并失败，严禁 0ms 回落到 ensure_fresh_token 重复再刷一次
+                        if e.contains("invalid_grant") {
+                            modules::logger::log_error(&format!(
+                                "Disabling account {} due to invalid_grant during token refresh (quota check)",
+                                account.email
+                            ));
+                            account.disabled = true;
+                            account.disabled_at = Some(chrono::Utc::now().timestamp());
+                            account.disabled_reason = Some(format!("invalid_grant: {}", e));
+                            let _ = save_account(account);
+                            crate::proxy::server::trigger_account_reload(&account.id);
+                        }
+                        return Err(AppError::OAuth(e));
                     }
                 }
             }
@@ -2198,6 +2219,16 @@ pub async fn fetch_quota_with_retry_opts(
         account.token = token.clone();
         upsert_account(account.email.clone(), account.name.clone(), token.clone())
             .map_err(AppError::Account)?;
+        refreshed_token_now = true;
+    }
+
+    // 换发新 Token 后增加 300..=700ms 拟人化沉淀延迟，避免 0ms 瞬发 fetchAvailableModels
+    if refreshed_token_now {
+        let settle_ms: u64 = {
+            use rand::Rng;
+            rand::thread_rng().gen_range(300..=700)
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
     }
 
     // 2. Attempt query (reuse cached project_id + subscription_tier to skip redundant loadCodeAssist calls)
@@ -2308,6 +2339,13 @@ pub async fn fetch_quota_with_retry_opts(
                     new_token.clone(),
                 )
                 .map_err(AppError::Account)?;
+
+                // 401 强刷换出新 Token 后沉淀 300..=700ms 再重试配额接口
+                let settle_ms: u64 = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(300..=700)
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
 
                 // Retry query (reuse cached project_id + subscription_tier when available)
                 let mut retry_result: crate::error::AppResult<(QuotaData, Option<String>)> =

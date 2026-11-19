@@ -109,6 +109,11 @@ pub struct ProxyPoolManager {
     /// Temporary resolve-once pin: `None` forces upstream/direct (skip pool re-pick).
     forced_egress: Arc<DashMap<String, Option<PoolProxyConfig>>>,
 
+    /// In-memory sticky pool egress for unbound accounts (`account_id -> proxy_id`) so
+    /// consecutive OAuth / loadCodeAssist / streamGenerateContent calls for the same unbound
+    /// account stay on the same proxy IP instead of teleporting across pool nodes every request.
+    sticky_pool_egress: Arc<DashMap<String, String>>,
+
     /// Live request outcome per pool proxy (in-memory only; resets on restart).
     egress_usage: Arc<DashMap<String, EgressUsageStatus>>,
 
@@ -176,6 +181,7 @@ impl ProxyPoolManager {
             account_bindings,
             round_robin_index: Arc::new(AtomicUsize::new(0)),
             forced_egress: Arc::new(DashMap::new()),
+            sticky_pool_egress: Arc::new(DashMap::new()),
             egress_usage: Arc::new(DashMap::new()),
             green_confirm_streak: Arc::new(DashMap::new()),
             green_at: Arc::new(DashMap::new()),
@@ -709,12 +715,62 @@ impl ProxyPoolManager {
         Ok(false)
     }
 
+    /// Pin a transient in-memory proxy override for an account import flow:
+    /// - When `preferred_proxy_id` is `Some`, pins that exact proxy if enabled & healthy.
+    /// - When `preferred_proxy_id` is `None`, selects one healthy pool proxy once and pins it
+    ///   so OAuth refresh, userinfo, and loadCodeAssist all share the exact same egress IP.
+    pub async fn pin_transient_proxy_for_import(
+        &self,
+        temp_id: &str,
+        preferred_proxy_id: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        if let Some(pid) = preferred_proxy_id.map(str::trim).filter(|s| !s.is_empty()) {
+            if self.pin_transient_proxy_by_id(temp_id, pid).await? {
+                return Ok(Some(pid.to_string()));
+            }
+            return Ok(None);
+        }
+        let config = self.config.read().await;
+        if !config.enabled || config.proxies.is_empty() {
+            return Ok(None);
+        }
+        if let Some(cfg) = self.select_proxy_from_pool(&config).await? {
+            let entry_id = cfg.entry_id.clone();
+            self.forced_egress.insert(temp_id.to_string(), Some(cfg));
+            return Ok(Some(entry_id));
+        }
+        Ok(None)
+    }
+
+    /// Hand off the transient import proxy to the newly created/upserted real `account_id`
+    /// as its initial sticky pool egress (only when the account has no dedicated binding yet),
+    /// ensuring quota fetch and subsequent traffic stay on the exact same IP as OAuth login/import.
+    pub fn inherit_sticky_egress(&self, from_temp_id: &str, to_account_id: &str) {
+        if self.account_bindings.contains_key(to_account_id) {
+            return;
+        }
+        let proxy_id = self
+            .forced_egress
+            .get(from_temp_id)
+            .and_then(|v| v.value().as_ref().map(|cfg| cfg.entry_id.clone()))
+            .or_else(|| {
+                self.sticky_pool_egress
+                    .get(from_temp_id)
+                    .map(|v| v.value().clone())
+            });
+        if let Some(pid) = proxy_id {
+            self.sticky_pool_egress
+                .insert(to_account_id.to_string(), pid);
+        }
+    }
+
     /// Remove a transient in-memory proxy override created by [`Self::pin_transient_proxy_by_id`].
     pub fn unpin_transient_proxy(&self, temp_id: &str) {
         self.forced_egress.remove(temp_id);
+        self.sticky_pool_egress.remove(temp_id);
     }
 
-    /// 为账号获取代理（与 AI 反代相同：bound → 未绑定池选择）
+    /// 为账号获取代理（与 AI 反代相同：bound → 未绑定池粘性选择）
     pub async fn get_proxy_for_account(
         &self,
         account_id: &str,
@@ -748,9 +804,38 @@ impl ProxyPoolManager {
             }
         }
 
-        // 2. 否则从池中策略选择 (公用池)
+        // 2. 未静态绑定的账号：优先复用该账号在公用池中已建立的粘性出口（防止每次请求跨 IP 瞬移）
+        if let Some(sticky_pid) = self
+            .sticky_pool_egress
+            .get(account_id)
+            .map(|v| v.value().clone())
+        {
+            let is_exclusively_bound = self
+                .account_bindings
+                .iter()
+                .any(|kv| kv.value() == &sticky_pid);
+            if !is_exclusively_bound {
+                if let Some(entry) = config.proxies.iter().find(|p| p.id == sticky_pid) {
+                    if entry.enabled && (!config.auto_failover || entry.is_healthy) {
+                        let cfg = self.build_proxy_config(entry)?;
+                        tracing::debug!(
+                            "[Proxy] Route: Account {} -> Proxy {} (Pool Sticky)",
+                            account_id,
+                            cfg.entry_id
+                        );
+                        return Ok(Some(cfg));
+                    }
+                }
+            }
+            // 原粘性节点已不可用或已被其他账号独占绑定，清理后重新分配
+            self.sticky_pool_egress.remove(account_id);
+        }
+
+        // 3. 首次从公用池策略选择并记录粘性出口
         let res = self.select_proxy_from_pool(&config).await?;
         if let Some(ref p) = res {
+            self.sticky_pool_egress
+                .insert(account_id.to_string(), p.entry_id.clone());
             tracing::info!(
                 "[Proxy] Route: Account {} -> Proxy {} (Pool)",
                 account_id,
@@ -1073,6 +1158,7 @@ impl ProxyPoolManager {
     /// 解绑账号代理
     pub async fn unbind_account_proxy(&self, account_id: String) {
         self.account_bindings.remove(&account_id);
+        self.sticky_pool_egress.remove(&account_id);
 
         // 持久化到配置文件
         self.persist_bindings().await;
@@ -1084,6 +1170,7 @@ impl ProxyPoolManager {
     pub fn remove_account_bindings_sync(&self, account_ids: &[String]) {
         let mut removed = false;
         for id in account_ids {
+            self.sticky_pool_egress.remove(id);
             if self.account_bindings.remove(id).is_some() {
                 removed = true;
             }
@@ -1683,5 +1770,57 @@ mod tests {
             EgressRoute::Direct => {}
             other => panic!("bound RED must fail closed, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_unbound_account_keeps_sticky_pool_egress_across_requests() {
+        let pool = test_pool(vec![
+            proxy("p1", None),
+            proxy("p2", None),
+            proxy("p3", None),
+        ]);
+
+        // Even under RoundRobin strategy, repeated calls for the same unbound account
+        // must stay pinned on the same pool proxy instead of jumping IPs on every request.
+        let first = pool
+            .get_proxy_for_account("unbound-sticky")
+            .await
+            .unwrap()
+            .expect("should pick a pool proxy");
+        for _ in 0..5 {
+            let next = pool
+                .get_proxy_for_account("unbound-sticky")
+                .await
+                .unwrap()
+                .expect("should reuse sticky pool proxy");
+            assert_eq!(next.entry_id, first.entry_id);
+        }
+
+        // Transient import pin -> inherit_sticky_egress -> unpin hands off the exact same proxy
+        let tmp_id = "tmp_import_test";
+        let pinned = pool
+            .pin_transient_proxy_for_import(tmp_id, None)
+            .await
+            .unwrap()
+            .expect("should pin a pool proxy");
+        pool.inherit_sticky_egress(tmp_id, "new-acc");
+        pool.unpin_transient_proxy(tmp_id);
+        let inherited = pool
+            .get_proxy_for_account("new-acc")
+            .await
+            .unwrap()
+            .expect("new account should inherit import proxy");
+        assert_eq!(inherited.entry_id, pinned);
+
+        // If the sticky proxy becomes exclusively bound to another account, unbound-sticky migrates cleanly
+        let _ = pool
+            .bind_account_to_proxy_inner("dedicated-owner".into(), first.entry_id.clone(), false)
+            .await;
+        let migrated = pool
+            .get_proxy_for_account("unbound-sticky")
+            .await
+            .unwrap()
+            .expect("should migrate away from exclusively bound proxy");
+        assert_ne!(migrated.entry_id, first.entry_id);
     }
 }

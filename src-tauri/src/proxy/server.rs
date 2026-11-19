@@ -1942,6 +1942,7 @@ async fn admin_clear_proxy_session_bindings(State(state): State<AppState>) -> im
 
 async fn admin_clear_all_rate_limits(State(state): State<AppState>) -> impl IntoResponse {
     state.token_manager.clear_all_rate_limits();
+    state.token_manager.clear_all_persisted_live_limits().await;
     logger::log_info("[API] 已清除所有限流记录");
     StatusCode::OK
 }
@@ -1951,6 +1952,10 @@ async fn admin_clear_rate_limit(
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
     let cleared = state.token_manager.clear_rate_limit(&account_id);
+    state
+        .token_manager
+        .clear_persisted_live_limit(&account_id, None)
+        .await;
     if cleared {
         logger::log_info(&format!("[API] 已清除账号 {} 的限流记录", account_id));
         StatusCode::OK

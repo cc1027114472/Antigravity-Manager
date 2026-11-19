@@ -751,18 +751,98 @@ pub async fn fetch_all_quotas(
     results
 }
 
-/// Get valid token (auto-refresh if expired)
+/// Get valid token (auto-refresh if expired, synced with TokenManager in-memory pool)
 pub async fn get_valid_token_for_warmup(
     account: &crate::models::account::Account,
 ) -> Result<(String, String), String> {
     let mut account = account.clone();
+    let mut refreshed_now = false;
+
+    // 0. 优先与内存 TokenManager 同步最新 Token 与 Project ID，避免重复并发换 Token
+    if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
+        if let Some(mem_tok) = tm.get_token_by_id(&account.id) {
+            if !mem_tok.access_token.is_empty()
+                && mem_tok.timestamp > account.token.expiry_timestamp
+            {
+                account.token.access_token = mem_tok.access_token.clone();
+                account.token.expires_in = mem_tok.expires_in;
+                account.token.expiry_timestamp = mem_tok.timestamp;
+            }
+            if account
+                .token
+                .project_id
+                .as_deref()
+                .map_or(true, |s| s.trim().is_empty())
+                && mem_tok
+                    .project_id
+                    .as_deref()
+                    .map_or(false, |s| !s.trim().is_empty())
+            {
+                account.token.project_id = mem_tok.project_id.clone();
+            }
+            let now = chrono::Utc::now().timestamp();
+            if now
+                >= account.token.expiry_timestamp
+                    - crate::modules::oauth::TOKEN_REFRESH_SKEW_SECONDS
+                || account.token.access_token.is_empty()
+            {
+                match tm
+                    .ensure_token_valid_with_skew(
+                        mem_tok,
+                        crate::modules::oauth::TOKEN_REFRESH_SKEW_SECONDS,
+                    )
+                    .await
+                {
+                    Ok(refreshed_mem) => {
+                        if refreshed_mem.access_token != account.token.access_token {
+                            refreshed_now = true;
+                        }
+                        account.token.access_token = refreshed_mem.access_token;
+                        account.token.expires_in = refreshed_mem.expires_in;
+                        account.token.expiry_timestamp = refreshed_mem.timestamp;
+                        account.token.refresh_token = refreshed_mem.refresh_token;
+                        if account
+                            .token
+                            .project_id
+                            .as_deref()
+                            .map_or(true, |s| s.trim().is_empty())
+                        {
+                            account.token.project_id = refreshed_mem.project_id;
+                        }
+                    }
+                    Err(e) => {
+                        if e.contains("invalid_grant") {
+                            account.disabled = true;
+                            account.disabled_at = Some(chrono::Utc::now().timestamp());
+                            account.disabled_reason = Some(format!("invalid_grant: {}", e));
+                            let _ = crate::modules::account::save_account(&account);
+                            crate::proxy::server::trigger_account_reload(&account.id);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
 
     // Check and auto-refresh token
-    let new_token =
-        crate::modules::oauth::ensure_fresh_token(&account.token, Some(&account.id)).await?;
+    let new_token = match crate::modules::oauth::ensure_fresh_token(&account.token, Some(&account.id)).await {
+        Ok(t) => t,
+        Err(e) => {
+            if e.contains("invalid_grant") {
+                account.disabled = true;
+                account.disabled_at = Some(chrono::Utc::now().timestamp());
+                account.disabled_reason = Some(format!("invalid_grant: {}", e));
+                let _ = crate::modules::account::save_account(&account);
+                crate::proxy::server::trigger_account_reload(&account.id);
+            }
+            return Err(e);
+        }
+    };
 
     // If token changed (meant refreshed), save it
     if new_token.access_token != account.token.access_token {
+        refreshed_now = true;
         account.token = new_token;
         if let Err(e) = crate::modules::account::save_account(&account) {
             crate::modules::logger::log_warn(&format!(
@@ -775,6 +855,14 @@ pub async fn get_valid_token_for_warmup(
                 account.email
             ));
         }
+    }
+
+    if refreshed_now {
+        let settle_ms: u64 = {
+            use rand::Rng;
+            rand::thread_rng().gen_range(300..=700)
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
     }
 
     // Prefer cached project_id when present; only call loadCodeAssist when missing.
@@ -798,6 +886,43 @@ pub async fn get_valid_token_for_warmup(
     };
 
     Ok((account.token.access_token, final_pid))
+}
+
+/// 按官方计费组 (gemini / claude) 去重，每个计费组最多挑选 1 个 100% 代表模型进行预热，
+/// 彻底避免单账号并发轰炸 10~15 个细分模型。
+fn select_representative_warmup_models(
+    models: &[crate::models::quota::ModelQuota],
+) -> Vec<(String, String, i32)> {
+    let mut best_by_group: std::collections::BTreeMap<String, (String, i32, bool)> =
+        std::collections::BTreeMap::new();
+
+    for m in models {
+        if m.percentage < 100 {
+            continue;
+        }
+        let lower = m.name.to_lowercase();
+        if lower.contains("2.5-") || lower.contains("2-5-") {
+            continue;
+        }
+        let group = crate::proxy::common::model_mapping::normalize_to_billing_group(&m.name)
+            .unwrap_or_else(|| m.name.clone());
+        let is_image = lower.contains("image");
+        match best_by_group.get(&group) {
+            None => {
+                best_by_group.insert(group, (m.name.clone(), m.percentage, is_image));
+            }
+            Some((_, _, existing_is_image)) if *existing_is_image && !is_image => {
+                // 优先选择同计费组内的标准对话模型而非生图模型
+                best_by_group.insert(group, (m.name.clone(), m.percentage, false));
+            }
+            _ => {}
+        }
+    }
+
+    best_by_group
+        .into_iter()
+        .map(|(group, (model_name, pct, _))| (group, model_name, pct))
+        .collect()
 }
 
 /// Send warmup request via proxy internal API
@@ -873,14 +998,27 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
     loop {
         let all_accounts = crate::modules::account::list_accounts().unwrap_or_default();
-        // [FIX] 过滤掉禁用反代的账号
+        // [FIX] 过滤掉禁用反代/硬禁用以及两个计费组均已在 4h 冷却期内的账号（避免先发网络请求再过滤）
         let target_accounts: Vec<_> = all_accounts
             .into_iter()
-            .filter(|a| !a.disabled && !a.proxy_disabled)
+            .filter(|a| {
+                if a.disabled || a.proxy_disabled || a.is_hard_forbidden() {
+                    return false;
+                }
+                let gemini_cool = crate::modules::scheduler::check_cooldown(
+                    &format!("{}:billing:gemini:100", a.email),
+                    14400,
+                );
+                let claude_cool = crate::modules::scheduler::check_cooldown(
+                    &format!("{}:billing:claude:100", a.email),
+                    14400,
+                );
+                !(gemini_cool && claude_cool)
+            })
             .collect();
 
         if target_accounts.is_empty() {
-            return Ok("No accounts available".to_string());
+            return Ok("No accounts available (or all in 4h warmup cooldown)".to_string());
         }
 
         crate::modules::logger::log_info(&format!(
@@ -891,9 +1029,10 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
         let mut warmup_items = Vec::new();
         let mut has_near_ready_models = false;
 
-        // Concurrently fetch quotas (batch size 5)
-        let batch_size = 5;
-        for batch in target_accounts.chunks(batch_size) {
+        // Concurrently fetch quotas (batch size 3, with 1.5~3.0s jitter between batches)
+        let batch_size = 3;
+        let total_batches = (target_accounts.len() + batch_size - 1) / batch_size;
+        for (batch_idx, batch) in target_accounts.chunks(batch_size).enumerate() {
             let mut handles = Vec::new();
             for account in batch {
                 let account = account.clone();
@@ -902,6 +1041,11 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
                         Ok(t) => t,
                         Err(_) => return None,
                     };
+                    let existing_tier = account
+                        .quota
+                        .as_ref()
+                        .and_then(|q| q.subscription_tier.clone())
+                        .filter(|s| !s.trim().is_empty());
                     let quota = fetch_quota_with_cache(
                         &token,
                         &account.email,
@@ -909,7 +1053,13 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
                         Some(&account.id),
                     )
                     .await
-                    .ok();
+                    .ok()
+                    .map(|(mut q, p)| {
+                        if q.subscription_tier.is_none() && existing_tier.is_some() {
+                            q.subscription_tier = existing_tier;
+                        }
+                        (q, p)
+                    });
                     Some((account.id.clone(), account.email.clone(), token, pid, quota))
                 });
                 handles.push(handle);
@@ -929,38 +1079,52 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
                         );
                         continue;
                     }
-                    let mut account_warmed_series = std::collections::HashSet::new();
-                    for m in fresh_quota.models {
-                        if m.percentage >= 100 {
-                            let model_to_ping = m.name.clone();
+                    // 顺手将已拉取到的最新配额落盘保存，避免白刷一次配额接口
+                    let _ = crate::modules::account::update_account_quota(&id, fresh_quota.clone());
 
-                            // Removed hardcoded whitelist - now warms up any model at 100%
-                            if !account_warmed_series.contains(&model_to_ping) {
-                                warmup_items.push((
-                                    id.clone(),
-                                    email.clone(),
-                                    model_to_ping.clone(),
-                                    token.clone(),
-                                    pid.clone(),
-                                    m.percentage,
-                                ));
-                                account_warmed_series.insert(model_to_ping);
-                            }
-                        } else if m.percentage >= NEAR_READY_THRESHOLD {
-                            has_near_ready_models = true;
-                        }
+                    if fresh_quota
+                        .models
+                        .iter()
+                        .any(|m| m.percentage < 100 && m.percentage >= NEAR_READY_THRESHOLD)
+                    {
+                        has_near_ready_models = true;
+                    }
+
+                    // 按计费组去重：每个账号每个计费组 (gemini / claude) 最多只预热 1 个代表模型
+                    for (group, model_to_ping, pct) in
+                        select_representative_warmup_models(&fresh_quota.models)
+                    {
+                        warmup_items.push((
+                            id.clone(),
+                            email.clone(),
+                            group,
+                            model_to_ping,
+                            token.clone(),
+                            pid.clone(),
+                            pct,
+                        ));
                     }
                 }
+            }
+
+            if batch_idx + 1 < total_batches {
+                let jitter_ms: u64 = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(1500..=3000)
+                };
+                tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
             }
         }
 
         if !warmup_items.is_empty() {
             let total_before = warmup_items.len();
 
-            // Filter out models warmed up within 4 hours
-            warmup_items.retain(|(_, email, model, _, _, _)| {
-                let history_key = format!("{}:{}:100", email, model);
-                !crate::modules::scheduler::check_cooldown(&history_key, 14400)
+            // Filter out billing groups / models warmed up within 4 hours
+            warmup_items.retain(|(_, email, group, model, _, _, _)| {
+                let group_key = format!("{}:billing:{}:100", email, group);
+                let model_key = format!("{}:{}:100", email, model);
+                !crate::modules::scheduler::check_cooldown(&group_key, 14400)
+                    && !crate::modules::scheduler::check_cooldown(&model_key, 14400)
             });
 
             if warmup_items.is_empty() {
@@ -986,51 +1150,35 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
             }
 
             crate::modules::logger::log_info(&format!(
-                "[Warmup] 🔥 Starting manual warmup for {} models",
+                "[Warmup] 🔥 Starting manual warmup for {} billing-group representatives",
                 total
             ));
 
             tokio::spawn(async move {
                 let mut success = 0;
-                let batch_size = 3;
-                let now_ts = chrono::Utc::now().timestamp();
 
-                for (batch_idx, batch) in warmup_items.chunks(batch_size).enumerate() {
-                    let mut handles = Vec::new();
-
-                    for (id, email, model, token, pid, pct) in batch.iter() {
-                        let id = id.clone();
-                        let email = email.clone();
-                        let model = model.clone();
-                        let token = token.clone();
-                        let pid = pid.clone();
-                        let pct = *pct;
-
-                        let handle = tokio::spawn(async move {
-                            let result =
-                                warmup_model_directly(&token, &model, &pid, &email, pct, Some(&id))
-                                    .await;
-                            (result, email, model)
-                        });
-                        handles.push(handle);
+                // 严格串行错峰预热（每次间隔 2~4s 随机抖动），绝不对同一账号并发齐射多发 streamGenerateContent
+                for (idx, (id, email, group, model, token, pid, pct)) in
+                    warmup_items.into_iter().enumerate()
+                {
+                    if idx > 0 {
+                        let jitter_ms: u64 = {
+                            use rand::Rng;
+                            rand::thread_rng().gen_range(2000..=4000)
+                        };
+                        tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
                     }
-
-                    for handle in handles {
-                        match handle.await {
-                            Ok((true, email, model)) => {
-                                success += 1;
-                                let history_key = format!("{}:{}:100", email, model);
-                                crate::modules::scheduler::record_warmup_history(
-                                    &history_key,
-                                    now_ts,
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if batch_idx < (warmup_items.len() + batch_size - 1) / batch_size - 1 {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    if warmup_model_directly(&token, &model, &pid, &email, pct, Some(&id)).await {
+                        success += 1;
+                        let now_ts = chrono::Utc::now().timestamp();
+                        crate::modules::scheduler::record_warmup_history(
+                            &format!("{}:billing:{}:100", email, group),
+                            now_ts,
+                        );
+                        crate::modules::scheduler::record_warmup_history(
+                            &format!("{}:{}:100", email, model),
+                            now_ts,
+                        );
                     }
                 }
 
@@ -1092,20 +1240,18 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
         return Err("Account is forbidden (403)".to_string());
     }
 
-    let mut models_to_warm = Vec::new();
-    let mut warmed_series = std::collections::HashSet::new();
-
-    for m in fresh_quota.models {
-        if m.percentage >= 100 {
-            let model_name = m.name.clone();
-
-            // Removed hardcoded whitelist - now warms up any model at 100%
-            if !warmed_series.contains(&model_name) {
-                models_to_warm.push((model_name.clone(), m.percentage));
-                warmed_series.insert(model_name);
-            }
-        }
+    // 顺手保存最新配额，避免白刷一次接口
+    let mut fresh_quota = fresh_quota;
+    if fresh_quota.subscription_tier.is_none() {
+        fresh_quota.subscription_tier = account_owned
+            .quota
+            .as_ref()
+            .and_then(|q| q.subscription_tier.clone());
     }
+    let _ = crate::modules::account::update_account_quota(account_id, fresh_quota.clone());
+
+    // 按官方计费组 (gemini / claude) 去重，每个计费组最多预热 1 个代表模型
+    let models_to_warm = select_representative_warmup_models(&fresh_quota.models);
 
     if models_to_warm.is_empty() {
         return Ok("No warmup needed".to_string());
@@ -1115,15 +1261,27 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
     let account_id_clone = account_id.to_string();
 
     tokio::spawn(async move {
-        for (name, pct) in models_to_warm {
+        for (idx, (group, name, pct)) in models_to_warm.into_iter().enumerate() {
+            if idx > 0 {
+                let jitter_ms: u64 = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(2000..=4000)
+                };
+                tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
+            }
             if warmup_model_directly(&token, &name, &pid, &email, pct, Some(&account_id_clone))
                 .await
             {
-                let history_key = format!("{}:{}:100", email, name);
                 let now_ts = chrono::Utc::now().timestamp();
-                crate::modules::scheduler::record_warmup_history(&history_key, now_ts);
+                crate::modules::scheduler::record_warmup_history(
+                    &format!("{}:billing:{}:100", email, group),
+                    now_ts,
+                );
+                crate::modules::scheduler::record_warmup_history(
+                    &format!("{}:{}:100", email, name),
+                    now_ts,
+                );
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     });
 
@@ -1159,5 +1317,40 @@ mod tests {
         assert_eq!(crate::modules::quota_ledger::fraction_to_pct(0.996), 100);
         assert_eq!(crate::modules::quota_ledger::fraction_to_pct(0.004), 0);
         assert_eq!(crate::modules::quota_ledger::fraction_to_pct(0.24319573), 24);
+    }
+
+    #[test]
+    fn test_select_representative_warmup_models_dedups_by_billing_group() {
+        use crate::models::quota::ModelQuota;
+
+        let mk = |name: &str, pct: i32| -> ModelQuota {
+            serde_json::from_value(json!({
+                "name": name,
+                "percentage": pct,
+                "reset_time": ""
+            }))
+            .unwrap()
+        };
+        let models = vec![
+            mk("gemini-2.5-flash", 100),
+            mk("gemini-3-pro-image", 100),
+            mk("gemini-3-flash", 100),
+            mk("gemini-3.1-pro-high", 100),
+            mk("claude-sonnet-4-6", 100),
+            mk("claude-opus-4-6-thinking", 100),
+            mk("gpt-oss-120b-medium", 100),
+        ];
+
+        let selected = select_representative_warmup_models(&models);
+        assert_eq!(selected.len(), 2, "must select at most 1 per billing group");
+        let groups: Vec<&str> = selected.iter().map(|(g, _, _)| g.as_str()).collect();
+        assert_eq!(groups, vec!["claude", "gemini"]);
+        // Gemini group should prefer non-image model over gemini-3-pro-image
+        let gemini_model = &selected[1].1;
+        assert!(
+            !gemini_model.contains("image") && !gemini_model.contains("2.5-"),
+            "expected non-image non-2.5 gemini model, got {}",
+            gemini_model
+        );
     }
 }

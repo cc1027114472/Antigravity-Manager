@@ -503,3 +503,32 @@ func TestRelayClosesOldProxyConnectionsOnAccountSwitch(t *testing.T) {
 			afterCount, hasOldH1, hasOldH2, hasNewH1)
 	}
 }
+
+func TestRelayTransientAccountDoesNotPopulatePool(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer proxy.Close()
+
+	pool := newTransportPool()
+	handler := newRelayHandler(pool)
+
+	req := httptest.NewRequest(http.MethodPost, "/relay", strings.NewReader(`{}`))
+	req.Header.Set(hdrTargetURL, "http://example.com/oauth2/token")
+	req.Header.Set(hdrProxyURL, proxy.URL)
+	req.Header.Set(hdrProto, "h2")
+	req.Header.Set(hdrAccountID, "tmp_import_12345")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	pool.mu.RLock()
+	entriesCount := len(pool.entries)
+	pool.mu.RUnlock()
+	if entriesCount != 0 {
+		t.Fatalf("expected transient tmp_ account not to populate transportPool, got %d entries", entriesCount)
+	}
+}

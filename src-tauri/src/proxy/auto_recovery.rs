@@ -176,26 +176,52 @@ impl AutoRecoveryScheduler {
                         let now = chrono::Utc::now().timestamp();
                         let is_expired = now >= (account.token.expiry_timestamp - 300);
                         let tok = if is_expired {
-                            if let Ok(token_resp) = crate::modules::oauth::refresh_access_token_with_client(
+                            match crate::modules::oauth::refresh_access_token_with_client(
                                 &account.token.refresh_token,
                                 Some(account_id),
                                 account.token.oauth_client_key.as_deref(),
                             )
                             .await
                             {
-                                account.token.access_token = token_resp.access_token.clone();
-                                account.token.expires_in = token_resp.expires_in;
-                                account.token.expiry_timestamp = now + token_resp.expires_in;
-                                if let Some(rt) = token_resp.refresh_token.clone() {
-                                    account.token.refresh_token = rt;
+                                Ok(token_resp) => {
+                                    account.token.access_token = token_resp.access_token.clone();
+                                    account.token.expires_in = token_resp.expires_in;
+                                    account.token.expiry_timestamp = now + token_resp.expires_in;
+                                    if let Some(rt) = token_resp.refresh_token.clone() {
+                                        account.token.refresh_token = rt;
+                                    }
+                                    if token_resp.oauth_client_key.is_some() {
+                                        account.token.oauth_client_key =
+                                            token_resp.oauth_client_key.clone();
+                                    }
+                                    let _ = crate::modules::account::save_account(&account);
+                                    // 拟人化沉淀延迟 (400..=800ms)，避免换完 Token 0ms 瞬发探针
+                                    let settle_ms: u64 = {
+                                        use rand::Rng;
+                                        rand::thread_rng().gen_range(400..=800)
+                                    };
+                                    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+                                    token_resp.access_token
                                 }
-                                if token_resp.oauth_client_key.is_some() {
-                                    account.token.oauth_client_key = token_resp.oauth_client_key.clone();
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "[AutoRecovery] OAuth refresh failed before probe for {} ({}): {}",
+                                        email,
+                                        account_id,
+                                        e
+                                    );
+                                    if e.contains("invalid_grant") {
+                                        let _ = token_mgr
+                                            .disable_account(
+                                                account_id,
+                                                &format!("invalid_grant: {}", e),
+                                            )
+                                            .await;
+                                        self.remove_task(account_id);
+                                    }
+                                    // 严禁拿已过期的旧 access_token 硬打 streamGenerateContent 制造 401 噪声
+                                    return Ok(false);
                                 }
-                                let _ = crate::modules::account::save_account(&account);
-                                token_resp.access_token
-                            } else {
-                                account.token.access_token.clone()
                             }
                         } else {
                             account.token.access_token.clone()
@@ -257,6 +283,7 @@ impl AutoRecoveryScheduler {
                             account_id,
                             "Google upstream probe returned 403 Forbidden",
                         );
+                        self.remove_task(account_id);
                     } else {
                         tracing::info!(
                             "[AutoRecovery] Probe non-success for account {} ({}): status {}",
@@ -491,30 +518,44 @@ impl AutoRecoveryScheduler {
                     }
                     _ = interval.tick() => {
                         let due_tasks = scheduler.get_due_tasks();
-                        for task in due_tasks {
-                            let s = scheduler.clone();
-                            tokio::spawn(async move {
-                                match s.probe_account(&task.account_id, &task.email).await {
-                                    Ok(true) => {
-                                        if let Err(e) = s.recover_account(&task.account_id, &task.email, task.attempt).await {
-                                            tracing::warn!("[AutoRecovery] Failed to recover account {}: {}", task.email, e);
-                                        }
+                        for (idx, task) in due_tasks.into_iter().enumerate() {
+                            if cancel_token.is_cancelled() {
+                                break;
+                            }
+                            // 同一 Tick 内多个到期恢复任务强制串行错峰 (1.5~3.0s)，严禁并发齐射探针
+                            if idx > 0 {
+                                let jitter_ms: u64 = {
+                                    use rand::Rng;
+                                    rand::thread_rng().gen_range(1500..=3000)
+                                };
+                                tokio::select! {
+                                    _ = cancel_token.cancelled() => {
+                                        tracing::info!("[AutoRecovery] Loop cancelled during stagger");
+                                        return;
                                     }
-                                    Ok(false) | Err(_) => {
-                                        if let Some(next_task) = s.advance_task(&task.account_id) {
-                                            tracing::info!(
-                                                "[AutoRecovery] Probe failed for {}, advanced to attempt {} (next in {:?})",
-                                                task.email, next_task.attempt, next_task.next_probe_at.saturating_duration_since(std::time::Instant::now())
-                                            );
-                                        } else {
-                                            tracing::warn!(
-                                                "🚫 [AutoRecovery] All 4 probe attempts exhausted for account {}. Ceasing auto-recovery, remaining proxy-disabled.",
-                                                task.email
-                                            );
-                                        }
+                                    _ = tokio::time::sleep(Duration::from_millis(jitter_ms)) => {}
+                                }
+                            }
+                            match scheduler.probe_account(&task.account_id, &task.email).await {
+                                Ok(true) => {
+                                    if let Err(e) = scheduler.recover_account(&task.account_id, &task.email, task.attempt).await {
+                                        tracing::warn!("[AutoRecovery] Failed to recover account {}: {}", task.email, e);
                                     }
                                 }
-                            });
+                                Ok(false) | Err(_) => {
+                                    if let Some(next_task) = scheduler.advance_task(&task.account_id) {
+                                        tracing::info!(
+                                            "[AutoRecovery] Probe failed for {}, advanced to attempt {} (next in {:?})",
+                                            task.email, next_task.attempt, next_task.next_probe_at.saturating_duration_since(std::time::Instant::now())
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            "🚫 [AutoRecovery] Task for {} removed (e.g. invalid_grant/403/manual cancel). Stopping auto-recovery.",
+                                            task.email
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }

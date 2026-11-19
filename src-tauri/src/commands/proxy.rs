@@ -861,7 +861,12 @@ pub async fn clear_proxy_rate_limit(
 ) -> Result<bool, String> {
     let instance_lock = state.instance.read().await;
     if let Some(instance) = instance_lock.as_ref() {
-        Ok(instance.token_manager.clear_rate_limit(&account_id))
+        let cleared = instance.token_manager.clear_rate_limit(&account_id);
+        instance
+            .token_manager
+            .clear_persisted_live_limit(&account_id, None)
+            .await;
+        Ok(cleared)
     } else {
         Err("服务未运行".to_string())
     }
@@ -875,6 +880,10 @@ pub async fn clear_all_proxy_rate_limits(
     let instance_lock = state.instance.read().await;
     if let Some(instance) = instance_lock.as_ref() {
         instance.token_manager.clear_all_rate_limits();
+        instance
+            .token_manager
+            .clear_all_persisted_live_limits()
+            .await;
         Ok(())
     } else {
         Err("服务未运行".to_string())

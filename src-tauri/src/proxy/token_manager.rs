@@ -83,6 +83,10 @@ fn set_account_oauth_client_key(account_id: &str, key: Option<&str>) {
     }
 }
 
+fn clear_account_oauth_client_key(account_id: &str) {
+    ACCOUNT_OAUTH_CLIENT_KEYS.remove(account_id);
+}
+
 #[derive(Debug, Clone)]
 pub struct ProxyToken {
     pub account_id: String,
@@ -773,8 +777,10 @@ impl TokenManager {
             Ok(Some(token)) => {
                 let merged = self.merge_with_in_memory_state(account_id, token);
                 self.tokens.insert(account_id.to_string(), merged);
-                // [NEW] 重新加载账号时自动清除该账号的限流记录
-                self.clear_rate_limit(account_id);
+                // 注意：此处严禁无条件调用 clear_rate_limit(account_id)！
+                // 后台配额校准、修改并发上限、绑定代理、同步配置等日常操作都会触发 reload_account，
+                // 若清空仍在冷却期内的 429 限流锁会导致被限流账号提前顶风撞墙。
+                // 真正确认恢复的路径（auto_recovery 探针成功、管理员手动解除、配额恢复）会显式调用 clear_rate_limit。
                 Ok(())
             }
             Ok(None) => {
@@ -790,10 +796,8 @@ impl TokenManager {
 
     /// 重新加载所有账号
     pub async fn reload_all_accounts(&self) -> Result<usize, String> {
-        let count = self.load_accounts().await?;
-        // [NEW] 重新加载所有账号时自动清除所有限流记录
-        self.clear_all_rate_limits();
-        Ok(count)
+        // 仅原子同步账号池，严禁无条件 clear_all_rate_limits()，避免单次新增账号或配额刷新抹掉全池 429 冷却锁
+        self.load_accounts().await
     }
 
     /// 取消指定账号在后台的自动恢复任务
@@ -819,6 +823,8 @@ impl TokenManager {
         self.health_scores.remove(account_id);
         self.clear_rate_limit(account_id);
         self.cancel_auto_recovery(account_id);
+        clear_account_oauth_client_key(account_id);
+        RECENT_LOAD_CODE_ASSIST_TS.remove(account_id);
         self.session_accounts.retain(|_, v| v != account_id);
         self.unbind_account_session(account_id);
         if let Ok(mut preferred) = self.preferred_account_id.try_write() {
@@ -1074,10 +1080,25 @@ impl TokenManager {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        set_account_oauth_client_key(
-            &account_id,
-            token_obj.get("oauth_client_key").and_then(|v| v.as_str()),
-        );
+        let disk_oauth_client_key = token_obj
+            .get("oauth_client_key")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(client_key) = disk_oauth_client_key {
+            set_account_oauth_client_key(&account_id, Some(client_key));
+        } else {
+            // 若磁盘未携带 oauth_client_key 且是新账号或 refresh_token 已被覆盖更换（如 API 重新上传），
+            // 必须清除内存中残留的旧 oauth_client_key，避免用旧渠道 client_id 试探新 refresh_token。
+            let same_refresh_token = self
+                .tokens
+                .get(&account_id)
+                .map(|existing| existing.refresh_token == refresh_token)
+                .unwrap_or(false);
+            if !same_refresh_token {
+                clear_account_oauth_client_key(&account_id);
+            }
+        }
 
         // 【新增】提取订阅等级 (subscription_tier 为 "FREE" | "PRO" | "ULTRA")
         let subscription_tier = account
@@ -1122,6 +1143,7 @@ impl TokenManager {
         let mut model_limits: HashMap<String, u64> = HashMap::new();
         // Also keep fine-grained capability keys so get_token can verify model presence
         let mut capability_keys: HashSet<String> = HashSet::new();
+        let has_online_quota = account.get("quota").map_or(false, |q| q.is_object());
 
         if let Some(models) = account
             .get("quota")
@@ -1222,6 +1244,20 @@ impl TokenManager {
                     }
                 }
             }
+        }
+
+        // 新导入且尚未拉取过在线配额快照的账号（如 API 批量上传 add_account_direct、skip_initial_quota 或 Web OAuth 回调）：
+        // 磁盘上 quota 为 null，不能让 model_quotas 为空（否则会被选号阶段的 capability retain 100% 剔除，
+        // 导致后台 PrewarmingWorker 反复刷 Token/预热却永远接不到正常业务请求），也不能因为首次只跑了
+        // 某一计费组（写入 estimated_quotas）就把另一个计费组锁死。
+        // 仅在内存中为尚未在线校准过的账号补齐官方默认计费组 (gemini / claude -> 100%)，不写盘、不触发额外刷新。
+        if !has_online_quota {
+            model_quotas
+                .entry(crate::proxy::common::model_mapping::BILLING_GEMINI.to_string())
+                .or_insert(100);
+            model_quotas
+                .entry(crate::proxy::common::model_mapping::BILLING_CLAUDE.to_string())
+                .or_insert(100);
         }
 
         for (k, v) in &model_quotas {
@@ -1781,8 +1817,24 @@ impl TokenManager {
         fallback_5h: i32,
         fallback_weekly: i32,
     ) {
-        let (access_token, email) = match self.tokens.get(account_id) {
-            Some(entry) => (entry.access_token.clone(), entry.email.clone()),
+        let (access_token, email, cached_pid, existing_tier) = match self.tokens.get(account_id) {
+            Some(entry) => {
+                let tier = entry
+                    .subscription_tier
+                    .clone()
+                    .filter(|s| !s.trim().is_empty());
+                let pid = if tier.is_some() {
+                    entry
+                        .project_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+                (entry.access_token.clone(), entry.email.clone(), pid, tier)
+            }
             None => {
                 tracing::warn!(
                     "[QuotaLedger] Threshold calibrate skipped: account {} not in pool",
@@ -1798,8 +1850,18 @@ impl TokenManager {
             }
         };
 
-        match crate::modules::quota::fetch_quota(&access_token, &email, Some(account_id)).await {
-            Ok((quota_data, _project_id)) => {
+        match crate::modules::quota::fetch_quota_with_cache(
+            &access_token,
+            &email,
+            cached_pid.as_deref(),
+            Some(account_id),
+        )
+        .await
+        {
+            Ok((mut quota_data, _project_id)) => {
+                if quota_data.subscription_tier.is_none() && existing_tier.is_some() {
+                    quota_data.subscription_tier = existing_tier;
+                }
                 match crate::modules::account::update_account_quota(account_id, quota_data) {
                     Ok(()) => {
                         if let Err(e) = self.reload_account(account_id).await {
@@ -4579,8 +4641,9 @@ impl TokenManager {
             );
         }
 
-        // 【优化 Issue #284】添加 5 秒超时，防止死锁
-        let timeout_duration = std::time::Duration::from_secs(5);
+        // 【超时对齐】与 acquire_token_with_lease 一致采用 25s 外层超时，确保严格大于内层
+        // OAuth / loadCodeAssist 的 10s 单次超时，避免慢代理在 5s 被提前截断、错失 X-Ag-Proxy-Error 熔断。
+        let timeout_duration = std::time::Duration::from_secs(25);
         match tokio::time::timeout(
             timeout_duration,
             self.get_token_internal(quota_group, force_rotate, session_id, target_model),
@@ -4589,7 +4652,8 @@ impl TokenManager {
         {
             Ok(result) => result,
             Err(_) => Err(
-                "Token acquisition timeout (5s) - system too busy or deadlock detected".to_string(),
+                "Token acquisition timeout (25s) - system too busy or deadlock detected"
+                    .to_string(),
             ),
         }
     }
@@ -5481,7 +5545,7 @@ impl TokenManager {
         Err(last_error.unwrap_or_else(|| "All accounts failed".to_string()))
     }
 
-    async fn disable_account(&self, account_id: &str, reason: &str) -> Result<(), String> {
+    pub(crate) async fn disable_account(&self, account_id: &str, reason: &str) -> Result<(), String> {
         let path = if let Some(entry) = self.tokens.get(account_id) {
             entry.account_path.clone()
         } else {
@@ -5929,33 +5993,60 @@ impl TokenManager {
     ) -> bool {
         // 1. 从 tokens 中获取该账号的 access_token 和 account_id
         // 同时获取 account_id，确保锁定 key 与检查 key 一致
-        let (access_token, account_id) = {
-            let mut found: Option<(String, String)> = None;
+        let found = {
+            let mut found: Option<(String, String, Option<String>, Option<String>)> = None;
             for entry in self.tokens.iter() {
                 if entry.value().email == email {
+                    let tier = entry
+                        .value()
+                        .subscription_tier
+                        .clone()
+                        .filter(|s| !s.trim().is_empty());
+                    let pid = if tier.is_some() {
+                        entry
+                            .value()
+                            .project_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                    } else {
+                        None
+                    };
                     found = Some((
                         entry.value().access_token.clone(),
                         entry.value().account_id.clone(),
+                        pid,
+                        tier,
                     ));
                     break;
                 }
             }
             found
-        }
-        .unzip();
+        };
 
-        let (access_token, account_id) = match (access_token, account_id) {
-            (Some(token), Some(id)) => (token, id),
-            _ => {
+        let (access_token, account_id, cached_pid, existing_tier) = match found {
+            Some(v) => v,
+            None => {
                 tracing::warn!("无法找到账号 {} 的 access_token,无法实时刷新配额", email);
                 return false;
             }
         };
 
-        // 2. 调用配额刷新 API
+        // 2. 调用配额刷新 API（复用已缓存的 project_id + subscription_tier，避免 429 瞬间多打一次 loadCodeAssist）
         tracing::info!("账号 {} 正在实时刷新配额...", email);
-        match crate::modules::quota::fetch_quota(&access_token, email, Some(&account_id)).await {
-            Ok((quota_data, _project_id)) => {
+        match crate::modules::quota::fetch_quota_with_cache(
+            &access_token,
+            email,
+            cached_pid.as_deref(),
+            Some(&account_id),
+        )
+        .await
+        {
+            Ok((mut quota_data, _project_id)) => {
+                if quota_data.subscription_tier.is_none() && existing_tier.is_some() {
+                    quota_data.subscription_tier = existing_tier;
+                }
                 // Calibrate local ledger + protection from online snapshot (not lockout-only).
                 if let Err(e) =
                     crate::modules::account::update_account_quota(&account_id, quota_data.clone())
@@ -6391,9 +6482,11 @@ impl TokenManager {
     }
 
     pub async fn clear_persisted_live_limit(&self, account_id: &str, model: Option<&str>) {
-        let Some(model_key) = model.filter(|m| !m.is_empty()) else {
-            return;
-        };
+        if let Some(m) = model {
+            if m.is_empty() {
+                return;
+            }
+        }
 
         let path = if let Some(entry) = self.tokens.get(account_id) {
             entry.account_path.clone()
@@ -6417,14 +6510,26 @@ impl TokenManager {
             return;
         };
 
-        live_limits.remove(model_key);
-        if model_key.contains("image") {
-            live_limits.remove("gemini-3.1-flash-image");
-            live_limits.remove("gemini-3-pro-image");
+        if let Some(model_key) = model {
+            live_limits.remove(model_key);
+            if model_key.contains("image") {
+                live_limits.remove("gemini-3.1-flash-image");
+                live_limits.remove("gemini-3-pro-image");
+            }
+        } else {
+            // model == None 表示清除该账号的全部持久化限流记录（例如探针自愈或管理员手动解除限流）
+            live_limits.clear();
         }
 
         if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&content).unwrap()) {
             tracing::debug!("Failed to clear live limit for {}: {}", account_id, e);
+        }
+    }
+
+    pub async fn clear_all_persisted_live_limits(&self) {
+        let account_ids: Vec<String> = self.tokens.iter().map(|e| e.key().clone()).collect();
+        for account_id in account_ids {
+            self.clear_persisted_live_limit(&account_id, None).await;
         }
     }
 
@@ -6939,20 +7044,38 @@ impl TokenManager {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| "No refresh token returned by Google".to_string())?;
 
+        let temp_id = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            let tid = format!("tmp_oauth_{}", uuid::Uuid::new_v4());
+            match pool.pin_transient_proxy_for_import(&tid, None).await {
+                Ok(Some(_)) => Some(tid),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let probe_ctx = temp_id.as_deref();
+
         // 1. 直接用刚换出的 access_token 获取用户信息（不再二次调 oauth2/token）
-        let user_info =
-            crate::modules::oauth::get_user_info(&token_resp.access_token, None).await?;
+        let user_info = match crate::modules::oauth::get_user_info(&token_resp.access_token, probe_ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                if let (Some(tid), Some(pool)) = (&temp_id, crate::proxy::proxy_pool::get_global_proxy_pool()) {
+                    pool.unpin_transient_proxy(tid);
+                }
+                return Err(e);
+            }
+        };
         let email = user_info.email.clone();
         let display_name = user_info.get_display_name();
 
-        // 2. 直接用同一个 access_token 获取 project_id（不再三次调 oauth2/token）
+        // 2. 直接用同一个 access_token 获取 project_id（共享同一临时出口，不再三次调 oauth2/token）
         let project_id =
-            crate::proxy::project_resolver::fetch_project_id(&token_resp.access_token, None)
+            crate::proxy::project_resolver::fetch_project_id(&token_resp.access_token, probe_ctx)
                 .await
                 .unwrap_or_else(|_| "aicode-consumers".to_string());
 
         let email_clone = email.clone();
-        tokio::task::spawn_blocking(move || {
+        let saved_account = tokio::task::spawn_blocking(move || {
             let token_data = crate::models::TokenData::new(
                 token_resp.access_token,
                 refresh_token,
@@ -6968,7 +7091,22 @@ impl TokenManager {
             crate::modules::account::upsert_account(email_clone, display_name, token_data)
         })
         .await
-        .map_err(|e| format!("Task join error: {}", e))??;
+        .map_err(|e| format!("Task join error: {}", e))?;
+
+        match saved_account {
+            Ok(acc) => {
+                if let (Some(tid), Some(pool)) = (&temp_id, crate::proxy::proxy_pool::get_global_proxy_pool()) {
+                    pool.inherit_sticky_egress(tid, &acc.id);
+                    pool.unpin_transient_proxy(tid);
+                }
+            }
+            Err(e) => {
+                if let (Some(tid), Some(pool)) = (&temp_id, crate::proxy::proxy_pool::get_global_proxy_pool()) {
+                    pool.unpin_transient_proxy(tid);
+                }
+                return Err(e);
+            }
+        }
 
         let _ = self.load_accounts().await;
         Ok(email)
@@ -6977,12 +7115,27 @@ impl TokenManager {
     /// 添加新账号 (纯后端实现，不依赖 Tauri AppHandle)
     pub async fn add_account(&self, email: &str, refresh_token: &str) -> Result<(), String> {
         // 1. 获取 Access Token (验证 refresh_token 有效性)
-        // Use a temp account id so project resolve shares the same pool egress as oauth
-        let temp_account_id = uuid::Uuid::new_v4().to_string();
-        let token_info =
-            crate::modules::oauth::refresh_access_token(refresh_token, Some(&temp_account_id))
-                .await
-                .map_err(|e| format!("Invalid refresh token: {}", e))?;
+        // Use a tmp_ prefixed id so Go sidecar treats it as ephemeral and ProxyPool pins a single egress
+        let temp_account_id = format!("tmp_add_{}", uuid::Uuid::new_v4());
+        if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            let _ = pool
+                .pin_transient_proxy_for_import(&temp_account_id, None)
+                .await;
+        }
+        let token_info = match crate::modules::oauth::refresh_access_token(
+            refresh_token,
+            Some(&temp_account_id),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                    pool.unpin_transient_proxy(&temp_account_id);
+                }
+                return Err(format!("Invalid refresh token: {}", e));
+            }
+        };
 
         // 2. 获取项目 ID (Project ID)
         let project_id = crate::proxy::project_resolver::fetch_project_id(
@@ -6996,7 +7149,7 @@ impl TokenManager {
         let email_clone = email.to_string();
         let refresh_token_clone = refresh_token.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        let saved_res = tokio::task::spawn_blocking(move || {
             let token_data = crate::models::TokenData::new(
                 token_info.access_token,
                 refresh_token_clone,
@@ -7012,8 +7165,22 @@ impl TokenManager {
             crate::modules::account::upsert_account(email_clone, None, token_data)
         })
         .await
-        .map_err(|e| format!("Task join error: {}", e))?
-        .map_err(|e| format!("Failed to save account: {}", e))?;
+        .map_err(|e| format!("Task join error: {}", e))?;
+
+        match saved_res {
+            Ok(acc) => {
+                if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                    pool.inherit_sticky_egress(&temp_account_id, &acc.id);
+                    pool.unpin_transient_proxy(&temp_account_id);
+                }
+            }
+            Err(e) => {
+                if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+                    pool.unpin_transient_proxy(&temp_account_id);
+                }
+                return Err(format!("Failed to save account: {}", e));
+            }
+        }
 
         // 4. 重新加载 (更新内存)
         self.reload_all_accounts().await.map(|_| ())
@@ -9306,5 +9473,266 @@ mod tests {
             |s| *s == State::Cold,
         );
         assert_eq!(picked_busy, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_uncalibrated_uploaded_account_is_schedulable_for_both_billing_groups() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-tm-uncalibrated-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let account_id = "acc-uploaded-1";
+        let account_path = accounts_dir.join(format!("{}.json", account_id));
+
+        // 1. Newly API-uploaded account: quota is null, estimated_quotas is empty
+        let uploaded_json = serde_json::json!({
+            "id": account_id,
+            "email": "uploaded@test.com",
+            "token": {
+                "access_token": "atk-uploaded",
+                "refresh_token": "rtk-uploaded",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600,
+                "project_id": "pid-uploaded"
+            },
+            "quota": null,
+            "estimated_quotas": {},
+            "disabled": false,
+            "proxy_disabled": false,
+            "created_at": now,
+            "last_used": now
+        });
+        std::fs::write(
+            &account_path,
+            serde_json::to_string_pretty(&uploaded_json).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        {
+            let loaded = manager.tokens.get(account_id).expect("account must load");
+            assert_eq!(loaded.model_quotas.get("gemini").copied(), Some(100));
+            assert_eq!(loaded.model_quotas.get("claude").copied(), Some(100));
+            assert_eq!(loaded.model_quotas_weekly.get("gemini").copied(), Some(100));
+            assert_eq!(loaded.model_quotas_weekly.get("claude").copied(), Some(100));
+            assert_eq!(loaded.remaining_quota, Some(100));
+        }
+
+        // Must be selectable via get_token for BOTH Claude and Gemini models
+        let (_, _, _, picked_claude, _) = manager
+            .get_token("claude", false, Some("sid-c"), "claude-sonnet-4-6")
+            .await
+            .expect("uncalibrated account should be selectable for claude");
+        assert_eq!(picked_claude, account_id);
+
+        let (_, _, _, picked_gemini, _) = manager
+            .get_token("gemini", false, Some("sid-g"), "gemini-3-flash")
+            .await
+            .expect("uncalibrated account should be selectable for gemini");
+        assert_eq!(picked_gemini, account_id);
+
+        // 2. Partial estimated_quotas (after first claude request), quota still null:
+        // Reload must preserve claude=95 AND keep gemini=100 unblocked
+        let mut partial_json = uploaded_json.clone();
+        partial_json["estimated_quotas"] = serde_json::json!({
+            "claude": { "percentage5h": 95, "percentageWeekly": 98 }
+        });
+        std::fs::write(
+            &account_path,
+            serde_json::to_string_pretty(&partial_json).unwrap(),
+        )
+        .unwrap();
+        manager.reload_account(account_id).await.unwrap();
+        {
+            let reloaded = manager.tokens.get(account_id).unwrap();
+            assert_eq!(reloaded.model_quotas.get("claude").copied(), Some(95));
+            assert_eq!(reloaded.model_quotas.get("gemini").copied(), Some(100));
+        }
+
+        // 3. Once authoritative online quota arrives (only gemini models), online snapshot wins
+        let mut calibrated_json = uploaded_json.clone();
+        calibrated_json["quota"] = serde_json::json!({
+            "models": [
+                { "name": "gemini-3-flash", "percentage": 80 }
+            ]
+        });
+        std::fs::write(
+            &account_path,
+            serde_json::to_string_pretty(&calibrated_json).unwrap(),
+        )
+        .unwrap();
+        manager.reload_account(account_id).await.unwrap();
+        {
+            let calibrated = manager.tokens.get(account_id).unwrap();
+            assert_eq!(calibrated.model_quotas.get("gemini").copied(), Some(80));
+            assert!(
+                !calibrated.model_quotas.contains_key("claude"),
+                "authoritative online quota without claude must not be artificially seeded"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_reload_preserves_active_rate_limits_and_clear_persisted_none_wipes_all() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-tm-reload-ratelimit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let account_id = "acc-rl-1";
+        let account_path = accounts_dir.join(format!("{}.json", account_id));
+
+        let account_json = serde_json::json!({
+            "id": account_id,
+            "email": "rl@test.com",
+            "token": {
+                "access_token": "atk-rl",
+                "refresh_token": "rtk-rl",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600,
+                "project_id": "pid-rl"
+            },
+            "quota": {
+                "models": [
+                    { "name": "claude-sonnet-4-6", "percentage": 50 }
+                ]
+            },
+            "live_limited_models": {
+                "claude-sonnet-4-6": {
+                    "until": now + 300,
+                    "reason": "RateLimitExceeded",
+                    "detected_at": now,
+                    "message": "429"
+                }
+            },
+            "disabled": false,
+            "proxy_disabled": false,
+            "created_at": now,
+            "last_used": now
+        });
+        std::fs::write(
+            &account_path,
+            serde_json::to_string_pretty(&account_json).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+        assert!(
+            manager
+                .is_rate_limited(account_id, Some("claude-sonnet-4-6"))
+                .await,
+            "initial load must restore persisted 429 limit"
+        );
+
+        // Routine reload_account and reload_all_accounts must NOT clear active 429 limits
+        manager.reload_account(account_id).await.unwrap();
+        assert!(
+            manager
+                .is_rate_limited(account_id, Some("claude-sonnet-4-6"))
+                .await,
+            "reload_account must not wipe active 429 cooldown"
+        );
+
+        manager.reload_all_accounts().await.unwrap();
+        assert!(
+            manager
+                .is_rate_limited(account_id, Some("claude-sonnet-4-6"))
+                .await,
+            "reload_all_accounts must not wipe active 429 cooldown"
+        );
+
+        // Explicit recovery (like auto_recovery::recover_account): clear memory + clear disk None + reload
+        manager.clear_rate_limit(account_id);
+        manager.clear_persisted_live_limit(account_id, None).await;
+        manager.reload_account(account_id).await.unwrap();
+        assert!(
+            !manager
+                .is_rate_limited(account_id, Some("claude-sonnet-4-6"))
+                .await,
+            "explicit clear_rate_limit + clear_persisted_live_limit(None) must survive reload"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_reupload_refresh_token_clears_stale_oauth_client_key() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-tm-clientkey-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let account_id = format!("acc-ck-{}", uuid::Uuid::new_v4());
+        let account_path = accounts_dir.join(format!("{}.json", account_id));
+
+        let mut account_json = serde_json::json!({
+            "id": account_id,
+            "email": "ck@test.com",
+            "token": {
+                "access_token": "atk-1",
+                "refresh_token": "rtk-old",
+                "expires_in": 3600,
+                "expiry_timestamp": now + 3600,
+                "oauth_client_key": "antigravity_enterprise"
+            },
+            "disabled": false,
+            "proxy_disabled": false,
+            "created_at": now,
+            "last_used": now
+        });
+        std::fs::write(
+            &account_path,
+            serde_json::to_string_pretty(&account_json).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+        assert_eq!(
+            get_account_oauth_client_key(&account_id).as_deref(),
+            Some("antigravity_enterprise")
+        );
+
+        // Case 1: Reload with SAME refresh_token and omitted oauth_client_key preserves in-memory key
+        account_json["token"]["oauth_client_key"] = serde_json::Value::Null;
+        std::fs::write(
+            &account_path,
+            serde_json::to_string_pretty(&account_json).unwrap(),
+        )
+        .unwrap();
+        manager.reload_account(&account_id).await.unwrap();
+        assert_eq!(
+            get_account_oauth_client_key(&account_id).as_deref(),
+            Some("antigravity_enterprise")
+        );
+
+        // Case 2: Re-upload with NEW refresh_token and null oauth_client_key clears stale cached key
+        account_json["token"]["refresh_token"] = serde_json::json!("rtk-new-channel");
+        std::fs::write(
+            &account_path,
+            serde_json::to_string_pretty(&account_json).unwrap(),
+        )
+        .unwrap();
+        manager.reload_account(&account_id).await.unwrap();
+        assert_eq!(get_account_oauth_client_key(&account_id), None);
+
+        // Cleanup static map entry
+        manager.remove_account(&account_id);
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

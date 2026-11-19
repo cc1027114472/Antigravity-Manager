@@ -24,15 +24,17 @@ impl AccountService {
         preferred_proxy_id: Option<&str>,
         skip_initial_quota: bool,
     ) -> Result<Account, String> {
-        // 仅在指定了专属代理时使用纯内存临时路由覆盖（不写盘 gui_config.json，不受 max_accounts=1 阻塞）；
-        // 否则传 None 让 Go Sidecar 走一次性匿名短连接（不留孤儿连接池条目）
-        let temp_bound_id = if let (Some(pid), Some(pool)) = (
-            preferred_proxy_id.map(str::trim).filter(|s| !s.is_empty()),
-            crate::proxy::proxy_pool::get_global_proxy_pool(),
-        ) {
+        // 无论是否指定了专属代理，都在导入探测阶段统一使用纯内存临时路由覆盖（不写盘 gui_config.json，
+        // 不受 max_accounts=1 阻塞），并在 Go Sidecar 中按 `tmp_` 前缀走一次性短连接（不留连接池泄漏），
+        // 确保步骤 1 (oauth2/token)、步骤 2 (userinfo)、步骤 3 (loadCodeAssist) 及步骤 6 (fetchAvailableModels)
+        // 全程使用同一个代理 IP，杜绝导入瞬间跨 3~4 个 IP 跳变触发风控。
+        let temp_bound_id = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
             let tid = format!("tmp_import_{}", uuid::Uuid::new_v4());
-            match pool.pin_transient_proxy_by_id(&tid, pid).await {
-                Ok(true) => Some(tid),
+            match pool
+                .pin_transient_proxy_for_import(&tid, preferred_proxy_id)
+                .await
+            {
+                Ok(Some(_)) => Some(tid),
                 _ => None,
             }
         } else {
@@ -70,10 +72,6 @@ impl AccountService {
         .await
         .ok();
 
-        if let (Some(tid), Some(pool)) = (&temp_bound_id, crate::proxy::proxy_pool::get_global_proxy_pool()) {
-            pool.unpin_transient_proxy(tid);
-        }
-
         // 4. 构造 TokenData
         let token = TokenData::new(
             token_res.access_token.clone(),
@@ -88,8 +86,29 @@ impl AccountService {
         .with_oauth_client_key(token_res.oauth_client_key.clone());
 
         // 5. 持久化
-        let mut account =
-            modules::upsert_account(user_info.email.clone(), user_info.get_display_name(), token)?;
+        let upsert_res =
+            modules::upsert_account(user_info.email.clone(), user_info.get_display_name(), token);
+
+        // 将导入探测阶段所用的同一出口 IP 粘性移交给新落盘的真实 account.id，并清理临时覆盖
+        let mut account = match upsert_res {
+            Ok(acc) => {
+                if let (Some(tid), Some(pool)) =
+                    (&temp_bound_id, crate::proxy::proxy_pool::get_global_proxy_pool())
+                {
+                    pool.inherit_sticky_egress(tid, &acc.id);
+                    pool.unpin_transient_proxy(tid);
+                }
+                acc
+            }
+            Err(e) => {
+                if let (Some(tid), Some(pool)) =
+                    (&temp_bound_id, crate::proxy::proxy_pool::get_global_proxy_pool())
+                {
+                    pool.unpin_transient_proxy(tid);
+                }
+                return Err(e);
+            }
+        };
 
         // 6. 自动获取配额信息（批量导入紧接着要绑定专属代理时跳过，避免在未绑定代理前走随机 IP；
         //    单条添加时复用第 3 步已拿到的 project_id，避免 1 秒内重复打两次 loadCodeAssist）

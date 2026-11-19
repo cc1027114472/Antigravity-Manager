@@ -110,8 +110,9 @@ func (p *transportPool) getClient(proxyRaw, proto, accountID, evictGen string) (
 		return nil, nil, err
 	}
 	accountID = strings.TrimSpace(accountID)
-	if accountID == "" {
-		// Anonymous / pre-login request (e.g. OAuth exchange_code): never share TCP/TLS connections across callers
+	if accountID == "" || strings.HasPrefix(accountID, "tmp_") {
+		// Anonymous / pre-login / transient import request (e.g. OAuth exchange_code or tmp_import_<uuid>):
+		// never cache in transportPool or keep lingering idle TCP/TLS sockets alive across callers.
 		tr := buildTransport(proxyURL, proto, true)
 		return &http.Client{Transport: tr}, tr.CloseIdleConnections, nil
 	}

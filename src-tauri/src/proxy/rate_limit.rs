@@ -2404,9 +2404,23 @@ impl RateLimitTracker {
         count
     }
 
-    /// 清除指定账号的限流记录
+    /// 清除指定账号的限流记录（同时清除账号全局锁与全部模型级锁 `account_id:*`）
     pub fn clear(&self, account_id: &str) -> bool {
-        self.limits.remove(account_id).is_some()
+        let mut removed = self.limits.remove(account_id).is_some();
+        let prefix = format!("{}:", account_id);
+        let model_keys: Vec<String> = self
+            .limits
+            .iter()
+            .filter(|entry| entry.key().starts_with(&prefix))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in model_keys {
+            if self.limits.remove(&key).is_some() {
+                removed = true;
+            }
+        }
+        self.failure_counts.remove(account_id);
+        removed
     }
 
     /// 清除所有限流记录 (乐观重置策略)
