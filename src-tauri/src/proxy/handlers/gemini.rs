@@ -728,6 +728,10 @@ pub async fn handle_generate(
             return Ok((status, headers, error_text).into_response());
         }
 
+        if status_code == 401 {
+            token_manager.invalidate_access_token(&account_id, &access_token);
+        }
+
         // 确定重试策略
         let strategy = determine_retry_strategy(status_code, &error_text, false);
         let trace_id = format!("gemini_{}", session_id);

@@ -1191,6 +1191,10 @@ pub async fn handle_chat_completions(
             .await;
         }
 
+        if status_code == 401 {
+            token_manager.invalidate_access_token(&account_id, &access_token);
+        }
+
         // 确定重试策略
         let strategy = determine_retry_strategy(status_code, &error_text, false);
 
@@ -3264,6 +3268,10 @@ pub async fn handle_completions(
                     peak,
                 )
                 .await;
+        }
+
+        if status_code == 401 {
+            token_manager.invalidate_access_token(&account_id, &access_token);
         }
 
         // 确定重试策略

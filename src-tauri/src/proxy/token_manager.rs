@@ -5580,13 +5580,6 @@ impl TokenManager {
             None => return Err(format!("未找到账号: {}", email)),
         };
 
-        let project_id = token
-            .project_id
-            .as_deref()
-            .filter(|s| !s.is_empty() && *s != "bamboo-precept-lgxtn")
-            .unwrap_or("aicode-consumers")
-            .to_string();
-
         // [STRICT PROXY] 检查代理是否健康可用
         if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
             if !pool.is_account_proxy_available(&token.account_id).await {
@@ -5597,8 +5590,8 @@ impl TokenManager {
             }
         }
 
-        // 请求驱动按需懒加载刷新（余量不足 180s 刷新 + 双重检查互斥锁 + 拟人化沉淀延迟 400..800ms）
-        let valid_token = self.ensure_token_valid(token).await?;
+        // 统一走 refresh_and_resolve_token：同时完成按需 OAuth 刷新与真实 project_id 握手持久化
+        let (valid_token, project_id) = self.refresh_and_resolve_token(token).await?;
 
         Ok((
             valid_token.access_token,
@@ -5607,6 +5600,28 @@ impl TokenManager {
             valid_token.account_id,
             0,
         ))
+    }
+
+    /// 收到 Google 上游 HTTP 401 Unauthorized 时比对作废内存中的旧 access_token：
+    /// 仅当当前缓存的 access_token 仍等于被拒的 rejected_token 时将 timestamp 置 0，
+    /// 避免误伤并发协程刚换出的新 Token，并强制下次选中该账号时走单账号互斥锁立即刷新。
+    pub fn invalidate_access_token(&self, account_id: &str, rejected_token: &str) -> bool {
+        let mut invalidated = false;
+        if let Some(mut entry) = self.tokens.get_mut(account_id) {
+            if entry.access_token == rejected_token {
+                entry.timestamp = 0;
+                invalidated = true;
+            }
+        }
+        if invalidated {
+            self.session_accounts.retain(|_, v| v != account_id);
+            self.unbind_account_session(account_id);
+            tracing::warn!(
+                "🔄 [TokenManager] Invalidated rejected 401 access_token for account {} (next call will force OAuth refresh)",
+                account_id
+            );
+        }
+        invalidated
     }
 
     // ===== 限流管理方法 =====
@@ -9596,5 +9611,32 @@ mod tests {
         let transport_err = "[代理池:p1] Refresh request failed: Go sidecar proxy transport error (502 Bad Gateway)";
         assert!(!is_permanent_oauth_credential_error(transport_err));
         assert!(is_oauth_transport_error(transport_err));
+    }
+
+    #[test]
+    fn test_invalidate_access_token_compare_and_swap() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-tm-invalidate-401-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let manager = TokenManager::new(tmp_root);
+        let now = chrono::Utc::now().timestamp();
+        let mut tok = create_test_token("401@test.com", Some("PRO"), 1.0, None, Some(100));
+        tok.account_id = "acc-401".to_string();
+        tok.access_token = "old-dead-token".to_string();
+        tok.timestamp = now + 3000;
+        manager.tokens.insert("acc-401".to_string(), tok);
+
+        // Mismatched token must NOT invalidate a fresher concurrent token
+        assert!(!manager.invalidate_access_token("acc-401", "some-other-token"));
+        assert_eq!(manager.tokens.get("acc-401").unwrap().timestamp, now + 3000);
+
+        // Matching rejected token zeroes timestamp so next refresh_and_resolve_token refreshes immediately
+        assert!(manager.invalidate_access_token("acc-401", "old-dead-token"));
+        assert_eq!(manager.tokens.get("acc-401").unwrap().timestamp, 0);
+        assert!(TokenManager::token_needs_oauth_refresh(
+            &manager.tokens.get("acc-401").unwrap(),
+            now
+        ));
     }
 }

@@ -1978,6 +1978,10 @@ pub async fn handle_messages(
             return (status, headers, error_text).into_response();
         }
 
+        if status_code == 401 {
+            token_manager.invalidate_access_token(&account_id, &access_token);
+        }
+
         // 确定重试策略
         let retry_strategy =
             determine_retry_strategy(status_code, &error_text, retried_without_thinking);
