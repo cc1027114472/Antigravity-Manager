@@ -469,11 +469,11 @@ impl TokenManager {
                                         }
                                         Err(e) => {
                                             tracing::warn!("⚠️ [BackgroundWorker] 账号 {} 静默换发失败: {}", t.email, e);
-                                            if e.contains("invalid_grant") {
+                                            if is_permanent_oauth_credential_error(&e) {
                                                 tokens_map.remove(&t.account_id);
                                                 if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
                                                     let _ = tm
-                                                        .disable_account(&t.account_id, &format!("invalid_grant: {}", e))
+                                                        .disable_account(&t.account_id, &format!("oauth_credential_error: {}", e))
                                                         .await;
                                                 }
                                             }
@@ -591,13 +591,13 @@ impl TokenManager {
                                                             target_acc.email,
                                                             e
                                                         );
-                                                        if e.contains("invalid_grant") {
+                                                        if is_permanent_oauth_credential_error(&e) {
                                                             tokens_map_clone.remove(&target_acc.account_id);
                                                             if let Some(tm) = crate::proxy::server::try_get_shared_token_manager() {
                                                                 let _ = tm
                                                                     .disable_account(
                                                                         &target_acc.account_id,
-                                                                        &format!("invalid_grant: {}", e),
+                                                                        &format!("oauth_credential_error: {}", e),
                                                                     )
                                                                     .await;
                                                             }
@@ -4947,73 +4947,44 @@ impl TokenManager {
                                 preferred_token.email
                             );
 
-                            // 直接使用优先账号，跳过轮询逻辑
-                            let mut token = preferred_token.clone();
-
-                            // 请求驱动按需懒加载刷新（余量不足 180s 刷新 + 双重检查互斥锁 + 拟人化沉淀延迟 400..800ms）
-                            if let Ok(refreshed) = self.ensure_token_valid(token.clone()).await {
-                                token = refreshed;
-                            }
-
-                            // 确保有 project_id (filter empty strings to trigger re-fetch)
-                            let project_id = if let Some(pid) = &token.project_id {
-                                if pid.is_empty() {
-                                    None
-                                } else {
-                                    Some(pid.clone())
-                                }
-                            } else {
-                                None
-                            };
-                            let project_id = if let Some(pid) = project_id {
-                                pid
-                            } else {
-                                match crate::proxy::project_resolver::fetch_project_id(
-                                    &token.access_token,
-                                    Some(&token.account_id),
-                                )
-                                .await
-                                {
-                                    Ok(pid) => {
-                                        if let Some(mut entry) =
-                                            self.tokens.get_mut(&token.account_id)
-                                        {
-                                            entry.project_id = Some(pid.clone());
-                                        }
-                                        let _ = self.save_project_id(&token.account_id, &pid).await;
-                                        pid
+                            // 直接使用优先账号，统一走 refresh_and_resolve_token（刷新失败时回退常规池选号，严禁拿空/过期 Token 硬打）
+                            match self.refresh_and_resolve_token(preferred_token.clone()).await {
+                                Ok((token, project_id)) => {
+                                    let wait_ms = self.pacer.get_required_wait_ms(&token.account_id);
+                                    if wait_ms > 0 {
+                                        tracing::info!(
+                                            "[HumanizedPacer] Pacing request on {}: waiting {}ms (post-response jitter cooldown or rolling 60s rpm quota)",
+                                            token.email,
+                                            wait_ms
+                                        );
+                                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                                     }
-                                    Err(_) => "aicode-consumers".to_string(), // fallback
+                                    self.pacer.mark_request_started(&token.account_id);
+                                    if self.pacer.is_in_nap(&token.account_id) {
+                                        self.session_accounts.retain(|_, bound_id| bound_id != &token.account_id);
+                                        self.unbind_account_session(&token.account_id);
+                                        tracing::info!(
+                                            "[HumanizedPacer] Preferred account {} entered micro-nap: actively unbound all sticky sessions",
+                                            token.email
+                                        );
+                                    }
+
+                                    return Ok((
+                                        token.access_token,
+                                        project_id,
+                                        token.email,
+                                        token.account_id,
+                                        0,
+                                    ));
                                 }
-                            };
-
-                            let wait_ms = self.pacer.get_required_wait_ms(&token.account_id);
-                            if wait_ms > 0 {
-                                tracing::info!(
-                                    "[HumanizedPacer] Pacing request on {}: waiting {}ms (post-response jitter cooldown or rolling 60s rpm quota)",
-                                    token.email,
-                                    wait_ms
-                                );
-                                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "🔒 [FIX #820] Preferred account {} refresh/handshake failed ({}), falling back to pool",
+                                        preferred_token.email,
+                                        e
+                                    );
+                                }
                             }
-                            self.pacer.mark_request_started(&token.account_id);
-                            if self.pacer.is_in_nap(&token.account_id) {
-                                self.session_accounts.retain(|_, bound_id| bound_id != &token.account_id);
-                self.unbind_account_session(&token.account_id);
-                                self.unbind_account_session(&token.account_id);
-                                tracing::info!(
-                                    "[HumanizedPacer] Preferred account {} entered micro-nap: actively unbound all sticky sessions",
-                                    token.email
-                                );
-                            }
-
-                            return Ok((
-                                token.access_token,
-                                project_id,
-                                token.email,
-                                token.account_id,
-                                0,
-                            ));
                         } else {
                             if is_rate_limited {
                                 tracing::warn!("🔒 [FIX #820] Preferred account {} is rate-limited, falling back to round-robin", preferred_token.email);
@@ -5324,8 +5295,9 @@ impl TokenManager {
                                 wait_sec, wait_ms
                             );
 
-                            // 缓冲延迟
+                            // 缓冲延迟后清理已自然到期的记录并重选（严禁调用 clear_all() 强拆全池未到期的 429 冷却锁！）
                             tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
+                            self.rate_limit_tracker.cleanup_expired();
 
                             // 重新尝试选择账号
                             let retry_token = tokens_snapshot.iter().find(|t| {
@@ -5346,34 +5318,10 @@ impl TokenManager {
                                 );
                                 t.clone()
                             } else {
-                                // Layer 2: 缓冲后仍无可用账号,执行乐观重置
-                                tracing::warn!(
-                                    "Buffer delay failed. Executing optimistic reset for all {} accounts...",
-                                    tokens_snapshot.len()
-                                );
-
-                                // 清除所有限流记录
-                                self.rate_limit_tracker.clear_all();
-
-                                // 再次尝试选择账号（配额保护与小憩休眠绝对不可被乐观重置绕过！）
-                                let final_token = tokens_snapshot.iter().find(|t| {
-                                    !attempted.contains(&t.account_id)
-                                        && !self.pacer.is_in_nap(&t.account_id)
-                                        && !(quota_protection_enabled
-                                            && Self::is_model_quota_protected(&t.protected_models, target_model))
-                                });
-
-                                if let Some(t) = final_token {
-                                    tracing::info!(
-                                        "✅ Optimistic reset successful! Using account: {}",
-                                        t.email
-                                    );
-                                    t.clone()
-                                } else {
-                                    return Err(
-                                        "All accounts failed after optimistic reset.".to_string()
-                                    );
-                                }
+                                return Err(format!(
+                                    "All accounts limited. Wait {}s.",
+                                    wait_sec.max(2)
+                                ));
                             }
                         } else {
                             return Err(format!("All accounts limited. Wait {}s.", wait_sec));
@@ -5406,139 +5354,26 @@ impl TokenManager {
                 }
                 OnDiskAccountState::Enabled => {}
             }
-            // 3. 请求驱动按需懒加载刷新（余量不足 180s 刷新 + 双重检查互斥锁 + 拟人化沉淀延迟 400..800ms）
-            match self.ensure_token_valid(token.clone()).await {
-                Ok(refreshed) => token = refreshed,
+            // 3 & 4. 统一走 refresh_and_resolve_token（单账号 refresh_locks 互斥锁、无 DashMap 跨 await 死锁、
+            // 自动 403 封禁识别、代理/429 故障自动回滚切往下一个健康账号）
+            let candidate_id = token.account_id.clone();
+            let candidate_email = token.email.clone();
+            let (token, project_id) = match self.refresh_and_resolve_token(token).await {
+                Ok(pair) => pair,
                 Err(e) => {
                     tracing::error!(
-                        "Token 刷新失败 ({}): {}，尝试下一个账号",
-                        token.email,
+                        "Token 刷新或 ProjectID 握手失败 ({}): {}，尝试下一个账号",
+                        candidate_email,
                         e
                     );
-                    last_error = Some(format!("Token refresh failed: {}", e));
-                    attempted.insert(token.account_id.clone());
+                    last_error = Some(e);
+                    attempted.insert(candidate_id.clone());
                     if quota_group != "image_gen"
-                        && matches!(&last_used_account_id, Some((id, _)) if id == &token.account_id)
+                        && matches!(&last_used_account_id, Some((id, _)) if id == &candidate_id)
                     {
-                        need_update_last_used =
-                            Some((String::new(), std::time::Instant::now()));
+                        need_update_last_used = Some((String::new(), std::time::Instant::now()));
                     }
                     continue;
-                }
-            }
-
-            // 4. [ENHANCED] 确保有 project_id (使用锁保护 fetch 动作)
-            let project_id = if let Some(pid) = &token.project_id {
-                if pid.is_empty() {
-                    None
-                } else {
-                    Some(pid.clone())
-                }
-            } else {
-                None
-            };
-            let project_id = if let Some(pid) = project_id {
-                pid
-            } else {
-                // [NEW] 针对 fetch_project_id 实现基于 SingleFlight 的异步合并
-                // 1. 检查是否已有 inflight 请求
-                let (mut rx, is_new) = {
-                    if let Some(existing_rx) = self.load_code_assist_inflight.get(&token.account_id)
-                    {
-                        (existing_rx.value().clone(), false)
-                    } else {
-                        // 创建新的 inflight 频道
-                        let (tx, rx) = tokio::sync::watch::channel(None);
-                        self.load_code_assist_inflight
-                            .insert(token.account_id.clone(), rx.clone());
-                        (rx, true)
-                    }
-                };
-
-                if is_new {
-                    // 仅由“第一个发现者”执行真实请求
-                    tracing::debug!("账号 {} 启动 [SingleFlight] ProjectID 探测...", token.email);
-
-                    let result =
-                        match crate::proxy::project_resolver::fetch_project_id(
-                            &token.access_token,
-                            Some(&token.account_id),
-                        )
-                        .await
-                        {
-                            Ok(pid) => {
-                                if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
-                                    entry.project_id = Some(pid.clone());
-                                    let _ = self.save_project_id(&token.account_id, &pid).await;
-                                }
-                                Ok(pid)
-                            }
-                            Err(e) => Err(e),
-                        };
-
-                    // 广播结果并清理 inflight
-                    if let Some(mut entry) =
-                        self.load_code_assist_inflight.get_mut(&token.account_id)
-                    {
-                        // 这里虽然是 rx，但在 Rust 中 watch 不需要 tx 也可以通过私有方式操作？
-                        // 修正：我们需要持有 tx。重新设计此处：使用 Mutex 或在 scope 外持有 tx。
-                        // 由于 DashMap 不能存不可克隆的 tx，我们改用 Mutex 保护的流程或直接在 if is_new 里执行
-                    }
-
-                    // 【修正实现方案】: 对于 project_id 这种高频探测，仍然使用 refresh_mu 锁是最高效的，
-                    // 但我们要加入“强制异步等待”逻辑。由于之前的 Mutex 已经是异步的，
-                    // 我们只需确保 fetch_project_id 调用被包裹在锁内并且有 double-check。
-                    // 之前的代码已经做到了这一点。
-
-                    // 为了完全对齐 agent-vibes 的 singleFlight 语义（即不仅是锁，还要有“结果复用”），
-                    // 我将保留之前的逻辑但移除不必要的重复日志。
-
-                    let refresh_mu = self
-                        .refresh_locks
-                        .entry(token.account_id.clone())
-                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                        .clone();
-                    let _guard = refresh_mu.lock().await;
-
-                    if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
-                        if let Some(pid) = &entry.project_id {
-                            if !pid.is_empty() {
-                                pid.clone()
-                            } else {
-                                match crate::proxy::project_resolver::fetch_project_id(
-                                    &entry.access_token,
-                                    Some(&token.account_id),
-                                )
-                                .await
-                                {
-                                    Ok(pid) => {
-                                        entry.project_id = Some(pid.clone());
-                                        let _ = self.save_project_id(&token.account_id, &pid).await;
-                                        pid
-                                    }
-                                    Err(_) => "aicode-consumers".to_string(),
-                                }
-                            }
-                        } else {
-                            "aicode-consumers".to_string()
-                        }
-                    } else {
-                        "aicode-consumers".to_string()
-                    }
-                } else {
-                    // 如果不是第一个，则等待结果 (虽然在 Mutex 模式下不需要 rx，但为了严谨性我们可以保留锁)
-                    let refresh_mu = self
-                        .refresh_locks
-                        .get(&token.account_id)
-                        .map(|v| v.value().clone());
-                    if let Some(mu) = refresh_mu {
-                        let _guard = mu.lock().await;
-                    }
-
-                    self.tokens
-                        .get(&token.account_id)
-                        .and_then(|t| t.project_id.clone())
-                        .unwrap_or_else(|| "aicode-consumers".to_string())
                 }
             };
 
@@ -6861,45 +6696,9 @@ impl TokenManager {
     /// 刷新 access_token（如需要）并解析 project_id，供选号路径复用
     async fn finalize_selected_token(
         &self,
-        mut token: ProxyToken,
+        token: ProxyToken,
     ) -> Result<(String, String, String, String, u64), String> {
-        // 请求驱动按需懒加载刷新（余量不足 180s 刷新 + 双重检查互斥锁 + 拟人化沉淀延迟 400..800ms）
-        match self.ensure_token_valid(token.clone()).await {
-            Ok(refreshed) => token = refreshed,
-            Err(e) => {
-                tracing::warn!("Token refresh failed for {}: {}", token.email, e);
-            }
-        }
-
-        let project_id = if let Some(pid) = &token.project_id {
-            if pid.is_empty() {
-                None
-            } else {
-                Some(pid.clone())
-            }
-        } else {
-            None
-        };
-        let project_id = if let Some(pid) = project_id {
-            pid
-        } else {
-            match crate::proxy::project_resolver::fetch_project_id(
-                &token.access_token,
-                Some(&token.account_id),
-            )
-            .await
-            {
-                Ok(pid) => {
-                    if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
-                        entry.project_id = Some(pid.clone());
-                    }
-                    let _ = self.save_project_id(&token.account_id, &pid).await;
-                    pid
-                }
-                Err(_) => "aicode-consumers".to_string(),
-            }
-        };
-
+        let (token, project_id) = self.refresh_and_resolve_token(token).await?;
         Ok((
             token.access_token,
             project_id,
