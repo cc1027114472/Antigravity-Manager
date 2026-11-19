@@ -190,13 +190,9 @@ pub async fn internal_start_proxy_service(
         let zai_enabled = config.zai.enabled
             && !matches!(config.zai.dispatch_mode, crate::proxy::ZaiDispatchMode::Off);
         if !zai_enabled {
-            tracing::warn!("沒有可用賬號，反代邏輯將暫停，請通過管理界面添加。");
-            return Ok(ProxyStatus {
-                running: false,
-                port: config.port,
-                base_url: format!("http://127.0.0.1:{}", config.port),
-                active_accounts: 0,
-            });
+            // 仅告警不提前退出：确保空库等待 API 传号或重启瞬间所有账号均处于 429 自动恢复队列时，
+            // axum_server.is_running 仍正常置为 true，后续 API 上传账号或 429 自愈后即刻无缝接单，避免永久 503。
+            tracing::warn!("当前暂无可用活跃账号（等待通过 API/管理界面添加或 429 自动恢复），反代服务已就绪待命。");
         }
     }
 

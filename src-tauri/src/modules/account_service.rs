@@ -28,15 +28,42 @@ impl AccountService {
         // 不受 max_accounts=1 阻塞），并在 Go Sidecar 中按 `tmp_` 前缀走一次性短连接（不留连接池泄漏），
         // 确保步骤 1 (oauth2/token)、步骤 2 (userinfo)、步骤 3 (loadCodeAssist) 及步骤 6 (fetchAvailableModels)
         // 全程使用同一个代理 IP，杜绝导入瞬间跨 3~4 个 IP 跳变触发风控。
+        // [STRICT FAIL-CLOSED] 若调用方显式指定了专属代理 preferred_proxy_id，但该代理不存在、被禁用或处于 RED 不健康状态，
+        // 必须立即报错中止导入，绝不允许静默退化为 probe_ctx = None 借用其他公用池/上游代理 IP！
+        let requested_proxy_id = preferred_proxy_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let temp_bound_id = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
             let tid = format!("tmp_import_{}", uuid::Uuid::new_v4());
             match pool
-                .pin_transient_proxy_for_import(&tid, preferred_proxy_id)
+                .pin_transient_proxy_for_import(&tid, requested_proxy_id)
                 .await
             {
                 Ok(Some(_)) => Some(tid),
-                _ => None,
+                Ok(None) => {
+                    if let Some(pid) = requested_proxy_id {
+                        return Err(format!(
+                            "严格代理策略拦截：指定的专属代理 {} 不存在、已禁用或不健康 (RED)，拒绝回退至其他代理 IP 执行导入探测",
+                            pid
+                        ));
+                    }
+                    None
+                }
+                Err(e) => {
+                    if let Some(pid) = requested_proxy_id {
+                        return Err(format!(
+                            "严格代理策略拦截：绑定临时导入代理 {} 失败 ({})，拒绝回退至其他代理 IP",
+                            pid, e
+                        ));
+                    }
+                    None
+                }
             }
+        } else if let Some(pid) = requested_proxy_id {
+            return Err(format!(
+                "严格代理策略拦截：全局代理池未初始化，无法使用指定的专属代理 {} 执行导入探测",
+                pid
+            ));
         } else {
             None
         };

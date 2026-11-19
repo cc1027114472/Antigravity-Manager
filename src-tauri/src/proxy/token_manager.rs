@@ -3532,7 +3532,26 @@ impl TokenManager {
                         let _ = self.set_forbidden(&token.account_id, &e).await;
                         return Err(format!("Account forbidden during loadCodeAssist handshake: {}", e));
                     }
-                    "aicode-consumers".to_string()
+                    // 仅当 Google 正常返回 HTTP 200 但账号无专属 cloudaicompanionProject 时才回退 "aicode-consumers"；
+                    // 若因代理断流/严格代理拦截/HTTP 429/401/5xx 失败，必须返回 Err 让选号器回滚租约并切往健康账号！
+                    if e.contains("账号无资格获取官方 cloudaicompanionProject") {
+                        let fallback_pid = "aicode-consumers".to_string();
+                        RECENT_LOAD_CODE_ASSIST_TS
+                            .insert(token.account_id.clone(), chrono::Utc::now().timestamp());
+                        token.project_id = Some(fallback_pid.clone());
+                        if let Some(mut entry) = self.tokens.get_mut(&token.account_id) {
+                            entry.project_id = Some(fallback_pid.clone());
+                        }
+                        let _ = self.save_project_id(&token.account_id, &fallback_pid).await;
+                        fallback_pid
+                    } else {
+                        tracing::warn!(
+                            "⚠️ [TokenManager] 账号 {} loadCodeAssist 握手失败 ({})，回滚租约并切换其他健康账号",
+                            token.email,
+                            e
+                        );
+                        return Err(format!("loadCodeAssist handshake failed: {}", e));
+                    }
                 }
             }
         };
