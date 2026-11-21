@@ -38,32 +38,32 @@ use serde::{Deserialize, Serialize};
 /// 单请求流式默认预占 Output Tokens
 pub const DEFAULT_IN_FLIGHT_RESERVED_TOKENS: u64 = 2000;
 
-/// 单账号小时 Output 软上限随机区间：[50_000, 68_000]
-pub const MIN_HOURLY_OUTPUT_TOKEN_LIMIT: u64 = 50_000;
-pub const MAX_HOURLY_OUTPUT_TOKEN_LIMIT: u64 = 68_000;
+/// 单账号小时 Output 软上限随机区间：[90_000, 120_000]
+pub const MIN_HOURLY_OUTPUT_TOKEN_LIMIT: u64 = 90_000;
+pub const MAX_HOURLY_OUTPUT_TOKEN_LIMIT: u64 = 120_000;
 
-/// 单账号 24 小时 Output 软上限随机区间：[260_000, 330_000]
-pub const MIN_DAILY_OUTPUT_TOKEN_LIMIT: u64 = 260_000;
-pub const MAX_DAILY_OUTPUT_TOKEN_LIMIT: u64 = 330_000;
+/// 单账号 24 小时 Output 软上限随机区间：[500_000, 650_000]
+pub const MIN_DAILY_OUTPUT_TOKEN_LIMIT: u64 = 500_000;
+pub const MAX_DAILY_OUTPUT_TOKEN_LIMIT: u64 = 650_000;
 
 /// 单账号小时 Input 软上限随机区间：[1_000_000, 1_400_000]
 pub const MIN_HOURLY_INPUT_TOKEN_LIMIT: u64 = 1_000_000;
 pub const MAX_HOURLY_INPUT_TOKEN_LIMIT: u64 = 1_400_000;
 
-/// 单账号小时请求频次软上限随机区间：[25, 35]
-pub const MIN_HOURLY_REQUEST_LIMIT: u32 = 25;
-pub const MAX_HOURLY_REQUEST_LIMIT: u32 = 35;
+/// 单账号小时请求频次软上限随机区间：[45, 60]
+pub const MIN_HOURLY_REQUEST_LIMIT: u32 = 45;
+pub const MAX_HOURLY_REQUEST_LIMIT: u32 = 60;
 
 /// 疲劳阶梯退避配置 (秒)
-pub const TIER1_NAP_MIN_SECS: i64 = 3600;      // 1.0 小时
-pub const TIER1_NAP_MAX_SECS: i64 = 5400;      // 1.5 小时
-pub const TIER2_NAP_MIN_SECS: i64 = 7200;      // 2.0 小时
-pub const TIER2_NAP_MAX_SECS: i64 = 12600;     // 3.5 小时
-pub const TIER3_NAP_MIN_SECS: i64 = 43200;     // 12.0 小时
-pub const TIER3_NAP_MAX_SECS: i64 = 64800;     // 18.0 小时
+pub const TIER1_NAP_MIN_SECS: i64 = 900;       // 15 分钟
+pub const TIER1_NAP_MAX_SECS: i64 = 1500;      // 25 分钟
+pub const TIER2_NAP_MIN_SECS: i64 = 2100;      // 35 分钟
+pub const TIER2_NAP_MAX_SECS: i64 = 3000;      // 50 分钟
+pub const TIER3_NAP_MIN_SECS: i64 = 5400;      // 90 分钟
+pub const TIER3_NAP_MAX_SECS: i64 = 7200;      // 120 分钟
 
-/// 阶梯惩罚重置静默期 (秒)：苏醒后 4 小时内未触顶则重置
-pub const FATIGUE_STRIKE_COOLDOWN_SECS: i64 = 14400;
+/// 阶梯惩罚重置静默期 (秒)：苏醒后 90 分钟内未触顶则重置
+pub const FATIGUE_STRIKE_COOLDOWN_SECS: i64 = 5400;
 
 /// 削峰填谷平滑抖动阈值：当两个账号当日 Output Token 差距在 5000 tokens 以内时，视为同一消耗梯队
 pub const LOAD_SMOOTHING_TOKEN_DIFF_THRESHOLD: u64 = 5000;
@@ -101,7 +101,7 @@ fn default_hourly_input_limit() -> u64 {
 }
 
 fn default_hourly_request_limit() -> u32 {
-    30
+    50
 }
 
 /// 单账号动态抖动软上限
@@ -1272,22 +1272,19 @@ mod tests {
         let cap = selector.get_or_init_jitter_cap(acc_id, now_ts);
 
         // 第 1 次触发
-        selector.record_token_usage(acc_id, email, 0, cap.hourly_limit as u32);
-        let rec1 = selector.check_and_update_fatigue(acc_id, email, now_ts).unwrap();
+        let rec1 = selector.record_token_usage(acc_id, email, 0, cap.hourly_limit as u32).unwrap();
         assert_eq!(rec1.consecutive_strikes, 1);
         assert!(rec1.nap_duration_secs >= TIER1_NAP_MIN_SECS && rec1.nap_duration_secs <= TIER1_NAP_MAX_SECS);
 
         // 模拟第 1 次苏醒并迅速再次触顶 (第 2 次触发)
         selector.clear_fatigue(acc_id);
-        selector.record_token_usage(acc_id, email, 0, cap.hourly_limit as u32);
-        let rec2 = selector.check_and_update_fatigue(acc_id, email, now_ts + 3600).unwrap();
+        let rec2 = selector.record_token_usage(acc_id, email, 0, cap.hourly_limit as u32).unwrap();
         assert_eq!(rec2.consecutive_strikes, 2);
         assert!(rec2.nap_duration_secs >= TIER2_NAP_MIN_SECS && rec2.nap_duration_secs <= TIER2_NAP_MAX_SECS);
 
         // 模拟第 3 次触发
         selector.clear_fatigue(acc_id);
-        selector.record_token_usage(acc_id, email, 0, cap.hourly_limit as u32);
-        let rec3 = selector.check_and_update_fatigue(acc_id, email, now_ts + 7200).unwrap();
+        let rec3 = selector.record_token_usage(acc_id, email, 0, cap.hourly_limit as u32).unwrap();
         assert_eq!(rec3.consecutive_strikes, 3);
         assert!(rec3.nap_duration_secs >= TIER3_NAP_MIN_SECS && rec3.nap_duration_secs <= TIER3_NAP_MAX_SECS);
     }
@@ -1415,10 +1412,10 @@ mod tests {
 // ==========================================
 // 兼容旧版常量与结构定义 (Backward Compatibility)
 // ==========================================
-pub const DAILY_OUTPUT_TOKEN_SOFT_LIMIT: u64 = 300_000;
-pub const HOURLY_OUTPUT_TOKEN_SOFT_LIMIT: u64 = 60_000;
-pub const FATIGUE_NAP_MIN_SECS: i64 = 3600;
-pub const FATIGUE_NAP_MAX_SECS: i64 = 7200;
+pub const DAILY_OUTPUT_TOKEN_SOFT_LIMIT: u64 = 550_000;
+pub const HOURLY_OUTPUT_TOKEN_SOFT_LIMIT: u64 = 100_000;
+pub const FATIGUE_NAP_MIN_SECS: i64 = 900;
+pub const FATIGUE_NAP_MAX_SECS: i64 = 1500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SoftLimitConfig {

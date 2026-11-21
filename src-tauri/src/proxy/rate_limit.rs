@@ -71,8 +71,8 @@ pub const OVERSIZE_TOKENS: u32 = 100_000; // 100K tokens
 /// 热度半衰期：从 600 秒调整为 200 秒 (~3.3 分钟) 指数衰减，加快账号自然静默降温
 const HEAT_HALF_LIFE_SECS: f64 = 200.0;
 
-/// 单账号 60 秒滑动窗口请求上限（严格限制最多 5 次/分钟，达到后触发冷却并换号）
-pub const ACCOUNT_MAX_REQUESTS_PER_MINUTE: usize = 5;
+/// 单账号 60 秒滑动窗口请求上限（最多 8 次/分钟，达到后触发冷却并换号）
+pub const ACCOUNT_MAX_REQUESTS_PER_MINUTE: usize = 8;
 
 /// 超大请求（>100K tokens 或 >400KB）10 分钟滑动时间窗硬上限：任意 600 秒内严格 < 3 个（最多允许 2 个）
 pub const OVERSIZE_WINDOW_SECS: u64 = 600;
@@ -342,7 +342,7 @@ impl AccountPacerState {
     pub fn new_default(account_id: &str, now: std::time::Instant, slot_count: usize) -> Self {
         use rand::Rng;
         let n = slot_count.max(1);
-        let next_nap_threshold = rand::thread_rng().gen_range(15..=25);
+        let next_nap_threshold = rand::thread_rng().gen_range(30..=45);
         Self {
             last_request_time: now,
             last_response_completed_at: None,
@@ -447,10 +447,10 @@ impl HumanizedPacer {
                     rng.gen_range(1100..=1800)
                 }
             }
-            // 5万~10万 Tokens 的中型请求：留出 3.5~7.5 秒拟人思考与散热时间
-            TrafficTier::Medium => rng.gen_range(3500..=7500),
-            // >10万 Tokens 极重计算：保持 8~15 秒充分冷却（完全在 18s 粘性等待上限内，杜绝旋转木马切号）
-            TrafficTier::Oversized => rng.gen_range(8000..=15_000),
+            // 5万~10万 Tokens 的中型请求：留出 2.0~4.5 秒拟人思考与散热时间
+            TrafficTier::Medium => rng.gen_range(2000..=4500),
+            // >10万 Tokens 极重计算：保持 5~9 秒冷却（完全在 18s 粘性等待上限内，杜绝旋转木马切号）
+            TrafficTier::Oversized => rng.gen_range(5000..=9000),
         }
     }
 
@@ -529,13 +529,13 @@ impl HumanizedPacer {
             entry.daily_output_tokens += output_tokens;
 
             // 软上限熔断检查：
-            // 单账号小时 Output Tokens > 60,000 或 当日 Output Tokens > 300,000 时，进入疲劳深度休眠 1~2 小时
-            const HOURLY_TOKEN_LIMIT: u64 = 60_000;
-            const DAILY_TOKEN_LIMIT: u64 = 300_000;
+            // 单账号小时 Output Tokens > 120,000 或 当日 Output Tokens > 650,000 时，进入疲劳休眠 20 分钟
+            const HOURLY_TOKEN_LIMIT: u64 = 120_000;
+            const DAILY_TOKEN_LIMIT: u64 = 650_000;
 
             if entry.hourly_output_tokens >= HOURLY_TOKEN_LIMIT || entry.daily_output_tokens >= DAILY_TOKEN_LIMIT {
                 if entry.fatigue_until.is_none() {
-                    let cooldown_secs = 3600; // 冷却 1 小时，让其他空闲账号接力
+                    let cooldown_secs = 1200; // 冷却 20 分钟，让其他空闲账号接力
                     entry.fatigue_until = Some(now + Duration::from_secs(cooldown_secs));
                     tracing::warn!(
                         "😴 [FatigueCooldown] Account {} hit token soft-cap (hourly: {}/{}, daily: {}/{}), entering fatigue cooldown for {}s to prevent ban",
@@ -1265,15 +1265,15 @@ impl HumanizedPacer {
         }
 
         let mut entered_nap = false;
-        let is_overheated_fatigued = entry.turns_since_nap >= 10 && entry.massive_heat >= 2.0;
+        let is_overheated_fatigued = entry.turns_since_nap >= 18 && entry.massive_heat >= 2.6;
         let is_turn_exhausted = entry.turns_since_nap >= entry.next_nap_threshold;
         if is_overheated_fatigued || is_turn_exhausted {
             let mut rng = rand::thread_rng();
-            // 小憩时间 3 ~ 6 分钟 (180 ~ 360 秒)
-            let nap_secs = rng.gen_range(180..=360);
+            // 小憩时间 1 ~ 2 分钟 (60 ~ 120 秒)
+            let nap_secs = rng.gen_range(60..=120);
             entry.nap_until = Some(ready_at + Duration::from_secs(nap_secs));
             entry.turns_since_nap = 0;
-            entry.next_nap_threshold = rng.gen_range(15..=25);
+            entry.next_nap_threshold = rng.gen_range(30..=45);
             entered_nap = true;
             tracing::info!(
                 "[HumanizedPacer] Account {} entering nap for {}s (reason: high_heat_fatigue={}, turns={}, heat={:.2})",
@@ -1567,15 +1567,15 @@ impl HumanizedPacer {
         entry.turns_since_nap += 1;
         entry.rolling_requests.push_back(now);
 
-        let is_overheated_fatigued = entry.turns_since_nap >= 10 && entry.massive_heat >= 2.0;
+        let is_overheated_fatigued = entry.turns_since_nap >= 18 && entry.massive_heat >= 2.6;
         let is_turn_exhausted = entry.turns_since_nap >= entry.next_nap_threshold;
         if is_overheated_fatigued || is_turn_exhausted {
             let mut rng = rand::thread_rng();
-            // 小憩时间 3 ~ 6 分钟 (180 ~ 360 秒)
-            let nap_secs = rng.gen_range(180..=360);
+            // 小憩时间 1 ~ 2 分钟 (60 ~ 120 秒)
+            let nap_secs = rng.gen_range(60..=120);
             entry.nap_until = Some(now + Duration::from_secs(nap_secs));
             entry.turns_since_nap = 0;
-            entry.next_nap_threshold = rng.gen_range(15..=25);
+            entry.next_nap_threshold = rng.gen_range(30..=45);
             tracing::info!(
                 "[HumanizedPacer] Account {} entering nap for {}s (reason: high_heat_fatigue={}, turns={})",
                 account_id,
@@ -2624,20 +2624,20 @@ mod tests {
         let wait = pacer.get_required_wait_ms(acc);
         assert!(wait >= 700 && wait <= 1850, "Normal wait was {}ms", wait);
 
-        // 2. L2 Medium (50K~100K tokens 或 200KB~400KB)：3500ms ~ 7500ms
+        // 2. L2 Medium (50K~100K tokens 或 200KB~400KB)：2000ms ~ 4500ms
         pacer.mark_request_completed(acc, Some(75_000));
         let wait_medium = pacer.get_required_wait_ms(acc);
         assert!(
-            wait_medium >= 3400 && wait_medium <= 7600,
+            wait_medium >= 1900 && wait_medium <= 4600,
             "Medium wait was {}ms",
             wait_medium
         );
 
-        // 3. L3 Oversized (>100K tokens 或 >400KB)：8000ms ~ 15000ms
+        // 3. L3 Oversized (>100K tokens 或 >400KB)：5000ms ~ 9000ms
         pacer.mark_request_completed(acc, Some(150_000));
         let wait_huge = pacer.get_required_wait_ms(acc);
         assert!(
-            wait_huge >= 7900 && wait_huge <= 15_100,
+            wait_huge >= 4900 && wait_huge <= 9100,
             "Oversized wait was {}ms",
             wait_huge
         );
@@ -2777,7 +2777,7 @@ mod tests {
         let fp = RequestFootprint::new(5_000, 10 * 1024);
 
         let mut nap_triggered_at = None;
-        for turn in 1..=31 {
+        for turn in 1..=50 {
             // 清空冷却与滚动 RPM 仅测试轮次小憩
             if let Some(mut entry) = pacer.account_states.get_mut(acc) {
                 entry.slots = vec![SlotPhase::Free; 2];
@@ -2793,10 +2793,10 @@ mod tests {
             }
         }
 
-        let triggered_turn = nap_triggered_at.expect("must trigger micro-nap within 15..=25 turns");
+        let triggered_turn = nap_triggered_at.expect("must trigger micro-nap within 30..=45 turns");
         assert!(
-            (15..=25).contains(&triggered_turn),
-            "nap triggered at turn {}, expected 15..=25",
+            (30..=45).contains(&triggered_turn),
+            "nap triggered at turn {}, expected 30..=45",
             triggered_turn
         );
         assert!(pacer.is_in_nap(acc));
@@ -2809,8 +2809,8 @@ mod tests {
         let fp_small = RequestFootprint::new(5_000, 10 * 1024);
         let fp_heavy = RequestFootprint::new(85_000, 300 * 1024); // Heavy: heat increment +0.8
 
-        // Run 9 small turns
-        for _ in 1..=9 {
+        // Run 17 small turns
+        for _ in 1..=17 {
             if let Some(mut entry) = pacer.account_states.get_mut(acc) {
                 entry.slots = vec![SlotPhase::Free; 2];
                 entry.rolling_requests.clear();
@@ -2819,24 +2819,24 @@ mod tests {
                 .try_acquire_lease(acc, fp_small, 2, 0)
                 .expect("should admit");
             guard.complete();
-            assert!(!entered_nap, "should not enter nap before 10 turns");
+            assert!(!entered_nap, "should not enter nap before 18 turns");
         }
 
-        // Set heat to 1.3 (below saturation threshold 1.5)
+        // Set heat to 1.9 (so +0.8 pushes it to 2.7 >= 2.6)
         if let Some(mut entry) = pacer.account_states.get_mut(acc) {
-            entry.massive_heat = 1.3;
+            entry.massive_heat = 1.9;
             entry.slots = vec![SlotPhase::Free; 2];
             entry.rolling_requests.clear();
         }
 
-        // 10th turn with fp_heavy (+0.8 heat) -> massive_heat = 1.3 + 0.8 = 2.1 >= 2.0
-        // turns_since_nap = 10 >= 10
+        // 18th turn with fp_heavy (+0.8 heat) -> massive_heat = 1.9 + 0.8 = 2.7 >= 2.6
+        // turns_since_nap = 18 >= 18
         // Should trigger early nap!
         let (mut guard, entered_nap) = pacer
             .try_acquire_lease(acc, fp_heavy, 2, 0)
-            .expect("should admit 10th turn");
+            .expect("should admit 18th turn");
         guard.complete();
-        assert!(entered_nap, "10th turn with heat >= 2.0 must trigger early nap");
+        assert!(entered_nap, "18th turn with heat >= 2.6 must trigger early nap");
         assert!(pacer.is_in_nap(acc), "account must be in nap state");
     }
 
@@ -2963,8 +2963,8 @@ mod tests {
         let acc = "rpm5_acc";
         let fp_small = RequestFootprint::new(10_000, 20 * 1024);
 
-        // 连续进入 5 个请求（中间清空槽位冷却以专注测试 60s RPM 门禁）
-        for i in 1..=5 {
+        // 连续进入 ACCOUNT_MAX_REQUESTS_PER_MINUTE (8) 个请求（中间清空槽位冷却以专注测试 60s RPM 门禁）
+        for i in 1..=ACCOUNT_MAX_REQUESTS_PER_MINUTE {
             let (mut g, _) = pacer
                 .try_acquire_lease(acc, fp_small, 2, 0)
                 .unwrap_or_else(|e| panic!("Request #{} should pass RPM check: {:?}", i, e));
@@ -2972,11 +2972,11 @@ mod tests {
             pacer.test_clear_slot_cooldowns(acc);
         }
 
-        // 第 6 个请求在 60s 窗口内到来：必须被 CooldownTooLong 拒绝（wait > 2000ms），触发上层切号！
-        let sixth = pacer.try_acquire_lease(acc, fp_small, 2, STICKY_MAX_SLOT_WAIT_MS);
+        // 第 9 个请求在 60s 窗口内到来：必须被 CooldownTooLong 拒绝（wait > 2000ms），触发上层切号！
+        let next_req = pacer.try_acquire_lease(acc, fp_small, 2, STICKY_MAX_SLOT_WAIT_MS);
         assert!(
-            matches!(sixth, Err(LeaseRejectReason::CooldownTooLong { wait_ms }) if wait_ms > 2000),
-            "6th request within 60s must be rejected by RPM cap"
+            matches!(next_req, Err(LeaseRejectReason::CooldownTooLong { wait_ms }) if wait_ms > 2000),
+            "9th request within 60s must be rejected by RPM cap"
         );
     }
 
