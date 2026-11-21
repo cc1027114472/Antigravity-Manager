@@ -670,18 +670,21 @@ impl AccountSelector {
             FatigueReason::HourlyRequestLimitExceeded
         };
 
-        // 计算阶梯退避惩罚（Backoff）
-        let mut strikes_entry = GLOBAL_FATIGUE_STRIKES
-            .entry(account_id.to_string())
-            .or_insert((0, 0));
-        let (mut strikes, last_strike_time) = *strikes_entry;
+        // 计算阶梯退避惩罚（Backoff），使用独立作用域立即释放 DashMap 写锁，避免后续 persist_selector_state 迭代时自锁死锁
+        let strikes = {
+            let mut strikes_entry = GLOBAL_FATIGUE_STRIKES
+                .entry(account_id.to_string())
+                .or_insert((0, 0));
+            let (mut strikes, last_strike_time) = *strikes_entry;
 
-        // 苏醒后超过 4 小时未再触顶，重置惩罚梯队
-        if now_ts.saturating_sub(last_strike_time) > FATIGUE_STRIKE_COOLDOWN_SECS {
-            strikes = 0;
-        }
-        strikes += 1;
-        *strikes_entry = (strikes, now_ts);
+            // 苏醒后超过 4 小时未再触顶，重置惩罚梯队
+            if now_ts.saturating_sub(last_strike_time) > FATIGUE_STRIKE_COOLDOWN_SECS {
+                strikes = 0;
+            }
+            strikes += 1;
+            *strikes_entry = (strikes, now_ts);
+            strikes
+        };
 
         let mut rng = rand::thread_rng();
         let nap_duration = match strikes {
